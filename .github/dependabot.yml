@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
+
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    versioning-strategy: lockfile-only
+    allow:
+      - dependency-type: all
+    groups:
+      cargo:
+        patterns: ["*"]
