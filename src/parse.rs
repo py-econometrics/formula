@@ -218,14 +218,14 @@ impl TryFrom<TransformCall> for Factor {
     type Error = TransformError;
 
     fn try_from(call: TransformCall) -> std::result::Result<Self, Self::Error> {
-        let mut factor = None;
+        let mut arguments = Vec::new();
         let mut keywords = BTreeMap::new();
         let mut saw_keyword = false;
 
         for argument in call.arguments {
             match argument {
-                TransformCallArgument::Positional(argument) if factor.is_none() && !saw_keyword => {
-                    factor = Some(argument);
+                TransformCallArgument::Positional(argument) if !saw_keyword => {
+                    arguments.push(argument);
                 }
                 TransformCallArgument::Positional(_) => {
                     return Err(TransformError::InvalidCall);
@@ -239,7 +239,6 @@ impl TryFrom<TransformCall> for Factor {
             }
         }
 
-        let factor = factor.ok_or(TransformError::InvalidCall)?;
         let transform = match call.name.as_str() {
             "log" => {
                 reject_keywords("log", keywords)?;
@@ -257,7 +256,10 @@ impl TryFrom<TransformCall> for Factor {
             _ => return Err(TransformError::Unknown(call.name)),
         };
 
-        Ok(factor.with_transform(transform))
+        Ok(Self::Call {
+            transform,
+            arguments,
+        })
     }
 }
 
@@ -343,21 +345,31 @@ mod tests {
         let cases = [
             (
                 "log(x)",
-                Factor::from("x").with_transform(Transform::Log(LogTransform)),
+                Factor::Call {
+                    transform: Transform::Log(LogTransform),
+                    arguments: vec![Factor::from("x")],
+                },
             ),
             (
                 "exp(x)",
-                Factor::from("x").with_transform(Transform::Exp(ExpTransform)),
+                Factor::Call {
+                    transform: Transform::Exp(ExpTransform),
+                    arguments: vec![Factor::from("x")],
+                },
             ),
             (
                 "C(group)",
-                Factor::from("group").with_transform(categorical(None)),
+                Factor::Call {
+                    transform: categorical(None),
+                    arguments: vec![Factor::from("group")],
+                },
             ),
             (
                 "C(group, reference='a')",
-                Factor::from("group").with_transform(categorical(Some(Scalar::from(
-                    PlSmallStr::from_static("a"),
-                )))),
+                Factor::Call {
+                    transform: categorical(Some(Scalar::from(PlSmallStr::from_static("a")))),
+                    arguments: vec![Factor::from("group")],
+                },
             ),
         ];
 
@@ -369,9 +381,10 @@ mod tests {
             );
         }
 
-        let expected = Expression::from(Term::from(
-            Factor::from("x").with_transform(categorical(Some(Scalar::from(1_i64)))),
-        ));
+        let expected = Expression::from(Term::from(Factor::Call {
+            transform: categorical(Some(Scalar::from(1_i64))),
+            arguments: vec![Factor::from("x")],
+        }));
         for source in [
             "C(x, reference=1)",
             "C(x, reference= 1)",
@@ -392,10 +405,7 @@ mod tests {
     fn invalid_transform_calls_are_rejected() {
         for source in [
             "unknown(x)",
-            "log()",
-            "log(x, y)",
             "log(x, reference=1)",
-            "C(reference=1)",
             "C(reference=1, x)",
             "C(x, reference=1, reference=2)",
             "C(x, unknown=1)",
@@ -476,21 +486,33 @@ mod tests {
         let cases = [
             (
                 "log(C(x))",
-                Factor::from("x")
-                    .with_transform(Transform::C(CategoricalTransform::new(None)))
-                    .with_transform(Transform::Log(LogTransform)),
+                Factor::Call {
+                    transform: Transform::Log(LogTransform),
+                    arguments: vec![Factor::Call {
+                        transform: Transform::C(CategoricalTransform::new(None)),
+                        arguments: vec![Factor::from("x")],
+                    }],
+                },
             ),
             (
                 "C(log(x))",
-                Factor::from("x")
-                    .with_transform(Transform::Log(LogTransform))
-                    .with_transform(Transform::C(CategoricalTransform::new(None))),
+                Factor::Call {
+                    transform: Transform::C(CategoricalTransform::new(None)),
+                    arguments: vec![Factor::Call {
+                        transform: Transform::Log(LogTransform),
+                        arguments: vec![Factor::from("x")],
+                    }],
+                },
             ),
             (
                 "log(exp(x))",
-                Factor::from("x")
-                    .with_transform(Transform::Exp(ExpTransform))
-                    .with_transform(Transform::Log(LogTransform)),
+                Factor::Call {
+                    transform: Transform::Log(LogTransform),
+                    arguments: vec![Factor::Call {
+                        transform: Transform::Exp(ExpTransform),
+                        arguments: vec![Factor::from("x")],
+                    }],
+                },
             ),
         ];
 

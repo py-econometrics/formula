@@ -12,10 +12,26 @@ pub enum Transform {
     C(CategoricalTransform),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgumentCount {
+    Exactly(usize),
+    AtLeast(usize),
+}
+
+impl ArgumentCount {
+    pub(crate) fn accepts(self, actual: usize) -> bool {
+        match self {
+            Self::Exactly(expected) => actual == expected,
+            Self::AtLeast(expected) => actual >= expected,
+        }
+    }
+}
+
 pub(crate) trait TransformOperation {
     fn expands(&self) -> bool;
-    fn fit(&mut self, input: &Series) -> Result<(), TransformError>;
-    fn transform(&self, input: &Series) -> Result<DataFrame, TransformError>;
+    fn argument_count(&self) -> ArgumentCount;
+    fn fit(&mut self, input: &[Series]) -> Result<(), TransformError>;
+    fn transform(&self, input: &[Series]) -> Result<DataFrame, TransformError>;
 }
 
 impl TransformOperation for Transform {
@@ -27,21 +43,38 @@ impl TransformOperation for Transform {
         }
     }
 
-    fn fit(&mut self, input: &Series) -> Result<(), TransformError> {
+    fn argument_count(&self) -> ArgumentCount {
         match self {
-            Self::Log(log) => log.fit(input),
-            Self::Exp(exp) => exp.fit(input),
-            Self::C(categorical) => categorical.fit(input),
+            Self::Log(log) => log.argument_count(),
+            Self::Exp(ex) => ex.argument_count(),
+            Self::C(categorical) => categorical.argument_count(),
         }
     }
 
-    fn transform(&self, input: &Series) -> Result<DataFrame, TransformError> {
+    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
         match self {
-            Self::Log(log) => log.transform(input),
-            Self::Exp(exp) => exp.transform(input),
-            Self::C(categorical) => categorical.transform(input),
+            Self::Log(log) => log.fit(inputs),
+            Self::Exp(exp) => exp.fit(inputs),
+            Self::C(categorical) => categorical.fit(inputs),
         }
     }
+
+    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        match self {
+            Self::Log(log) => log.transform(inputs),
+            Self::Exp(exp) => exp.transform(inputs),
+            Self::C(categorical) => categorical.transform(inputs),
+        }
+    }
+}
+
+fn validate_single_input(inputs: &[Series]) -> Result<&Series, TransformError> {
+    let [input] = inputs else {
+        return Err(TransformError::InvalidParameter(
+            "expected exactly one input column".into(),
+        ));
+    };
+    Ok(input)
 }
 
 fn validate_numeric_input(input: &Series) -> Result<(), TransformError> {
@@ -76,12 +109,17 @@ impl TransformOperation for LogTransform {
         false
     }
 
-    fn fit(&mut self, input: &Series) -> Result<(), TransformError> {
-        validate_numeric_input(input)
+    fn argument_count(&self) -> ArgumentCount {
+        ArgumentCount::Exactly(1)
     }
 
-    fn transform(&self, input: &Series) -> Result<DataFrame, TransformError> {
-        transform_numeric(input, "log", |expr| expr.log(lit(std::f64::consts::E)))
+    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
+        validate_numeric_input(validate_single_input(inputs)?)
+    }
+
+    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        let log = |expr: Expr| expr.log(lit(std::f64::consts::E));
+        transform_numeric(validate_single_input(inputs)?, "log", log)
     }
 }
 
@@ -93,12 +131,16 @@ impl TransformOperation for ExpTransform {
         false
     }
 
-    fn fit(&mut self, input: &Series) -> Result<(), TransformError> {
-        validate_numeric_input(input)
+    fn argument_count(&self) -> ArgumentCount {
+        ArgumentCount::Exactly(1)
     }
 
-    fn transform(&self, input: &Series) -> Result<DataFrame, TransformError> {
-        transform_numeric(input, "exp", Expr::exp)
+    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
+        validate_numeric_input(validate_single_input(inputs)?)
+    }
+
+    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        transform_numeric(validate_single_input(inputs)?, "exp", Expr::exp)
     }
 }
 
@@ -174,8 +216,15 @@ impl TransformOperation for CategoricalTransform {
     fn expands(&self) -> bool {
         true
     }
-    fn fit(&mut self, input: &Series) -> Result<(), TransformError> {
-        let levels = input.drop_nulls().unique_stable()?;
+
+    fn argument_count(&self) -> ArgumentCount {
+        ArgumentCount::Exactly(1)
+    }
+
+    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
+        let levels = validate_single_input(inputs)?
+            .drop_nulls()
+            .unique_stable()?;
         if let Some(reference) = self.reference_for_dtype(levels.dtype())?
             && !levels
                 .equal(&reference.into_series("reference".into()))?
@@ -189,7 +238,8 @@ impl TransformOperation for CategoricalTransform {
         Ok(())
     }
 
-    fn transform(&self, input: &Series) -> Result<DataFrame, TransformError> {
+    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        let input = validate_single_input(inputs)?;
         let name = input.name().clone();
         let levels = self.levels.as_ref().ok_or(TransformError::NotFitted)?;
         if input.dtype() != levels.dtype() {
@@ -282,7 +332,10 @@ mod tests {
 
     #[test]
     fn log_computes_natural_log_and_preserves_nulls() -> Result<(), TransformError> {
-        let input = Series::new("x".into(), [Some(1.0), Some(std::f64::consts::E), None]);
+        let input = [Series::new(
+            "x".into(),
+            [Some(1.0), Some(std::f64::consts::E), None],
+        )];
         let mut transform = Transform::Log(LogTransform);
 
         assert!(!transform.expands());
@@ -297,7 +350,10 @@ mod tests {
 
     #[test]
     fn exp_computes_exponential_and_preserves_nulls() -> Result<(), TransformError> {
-        let input = Series::new("x".into(), [Some(0.0), Some(1.0), Some(-1.0), None]);
+        let input = [Series::new(
+            "x".into(),
+            [Some(0.0), Some(1.0), Some(-1.0), None],
+        )];
         let mut transform = Transform::Exp(ExpTransform);
 
         assert!(!transform.expands());
@@ -317,16 +373,16 @@ mod tests {
 
     #[test]
     fn numeric_transforms_accept_numeric_widths_without_fit() -> Result<(), TransformError> {
-        let inputs = [
-            Series::new("x".into(), [1_i32, 2]),
-            Series::new("x".into(), [1_i64, 2]),
-            Series::new("x".into(), [1_u32, 2]),
-            Series::new("x".into(), [1_u64, 2]),
-            Series::new("x".into(), [1.0_f32, 2.0]),
-            Series::new("x".into(), [1.0_f64, 2.0]),
+        let cases = [
+            [Series::new("x".into(), [1_i32, 2])],
+            [Series::new("x".into(), [1_i64, 2])],
+            [Series::new("x".into(), [1_u32, 2])],
+            [Series::new("x".into(), [1_u64, 2])],
+            [Series::new("x".into(), [1.0_f32, 2.0])],
+            [Series::new("x".into(), [1.0_f64, 2.0])],
         ];
 
-        for input in inputs {
+        for input in cases {
             assert_numeric_output(
                 &Transform::Log(LogTransform).transform(&input)?,
                 "log(x)",
@@ -343,12 +399,12 @@ mod tests {
 
     #[test]
     fn numeric_transforms_reject_strings_and_booleans() {
-        let inputs = [
-            Series::new("x".into(), ["1", "2"]),
-            Series::new("x".into(), [true, false]),
+        let cases = [
+            [Series::new("x".into(), ["1", "2"])],
+            [Series::new("x".into(), [true, false])],
         ];
 
-        for input in inputs {
+        for input in cases {
             for mut transform in [Transform::Log(LogTransform), Transform::Exp(ExpTransform)] {
                 assert!(matches!(
                     transform.fit(&input),
@@ -364,8 +420,8 @@ mod tests {
 
     #[test]
     fn numeric_transforms_preserve_empty_and_all_null_inputs() -> Result<(), TransformError> {
-        let empty = Series::new("x".into(), Vec::<f64>::new());
-        let all_null = Series::new("x".into(), [None::<f64>, None]);
+        let empty = [Series::new("x".into(), Vec::<f64>::new())];
+        let all_null = [Series::new("x".into(), [None::<f64>, None])];
 
         for (transform, name) in [
             (Transform::Log(LogTransform), "log(x)"),
@@ -380,14 +436,14 @@ mod tests {
     #[test]
     fn numeric_transforms_follow_float_domain_and_overflow_behavior() -> Result<(), TransformError>
     {
-        let input = Series::new("x".into(), [-1.0_f64, 0.0, 1.0]);
+        let input = [Series::new("x".into(), [-1.0_f64, 0.0, 1.0])];
         assert_numeric_output(
             &Transform::Log(LogTransform).transform(&input)?,
             "log(x)",
             &[Some(f64::NAN), Some(f64::NEG_INFINITY), Some(0.0)],
         );
 
-        let input = Series::new("x".into(), [1000.0_f64]);
+        let input = [Series::new("x".into(), [1000.0_f64])];
         assert_numeric_output(
             &Transform::Exp(ExpTransform).transform(&input)?,
             "exp(x)",
@@ -398,7 +454,7 @@ mod tests {
 
     #[test]
     fn transform_enum_delegates_categorical_operations() -> Result<(), TransformError> {
-        let input = Series::new("group".into(), ["a", "b"]);
+        let input = [Series::new("group".into(), ["a", "b"])];
         let reference = Scalar::from(PlSmallStr::from_static("a"));
         let mut transform = Transform::C(CategoricalTransform::new(Some(reference)));
 
@@ -418,7 +474,7 @@ mod tests {
 
     fn assert_output(
         transform: &CategoricalTransform,
-        input: &Series,
+        input: &[Series],
         actual: &DataFrame,
         expected: &[&[Option<bool>]],
     ) {
@@ -435,7 +491,7 @@ mod tests {
                 )
             })
             .filter(|level| reference.as_ref() != Some(level))
-            .map(|level| transform.column_name(input.name(), &level))
+            .map(|level| transform.column_name(input[0].name(), &level))
             .collect::<Vec<_>>();
 
         for (index, (column, expected_values)) in actual.columns().iter().zip(expected).enumerate()
@@ -459,7 +515,7 @@ mod tests {
     #[test]
     fn categorical_requires_fit() {
         let transform = CategoricalTransform::new(None);
-        let input = Series::new("group".into(), ["a", "b"]);
+        let input = [Series::new("group".into(), ["a", "b"])];
 
         assert!(matches!(
             transform.transform(&input),
@@ -469,12 +525,15 @@ mod tests {
 
     #[test]
     fn categorical_preserves_fitted_order_and_schema() -> Result<(), TransformError> {
-        let training = Series::new(
+        let training = [Series::new(
             "group".into(),
             [Some("b"), Some("a"), Some("b"), None, Some("c")],
-        );
+        )];
         // The new data omits c, but its fitted output column must remain.
-        let input = Series::new("group".into(), [Some("a"), Some("b"), Some("unseen"), None]);
+        let input = [Series::new(
+            "group".into(),
+            [Some("a"), Some("b"), Some("unseen"), None],
+        )];
         let mut transform = CategoricalTransform::new(None);
 
         transform.fit(&training)?;
@@ -495,11 +554,14 @@ mod tests {
 
     #[test]
     fn categorical_omits_reference_and_preserves_nulls() -> Result<(), TransformError> {
-        let training = Series::new("group".into(), [Some("a"), Some("b"), Some("c"), None]);
-        let input = Series::new(
+        let training = [Series::new(
+            "group".into(),
+            [Some("a"), Some("b"), Some("c"), None],
+        )];
+        let input = [Series::new(
             "group".into(),
             [Some("a"), Some("b"), Some("c"), Some("unseen"), None],
-        );
+        )];
         let reference = Scalar::from(PlSmallStr::from_static("a"));
         let mut transform = CategoricalTransform::new(Some(reference));
 
@@ -521,10 +583,10 @@ mod tests {
     #[test]
     fn categorical_accepts_integer_reference_across_widths() -> Result<(), TransformError> {
         let inputs = [
-            Series::new("group".into(), [1_i32, 2, 1]),
-            Series::new("group".into(), [1_i64, 2, 1]),
-            Series::new("group".into(), [1_u32, 2, 1]),
-            Series::new("group".into(), [1_u64, 2, 1]),
+            [Series::new("group".into(), [1_i32, 2, 1])],
+            [Series::new("group".into(), [1_i64, 2, 1])],
+            [Series::new("group".into(), [1_u32, 2, 1])],
+            [Series::new("group".into(), [1_u64, 2, 1])],
         ];
         for input in inputs {
             let mut transform = CategoricalTransform::new(Some(Scalar::from(1_i64)));
@@ -541,7 +603,7 @@ mod tests {
 
     #[test]
     fn categorical_resolves_float_reference_to_column_precision() -> Result<(), TransformError> {
-        let input = Series::new("group".into(), [0.1_f32, 0.2, 0.1]);
+        let input = [Series::new("group".into(), [0.1_f32, 0.2, 0.1])];
         let mut transform = CategoricalTransform::new(Some(Scalar::from(0.1_f64)));
 
         transform.fit(&input)?;
@@ -557,7 +619,7 @@ mod tests {
 
     #[test]
     fn categorical_supports_boolean_reference() -> Result<(), TransformError> {
-        let input = Series::new("group".into(), [Some(true), Some(false), None]);
+        let input = [Series::new("group".into(), [Some(true), Some(false), None])];
         let mut transform = CategoricalTransform::new(Some(Scalar::from(false)));
 
         transform.fit(&input)?;
@@ -573,7 +635,7 @@ mod tests {
 
     #[test]
     fn categorical_rejects_missing_reference() {
-        let input = Series::new("group".into(), ["a", "b"]);
+        let input = [Series::new("group".into(), ["a", "b"])];
         let reference = Scalar::from(PlSmallStr::from_static("missing"));
         let mut transform = CategoricalTransform::new(Some(reference));
 
@@ -590,13 +652,19 @@ mod tests {
     #[test]
     fn categorical_rejects_reference_type_changes() {
         let cases = [
-            (Scalar::from(1_i64), Series::new("group".into(), [1.0_f64])),
-            (Scalar::from(1.0_f64), Series::new("group".into(), [1_i32])),
-            (Scalar::from(true), Series::new("group".into(), [1_i32])),
-            (Scalar::from(1_i64), Series::new("group".into(), [true])),
+            (
+                Scalar::from(1_i64),
+                [Series::new("group".into(), [1.0_f64])],
+            ),
+            (
+                Scalar::from(1.0_f64),
+                [Series::new("group".into(), [1_i32])],
+            ),
+            (Scalar::from(true), [Series::new("group".into(), [1_i32])]),
+            (Scalar::from(1_i64), [Series::new("group".into(), [true])]),
             (
                 Scalar::from(PlSmallStr::from_static("1")),
-                Series::new("group".into(), [1_i32]),
+                [Series::new("group".into(), [1_i32])],
             ),
         ];
 
@@ -614,11 +682,11 @@ mod tests {
         let cases = [
             (
                 Scalar::from(-1_i64),
-                Series::new("group".into(), [0_u32, 1]),
+                [Series::new("group".into(), [0_u32, 1])],
             ),
             (
                 Scalar::from(i64::MAX),
-                Series::new("group".into(), [0_i32, 1]),
+                [Series::new("group".into(), [0_i32, 1])],
             ),
         ];
 
@@ -633,7 +701,7 @@ mod tests {
 
     #[test]
     fn categorical_rejects_nonfinite_float_reference() {
-        let input = Series::new("group".into(), [0.1_f32, 0.2]);
+        let input = [Series::new("group".into(), [0.1_f32, 0.2])];
 
         for reference in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
             let mut transform = CategoricalTransform::new(Some(Scalar::from(reference)));
@@ -646,8 +714,8 @@ mod tests {
 
     #[test]
     fn categorical_rejects_changed_input_dtype() -> Result<(), TransformError> {
-        let training = Series::new("group".into(), [1_i32, 2]);
-        let input = Series::new("group".into(), [1_i64, 2]);
+        let training = [Series::new("group".into(), [1_i32, 2])];
+        let input = [Series::new("group".into(), [1_i64, 2])];
 
         for reference in [None, Some(Scalar::from(1_i64))] {
             let mut transform = CategoricalTransform::new(reference);
@@ -662,9 +730,9 @@ mod tests {
 
     #[test]
     fn categorical_refit_replaces_fitted_levels() -> Result<(), TransformError> {
-        let first = Series::new("group".into(), ["a", "b"]);
-        let second = Series::new("group".into(), ["b", "c"]);
-        let input = Series::new("group".into(), ["a", "b", "c"]);
+        let first = [Series::new("group".into(), ["a", "b"])];
+        let second = [Series::new("group".into(), ["b", "c"])];
+        let input = [Series::new("group".into(), ["a", "b", "c"])];
         let mut transform = CategoricalTransform::new(None);
 
         transform.fit(&first)?;

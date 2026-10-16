@@ -1,5 +1,5 @@
 use crate::design::{Design, MaterializationError, MaterializationMode, Model};
-use crate::transform::{Transform, TransformError, TransformOperation};
+use crate::transform::{ArgumentCount, Transform, TransformError, TransformOperation};
 use polars::error::PolarsResult;
 use polars::frame::DataFrame;
 use polars::prelude::{DataType, Series};
@@ -11,60 +11,81 @@ fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Factor {
-    name: String,
-    transforms: Vec<Transform>,
+pub(crate) enum Factor {
+    Variable(String),
+    Call {
+        transform: Transform,
+        arguments: Vec<Factor>,
+    },
 }
 
 impl From<&str> for Factor {
     fn from(value: &str) -> Self {
-        Self {
-            name: value.to_owned(),
-            transforms: Vec::new(),
-        }
+        Self::Variable(value.to_owned())
     }
 }
 
 impl Factor {
-    pub(crate) fn with_transform(mut self, transform: Transform) -> Self {
-        self.transforms.push(transform);
-        self
-    }
-
     fn validate(&self) -> Result<(), ValidationError> {
-        for pair in self.transforms.windows(2) {
-            if pair[0].expands() {
-                return Err(ValidationError::InvalidTransformComposition);
+        match self {
+            Self::Variable(_) => Ok(()),
+            Self::Call {
+                transform,
+                arguments,
+            } => {
+                let expected = transform.argument_count();
+
+                if !expected.accepts(arguments.len()) {
+                    return Err(ValidationError::InvalidArgumentCount {
+                        expected,
+                        actual: arguments.len(),
+                    });
+                }
+
+                for argument in arguments {
+                    argument.validate()?;
+
+                    if let Self::Call { transform, .. } = argument
+                        && transform.expands()
+                    {
+                        return Err(ValidationError::InvalidTransformComposition);
+                    }
+                }
+
+                Ok(())
             }
         }
-        Ok(())
     }
     fn materialize(
         &mut self,
         data: &DataFrame,
         mode: MaterializationMode,
     ) -> Result<Vec<Series>, TransformError> {
-        let mut input = data.column(&self.name)?.as_materialized_series().clone();
-        let mut transforms = self.transforms.iter_mut().peekable();
-
-        while let Some(transform) = transforms.next() {
-            if matches!(mode, MaterializationMode::Fit) {
-                transform.fit(&input)?;
+        match self {
+            Self::Variable(name) => {
+                let column = data.column(name)?.as_materialized_series().clone();
+                Ok(vec![column])
             }
-            let output = transform.transform(&input)?;
-
-            if transforms.peek().is_none() {
-                return Ok(output
+            Self::Call {
+                transform,
+                arguments,
+            } => {
+                let mut inputs = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    inputs.extend(argument.materialize(data, mode)?);
+                }
+                match mode {
+                    MaterializationMode::Fit => transform.fit(&inputs)?,
+                    MaterializationMode::Apply => {}
+                }
+                let output = transform.transform(&inputs)?;
+                Ok(output
                     .columns()
                     .iter()
                     .map(|column| column.as_materialized_series().clone())
-                    .collect());
+                    .collect())
             }
-
-            input = output.columns()[0].as_materialized_series().clone();
         }
-
-        Ok(vec![input])
     }
 }
 
@@ -250,6 +271,68 @@ impl Formula {
 
 #[derive(Debug)]
 pub enum ValidationError {
+    InvalidArgumentCount {
+        expected: ArgumentCount,
+        actual: usize,
+    },
     InvalidTransformComposition,
     EmptyTerm,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transform::{CategoricalTransform, ExpTransform, LogTransform};
+    use polars::prelude::Scalar;
+    fn assert_requires_one_argument(transform: Transform) {
+        for count in [0, 1, 2, 3] {
+            let arguments = (0..count)
+                .map(|index| Factor::Variable(format!("x{index}")))
+                .collect();
+
+            let factor = Factor::Call {
+                transform: transform.clone(),
+                arguments,
+            };
+
+            let result = factor.validate();
+
+            if count == 1 {
+                assert!(
+                    result.is_ok(),
+                    "{factor:?}: expected success, got {result:?}",
+                );
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ValidationError::InvalidArgumentCount {
+                            expected: ArgumentCount::Exactly(1),
+                            actual,
+                        }) if actual == count
+                    ),
+                    "{factor:?}: expected an argument-count error, got {result:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_requires_exactly_one_argument() {
+        assert_requires_one_argument(Transform::Log(LogTransform));
+    }
+
+    #[test]
+    fn exp_requires_exactly_one_argument() {
+        assert_requires_one_argument(Transform::Exp(ExpTransform));
+    }
+
+    #[test]
+    fn categorical_requires_exactly_one_argument() {
+        assert_requires_one_argument(Transform::C(CategoricalTransform::new(None)));
+
+        assert_requires_one_argument(Transform::C(CategoricalTransform::new(Some(Scalar::from(
+            1_i64,
+        )))));
+    }
 }
