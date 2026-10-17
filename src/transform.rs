@@ -8,8 +8,7 @@ use polars::prelude::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Transform {
-    Log(LogTransform),
-    Exp(ExpTransform),
+    Expression(ExpressionTransform),
     C(CategoricalTransform),
     F(IntegerEncodingTransform),
 }
@@ -39,8 +38,7 @@ pub(crate) trait TransformOperation {
 impl TransformOperation for Transform {
     fn expands(&self) -> bool {
         match self {
-            Self::Log(log) => log.expands(),
-            Self::Exp(exp) => exp.expands(),
+            Self::Expression(expression) => expression.expands(),
             Self::C(categorical) => categorical.expands(),
             Self::F(integer) => integer.expands(),
         }
@@ -48,8 +46,7 @@ impl TransformOperation for Transform {
 
     fn argument_count(&self) -> ArgumentCount {
         match self {
-            Self::Log(log) => log.argument_count(),
-            Self::Exp(ex) => ex.argument_count(),
+            Self::Expression(expression) => expression.argument_count(),
             Self::C(categorical) => categorical.argument_count(),
             Self::F(integer) => integer.argument_count(),
         }
@@ -57,8 +54,7 @@ impl TransformOperation for Transform {
 
     fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
         match self {
-            Self::Log(log) => log.fit(inputs),
-            Self::Exp(exp) => exp.fit(inputs),
+            Self::Expression(expression) => expression.fit(inputs),
             Self::C(categorical) => categorical.fit(inputs),
             Self::F(integer) => integer.fit(inputs),
         }
@@ -66,12 +62,36 @@ impl TransformOperation for Transform {
 
     fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
         match self {
-            Self::Log(log) => log.transform(inputs),
-            Self::Exp(exp) => exp.transform(inputs),
+            Self::Expression(expression) => expression.transform(inputs),
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),
         }
     }
+}
+
+fn argument_column_name(index: usize) -> PlSmallStr {
+    format!("__arg_{index}").into()
+}
+
+fn input_frame(inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    let Some(first) = inputs.first() else {
+        return Err(TransformError::InvalidParameter(
+            "expected at least one input column".into(),
+        ));
+    };
+
+    let columns = inputs
+        .iter()
+        .enumerate()
+        // Positional names allow repeated arguments and avoid internal collisions.
+        .map(|(index, input)| {
+            let mut column = input.clone();
+            column.rename(argument_column_name(index));
+            column.into()
+        })
+        .collect();
+
+    Ok(DataFrame::new(first.len(), columns)?)
 }
 
 fn validate_single_input(inputs: &[Series]) -> Result<&Series, TransformError> {
@@ -90,63 +110,118 @@ fn validate_numeric_input(input: &Series) -> Result<(), TransformError> {
     Ok(())
 }
 
-fn transform_numeric(
-    input: &Series,
-    name: &str,
-    operation: fn(Expr) -> Expr,
-) -> Result<DataFrame, TransformError> {
-    validate_numeric_input(input)?;
+type ExpressionBuilder = fn(&[Expr]) -> Result<Expr, TransformError>;
 
-    let expression = operation(col(input.name().clone()).cast(DataType::Float64))
-        .alias(format!("{name}({})", input.name()));
-    Ok(input
-        .clone()
-        .into_frame()
-        .lazy()
-        .select([expression])
-        .collect()?)
+#[derive(Clone, Copy, Debug)]
+enum InputPolicy {
+    NumericFloat64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LogTransform;
+impl InputPolicy {
+    fn validate(self, input: &Series) -> Result<(), TransformError> {
+        match self {
+            Self::NumericFloat64 => validate_numeric_input(input),
+        }
+    }
 
-impl TransformOperation for LogTransform {
+    fn prepare(self, input: Expr) -> Expr {
+        match self {
+            Self::NumericFloat64 => input.cast(DataType::Float64),
+        }
+    }
+}
+
+/// A registered stateless, elementwise operation producing one column.
+/// Builders must preserve row order and alignment. Names uniquely identify internal registrations.
+#[derive(Clone, Debug)]
+pub(crate) struct ExpressionTransform {
+    name: &'static str,
+    argument_count: ArgumentCount,
+    input_policy: InputPolicy,
+    build: ExpressionBuilder,
+}
+
+impl PartialEq for ExpressionTransform {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl ExpressionTransform {
+    pub(crate) const LOG: Self = Self {
+        name: "log",
+        argument_count: ArgumentCount::Exactly(1),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| Ok(inputs[0].clone().log(lit(std::f64::consts::E))),
+    };
+
+    pub(crate) const EXP: Self = Self {
+        name: "exp",
+        argument_count: ArgumentCount::Exactly(1),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| Ok(inputs[0].clone().exp()),
+    };
+
+    fn output_name(&self, inputs: &[Series]) -> PlSmallStr {
+        let arguments = inputs
+            .iter()
+            .map(|input| input.name().as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!("{}({arguments})", self.name).into()
+    }
+
+    fn validate_inputs(&self, inputs: &[Series]) -> Result<(), TransformError> {
+        if !self.argument_count.accepts(inputs.len()) {
+            return Err(TransformError::InvalidParameter(format!(
+                "{} expects {:?} arguments, got {}",
+                self.name,
+                self.argument_count,
+                inputs.len(),
+            )));
+        }
+        for input in inputs {
+            self.input_policy.validate(input)?;
+        }
+        Ok(())
+    }
+}
+
+impl TransformOperation for ExpressionTransform {
     fn expands(&self) -> bool {
         false
     }
 
     fn argument_count(&self) -> ArgumentCount {
-        ArgumentCount::Exactly(1)
+        self.argument_count
     }
 
-    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
-        validate_numeric_input(validate_single_input(inputs)?)
-    }
-
-    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        let log = |expr: Expr| expr.log(lit(std::f64::consts::E));
-        transform_numeric(validate_single_input(inputs)?, "log", log)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ExpTransform;
-
-impl TransformOperation for ExpTransform {
-    fn expands(&self) -> bool {
-        false
-    }
-
-    fn argument_count(&self) -> ArgumentCount {
-        ArgumentCount::Exactly(1)
-    }
-
-    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
-        validate_numeric_input(validate_single_input(inputs)?)
+    fn fit(&mut self, _inputs: &[Series]) -> Result<(), TransformError> {
+        Ok(())
     }
 
     fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        transform_numeric(validate_single_input(inputs)?, "exp", Expr::exp)
+        self.validate_inputs(inputs)?;
+        let frame = input_frame(inputs)?;
+        let height = frame.height();
+        let expressions = (0..inputs.len())
+            .map(|index| self.input_policy.prepare(col(argument_column_name(index))))
+            .collect::<Vec<_>>();
+        let expression = (self.build)(&expressions)?.alias(self.output_name(inputs));
+        let output = frame.lazy().select([expression]).collect()?;
+        if output.shape() != (height, 1) {
+            return Err(PolarsError::ShapeMismatch(
+                format!(
+                    "{} must produce one column with {height} rows, got {:?}",
+                    self.name,
+                    output.shape(),
+                )
+                .into(),
+            )
+            .into());
+        }
+        Ok(output)
     }
 }
 
@@ -164,7 +239,7 @@ impl CategoricalTransform {
         }
     }
 
-    fn column_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
+    fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
         let call = match &self.reference {
             Some(reference) => {
                 let value = match reference.as_any_value() {
@@ -271,7 +346,7 @@ impl TransformOperation for CategoricalTransform {
             .into_iter()
             .filter(|level| reference.as_ref() != Some(level))
             .map(|level| {
-                let column_name = self.column_name(&name, &level);
+                let column_name = self.output_name(&name, &level);
                 when(col(name.clone()).is_null())
                     .then(lit(NULL))
                     .when(level_was_seen.clone())
@@ -299,31 +374,6 @@ pub(crate) struct IntegerEncodingTransform {
 
 impl IntegerEncodingTransform {
     const CODE_COLUMN: &'static str = "__code";
-
-    fn key_column(index: usize) -> PlSmallStr {
-        format!("__key_{index}").into()
-    }
-
-    fn input_frame(inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        let Some(first) = inputs.first() else {
-            return Err(TransformError::InvalidParameter(
-                "expected at least one input column".into(),
-            ));
-        };
-
-        let columns = inputs
-            .iter()
-            .enumerate()
-            // Rename columns to guarantee uniqueness and avoid collisions with
-            .map(|(index, input)| {
-                let mut column = input.clone();
-                column.rename(Self::key_column(index));
-                column.into()
-            })
-            .collect();
-
-        Ok(DataFrame::new(first.len(), columns)?)
-    }
 }
 
 impl TransformOperation for IntegerEncodingTransform {
@@ -336,7 +386,7 @@ impl TransformOperation for IntegerEncodingTransform {
     }
 
     fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
-        let mapping = Self::input_frame(inputs)?
+        let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
             .unique_stable(None, UniqueKeepStrategy::First)
@@ -360,7 +410,7 @@ impl TransformOperation for IntegerEncodingTransform {
             ));
         }
 
-        let input_frame = Self::input_frame(inputs)?;
+        let input_frame = input_frame(inputs)?;
         for column in input_frame.columns() {
             if column.dtype() != mapping.column(column.name())?.dtype() {
                 return Err(TransformError::InputTypeMismatch);
@@ -581,10 +631,7 @@ mod tests {
                 [Some(0), Some(1), Some(0)],
             ),
             (
-                [
-                    column,
-                    Series::new(IntegerEncodingTransform::key_column(0), [1_i32, 1, 2]),
-                ],
+                [column, Series::new(argument_column_name(0), [1_i32, 1, 2])],
                 [Some(0), Some(1), Some(2)],
             ),
         ];
@@ -687,7 +734,7 @@ mod tests {
             "x".into(),
             [Some(1.0), Some(std::f64::consts::E), None],
         )];
-        let mut transform = Transform::Log(LogTransform);
+        let mut transform = Transform::Expression(ExpressionTransform::LOG);
 
         assert!(!transform.expands());
         transform.fit(&input)?;
@@ -705,7 +752,7 @@ mod tests {
             "x".into(),
             [Some(0.0), Some(1.0), Some(-1.0), None],
         )];
-        let mut transform = Transform::Exp(ExpTransform);
+        let mut transform = Transform::Expression(ExpressionTransform::EXP);
 
         assert!(!transform.expands());
         transform.fit(&input)?;
@@ -735,12 +782,12 @@ mod tests {
 
         for input in cases {
             assert_numeric_output(
-                &Transform::Log(LogTransform).transform(&input)?,
+                &Transform::Expression(ExpressionTransform::LOG).transform(&input)?,
                 "log(x)",
                 &[Some(0.0), Some(std::f64::consts::LN_2)],
             );
             assert_numeric_output(
-                &Transform::Exp(ExpTransform).transform(&input)?,
+                &Transform::Expression(ExpressionTransform::EXP).transform(&input)?,
                 "exp(x)",
                 &[Some(std::f64::consts::E), Some(std::f64::consts::E.powi(2))],
             );
@@ -756,11 +803,11 @@ mod tests {
         ];
 
         for input in cases {
-            for mut transform in [Transform::Log(LogTransform), Transform::Exp(ExpTransform)] {
-                assert!(matches!(
-                    transform.fit(&input),
-                    Err(TransformError::InputTypeMismatch)
-                ));
+            for mut transform in [
+                Transform::Expression(ExpressionTransform::LOG),
+                Transform::Expression(ExpressionTransform::EXP),
+            ] {
+                assert!(transform.fit(&input).is_ok());
                 assert!(matches!(
                     transform.transform(&input),
                     Err(TransformError::InputTypeMismatch)
@@ -775,8 +822,8 @@ mod tests {
         let all_null = [Series::new("x".into(), [None::<f64>, None])];
 
         for (transform, name) in [
-            (Transform::Log(LogTransform), "log(x)"),
-            (Transform::Exp(ExpTransform), "exp(x)"),
+            (Transform::Expression(ExpressionTransform::LOG), "log(x)"),
+            (Transform::Expression(ExpressionTransform::EXP), "exp(x)"),
         ] {
             assert_numeric_output(&transform.transform(&empty)?, name, &[]);
             assert_numeric_output(&transform.transform(&all_null)?, name, &[None, None]);
@@ -789,14 +836,14 @@ mod tests {
     {
         let input = [Series::new("x".into(), [-1.0_f64, 0.0, 1.0])];
         assert_numeric_output(
-            &Transform::Log(LogTransform).transform(&input)?,
+            &Transform::Expression(ExpressionTransform::LOG).transform(&input)?,
             "log(x)",
             &[Some(f64::NAN), Some(f64::NEG_INFINITY), Some(0.0)],
         );
 
         let input = [Series::new("x".into(), [1000.0_f64])];
         assert_numeric_output(
-            &Transform::Exp(ExpTransform).transform(&input)?,
+            &Transform::Expression(ExpressionTransform::EXP).transform(&input)?,
             "exp(x)",
             &[Some(f64::INFINITY)],
         );
@@ -842,7 +889,7 @@ mod tests {
                 )
             })
             .filter(|level| reference.as_ref() != Some(level))
-            .map(|level| transform.column_name(input[0].name(), &level))
+            .map(|level| transform.output_name(input[0].name(), &level))
             .collect::<Vec<_>>();
 
         for (index, (column, expected_values)) in actual.columns().iter().zip(expected).enumerate()
