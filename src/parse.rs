@@ -250,6 +250,18 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("exp", keywords)?;
                 Transform::Expression(ExpressionTransform::EXP)
             }
+            "sqrt" => {
+                reject_keywords("sqrt", keywords)?;
+                Transform::Expression(ExpressionTransform::SQRT)
+            }
+            "add" => {
+                reject_keywords("add", keywords)?;
+                Transform::Expression(ExpressionTransform::ADD)
+            }
+            "sub" => {
+                reject_keywords("sub", keywords)?;
+                Transform::Expression(ExpressionTransform::SUB)
+            }
             "C" => {
                 let reference = keywords.remove("reference");
                 reject_keywords("C", keywords)?;

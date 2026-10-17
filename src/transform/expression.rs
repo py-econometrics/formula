@@ -1,4 +1,4 @@
-use super::input::{argument_column_name, input_frame};
+use super::input::input_frame;
 use super::{ArgumentCount, TransformError, TransformOperation, call_name};
 use polars::error::PolarsError;
 use polars::prelude::{DataFrame, DataType, Expr, IntoLazy, PlSmallStr, Series, col, lit};
@@ -67,6 +67,37 @@ impl ExpressionTransform {
         build: |inputs| Ok(inputs[0].clone().exp()),
     };
 
+    pub(crate) const SQRT: Self = Self {
+        name: "sqrt",
+        argument_count: ArgumentCount::Exactly(1),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| Ok(inputs[0].clone().sqrt()),
+    };
+
+    pub(crate) const ADD: Self = Self {
+        name: "add",
+        argument_count: ArgumentCount::AtLeast(2),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| {
+            Ok(inputs[1..]
+                .iter()
+                .fold(inputs[0].clone(), |sum, input| sum + input.clone()))
+        },
+    };
+
+    pub(crate) const SUB: Self = Self {
+        name: "sub",
+        argument_count: ArgumentCount::AtLeast(2),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| {
+            Ok(inputs[1..]
+                .iter()
+                .fold(inputs[0].clone(), |difference, input| {
+                    difference - input.clone()
+                }))
+        },
+    };
+
     fn output_name(&self, inputs: &[Series]) -> PlSmallStr {
         call_name(self.name, inputs.iter().map(|input| input.name().as_str()))
     }
@@ -104,8 +135,10 @@ impl TransformOperation for ExpressionTransform {
         self.validate_inputs(inputs)?;
         let frame = input_frame(inputs)?;
         let height = frame.height();
-        let expressions = (0..inputs.len())
-            .map(|index| self.input_policy.prepare(col(argument_column_name(index))))
+        let expressions = frame
+            .columns()
+            .iter()
+            .map(|column| self.input_policy.prepare(col(column.name().clone())))
             .collect::<Vec<_>>();
         let expression = (self.build)(&expressions)?.alias(self.output_name(inputs));
         let output = frame.lazy().select([expression]).collect()?;
@@ -155,6 +188,89 @@ mod tests {
                 (actual, expected) => panic!("actual {actual:?}, expected {expected:?}"),
             }
         }
+    }
+
+    #[test]
+    fn sqrt_preserves_row_order_nulls_and_domain_behavior() {
+        let data = polars::df!("x" => [Some(9.0), Some(1.0), Some(4.0), None, Some(-1.0)]).unwrap();
+        let output = crate::parse_expression("sqrt(x)")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert_numeric_output(
+            &output.to_frame().unwrap(),
+            "sqrt(x)",
+            &[Some(3.0), Some(1.0), Some(2.0), None, Some(f64::NAN)],
+        );
+    }
+
+    #[test]
+    fn add_accepts_repeated_arguments_and_mixed_numeric_types() {
+        let data = polars::df!("x" => [3_i32, 1], "y" => [Some(0.5_f32), None]).unwrap();
+        let output = crate::parse_expression("add(x, y, x)")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert_numeric_output(
+            &output.to_frame().unwrap(),
+            "add(x, y, x)",
+            &[Some(6.5), None],
+        );
+    }
+
+    #[test]
+    fn sub_preserves_argument_order_and_associates_left() {
+        let data = polars::df!("x" => [10, 3], "y" => [3, 10], "z" => [2, 1]).unwrap();
+        let output = crate::parse_expression("sub(x, y, z)")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert_numeric_output(
+            &output.to_frame().unwrap(),
+            "sub(x, y, z)",
+            &[Some(5.0), Some(-8.0)],
+        );
+    }
+
+    #[test]
+    fn expression_functions_validate_arity_and_reject_keywords() {
+        let data = polars::df!("x" => [1.0]).unwrap();
+        for source in ["sqrt()", "sqrt(x, x)", "add()", "add(x)", "sub()", "sub(x)"] {
+            assert!(
+                matches!(
+                    crate::parse_expression(source).unwrap().materialize(&data),
+                    Err(crate::MaterializationError::Validation(
+                        crate::ValidationError::InvalidArgumentCount { .. }
+                    ))
+                ),
+                "{source}"
+            );
+        }
+        for source in ["sqrt(x, base=2)", "add(x, x, base=2)", "sub(x, x, base=2)"] {
+            assert!(crate::parse_expression(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn repeated_expression_factors_are_deduplicated() {
+        assert_eq!(
+            crate::parse_expression("log(x) + log(x)").unwrap(),
+            crate::parse_expression("log(x)").unwrap(),
+        );
+    }
+
+    #[test]
+    fn expression_rejects_output_with_wrong_row_count() {
+        let transform = ExpressionTransform {
+            name: "first",
+            build: |inputs| Ok(inputs[0].clone().first()),
+            ..ExpressionTransform::LOG
+        };
+        let inputs = [Series::new("x".into(), [1.0, 2.0])];
+        assert!(matches!(
+            transform.transform(&inputs),
+            Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
+        ));
     }
 
     #[test]

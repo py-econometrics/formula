@@ -1,4 +1,4 @@
-use super::input::validate_single_input;
+use super::input::{input_frame, validate_single_input};
 use super::{ArgumentCount, TransformError, TransformOperation, call_name};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
@@ -104,11 +104,12 @@ impl TransformOperation for CategoricalTransform {
 
     fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
         let input = validate_single_input(inputs)?;
-        let name = input.name().clone();
         let levels = self.levels.as_ref().ok_or(TransformError::NotFitted)?;
         if input.dtype() != levels.dtype() {
             return Err(TransformError::InputTypeMismatch);
         }
+        let frame = input_frame(inputs)?;
+        let argument = col(frame.columns()[0].name().clone());
         let reference = self.reference_for_dtype(input.dtype())?;
         let fitted_levels = (0..levels.len())
             .map(|i| {
@@ -121,7 +122,7 @@ impl TransformOperation for CategoricalTransform {
 
         let level_was_seen = fitted_levels
             .iter()
-            .map(|level| col(name.clone()).eq_missing(lit(level.clone())))
+            .map(|level| argument.clone().eq_missing(lit(level.clone())))
             .reduce(|left, right| left.or(right))
             .unwrap_or(lit(false));
 
@@ -129,22 +130,17 @@ impl TransformOperation for CategoricalTransform {
             .into_iter()
             .filter(|level| reference.as_ref() != Some(level))
             .map(|level| {
-                let column_name = self.output_name(&name, &level);
-                when(col(name.clone()).is_null())
+                let column_name = self.output_name(input.name(), &level);
+                when(argument.clone().is_null())
                     .then(lit(NULL))
                     .when(level_was_seen.clone())
-                    .then(col(name.clone()).eq(lit(level)))
+                    .then(argument.clone().eq(lit(level)))
                     .otherwise(lit(NULL))
                     .alias(column_name)
             })
             .collect::<Vec<_>>();
 
-        let result = input
-            .clone()
-            .into_frame()
-            .lazy()
-            .select(expressions)
-            .collect()?;
+        let result = frame.lazy().select(expressions).collect()?;
         Ok(result)
     }
 }
