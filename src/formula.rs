@@ -282,7 +282,9 @@ pub enum ValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{CategoricalTransform, ExpTransform, LogTransform};
+    use crate::transform::{
+        CategoricalTransform, ExpTransform, IntegerEncodingTransform, LogTransform,
+    };
     use polars::prelude::Scalar;
     fn assert_requires_one_argument(transform: Transform) {
         for count in [0, 1, 2, 3] {
@@ -334,5 +336,140 @@ mod tests {
         assert_requires_one_argument(Transform::C(CategoricalTransform::new(Some(Scalar::from(
             1_i64,
         )))));
+    }
+
+    #[test]
+    fn integer_encoding_requires_at_least_one_argument_and_allows_repetition() {
+        for count in [0, 1, 2, 3, 16] {
+            let factor = Factor::Call {
+                transform: Transform::F(IntegerEncodingTransform::default()),
+                arguments: vec![Factor::from("x"); count],
+            };
+            let result = factor.validate();
+            if count == 0 {
+                assert!(matches!(
+                    result,
+                    Err(ValidationError::InvalidArgumentCount {
+                        expected: ArgumentCount::AtLeast(1),
+                        actual: 0,
+                    })
+                ));
+            } else {
+                assert!(result.is_ok(), "{count} arguments: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn integer_encoding_rejects_expanding_arguments_in_any_position() {
+        for position in 0..3 {
+            let mut arguments = vec![Factor::from("x"); 3];
+            arguments[position] = Factor::Call {
+                transform: Transform::C(CategoricalTransform::new(None)),
+                arguments: vec![Factor::from("group")],
+            };
+            let factor = Factor::Call {
+                transform: Transform::F(IntegerEncodingTransform::default()),
+                arguments,
+            };
+            assert!(matches!(
+                factor.validate(),
+                Err(ValidationError::InvalidTransformComposition)
+            ));
+        }
+    }
+
+    #[test]
+    fn model_materialization_reuses_fitted_integer_encoding() {
+        let training = polars::df!(
+            "y" => [1.0, 2.0, 3.0],
+            "f1" => ["a", "b", "a"],
+            "f2" => [1_i32, 1, 2],
+        )
+        .unwrap();
+        let input = polars::df!(
+            "y" => [4.0, 5.0, 6.0, 7.0],
+            "f1" => ["a", "b", "a", "unseen"],
+            "f2" => [2_i32, 1, 1, 1],
+        )
+        .unwrap();
+        let specification = crate::parse("y ~ F(f1, f2)").unwrap();
+        let model = specification.materialize(&training).unwrap();
+        let rematerialized = model.materialize(&input).unwrap();
+        let output = rematerialized.independent().columns();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].name().as_str(), "F(f1, f2)");
+        assert_eq!(output[0].dtype(), &DataType::UInt32);
+        assert_eq!(
+            output[0].u32().unwrap().iter().collect::<Vec<_>>(),
+            vec![Some(2), Some(1), Some(0), None]
+        );
+        assert_eq!(rematerialized.dependent().columns()[0].len(), 4);
+
+        let original = model.independent().columns()[0]
+            .u32()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(original, vec![Some(0), Some(1), Some(2)]);
+        assert_eq!(
+            model.independent().expression(),
+            rematerialized.independent().expression()
+        );
+    }
+
+    #[test]
+    fn nested_materialization_matches_explicit_transform_composition() {
+        let training = polars::df!(
+            "y" => [1.0, 2.0, 3.0],
+            "f1" => ["a", "b", "a"],
+            "f2" => ["u", "u", "v"],
+        )
+        .unwrap();
+        let input = polars::df!(
+            "y" => [4.0, 5.0, 6.0, 7.0],
+            "f1" => ["a", "b", "c", "b"],
+            "f2" => ["v", "u", "u", "v"],
+        )
+        .unwrap();
+        let specification = crate::parse("y ~ exp(F(f1, f2))").unwrap();
+        let model = specification.materialize(&training).unwrap();
+        let rematerialized = model.materialize(&input).unwrap();
+
+        let training_inputs = [
+            training
+                .column("f1")
+                .unwrap()
+                .as_materialized_series()
+                .clone(),
+            training
+                .column("f2")
+                .unwrap()
+                .as_materialized_series()
+                .clone(),
+        ];
+        let mut inner = IntegerEncodingTransform::default();
+        inner.fit(&training_inputs).unwrap();
+        let encoded = inner.transform(&training_inputs).unwrap();
+        let mut outer = ExpTransform;
+        outer
+            .fit(&[encoded[0].as_materialized_series().clone()])
+            .unwrap();
+
+        for (data, design) in [
+            (&training, model.independent()),
+            (&input, rematerialized.independent()),
+        ] {
+            let inputs = [
+                data.column("f1").unwrap().as_materialized_series().clone(),
+                data.column("f2").unwrap().as_materialized_series().clone(),
+            ];
+            let encoded = inner.transform(&inputs).unwrap();
+            let expected = outer
+                .transform(&[encoded[0].as_materialized_series().clone()])
+                .unwrap();
+            assert!(design.to_frame().unwrap().equals_missing(&expected));
+        }
     }
 }

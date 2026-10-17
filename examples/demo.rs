@@ -3,12 +3,15 @@ use polars::df;
 fn main() {
     let data = df!(
         "y" => [1.0, 2.0, 3.0],
-        "x" => [2.0, 4.0, 6.0],
-        "group" => ["a", "b", "a"],
+        "x1" => [2.0, 4.0, 6.0],
+        "x2" => [12.0, 2.0, 1.0],
+        "category" => ["a", "b", "a"],
+        "f1" => [13, 1, 1],
+        "f2" => ["x", "y", "z"],
     )
     .expect("valid sample data");
 
-    let fml = "y ~ log(x) + C(group, reference='a')";
+    let fml = "y ~ log(x1)*x2 + C(category, reference='a') + F(f1, f2)";
     let specification = formula::parse(fml).expect("valid formula");
     let model = specification
         .materialize(&data)

@@ -1,5 +1,7 @@
 use crate::formula::{Expression, Factor, Formula, Term};
-use crate::transform::{CategoricalTransform, ExpTransform, LogTransform, Transform};
+use crate::transform::{
+    CategoricalTransform, ExpTransform, IntegerEncodingTransform, LogTransform, Transform,
+};
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
 use winnow::Parser;
@@ -253,6 +255,10 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("C", keywords)?;
                 Transform::C(CategoricalTransform::new(reference))
             }
+            "F" => {
+                reject_keywords("F", keywords)?;
+                Transform::F(IntegerEncodingTransform::default())
+            }
             _ => return Err(TransformError::Unknown(call.name)),
         };
 
@@ -411,8 +417,48 @@ mod tests {
             "C(x, unknown=1)",
             "C(x, reference=1 2)",
             "C(x, reference=tr ue)",
+            "F(x, unknown=1)",
         ] {
             assert!(parse_expression(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn integer_encoding_preserves_all_positional_arguments() {
+        let cases = [
+            ("F(x)", vec![Factor::from("x")]),
+            ("F(x, x)", vec![Factor::from("x"), Factor::from("x")]),
+            (
+                "F(f1, f2, f3, f4)",
+                vec![
+                    Factor::from("f1"),
+                    Factor::from("f2"),
+                    Factor::from("f3"),
+                    Factor::from("f4"),
+                ],
+            ),
+            (
+                "F(log(x), z)",
+                vec![
+                    Factor::Call {
+                        transform: Transform::Log(LogTransform),
+                        arguments: vec![Factor::from("x")],
+                    },
+                    Factor::from("z"),
+                ],
+            ),
+        ];
+
+        for (source, arguments) in cases {
+            let expected = Factor::Call {
+                transform: Transform::F(IntegerEncodingTransform::default()),
+                arguments,
+            };
+            assert_eq!(
+                parse_factor.parse(source).expect(source),
+                expected,
+                "{source}"
+            );
         }
     }
 
