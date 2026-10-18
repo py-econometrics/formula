@@ -282,9 +282,7 @@ pub enum ValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{
-        CategoricalTransform, ExpTransform, IntegerEncodingTransform, LogTransform,
-    };
+    use crate::transform::{CategoricalTransform, ExpressionTransform, IntegerEncodingTransform};
     use polars::prelude::Scalar;
     fn assert_requires_one_argument(transform: Transform) {
         for count in [0, 1, 2, 3] {
@@ -321,12 +319,12 @@ mod tests {
 
     #[test]
     fn log_requires_exactly_one_argument() {
-        assert_requires_one_argument(Transform::Log(LogTransform));
+        assert_requires_one_argument(Transform::Expression(ExpressionTransform::LOG));
     }
 
     #[test]
     fn exp_requires_exactly_one_argument() {
-        assert_requires_one_argument(Transform::Exp(ExpTransform));
+        assert_requires_one_argument(Transform::Expression(ExpressionTransform::EXP));
     }
 
     #[test]
@@ -452,7 +450,7 @@ mod tests {
         let mut inner = IntegerEncodingTransform::default();
         inner.fit(&training_inputs).unwrap();
         let encoded = inner.transform(&training_inputs).unwrap();
-        let mut outer = ExpTransform;
+        let mut outer = ExpressionTransform::EXP;
         outer
             .fit(&[encoded[0].as_materialized_series().clone()])
             .unwrap();

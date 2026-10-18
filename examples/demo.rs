@@ -11,7 +11,7 @@ fn main() {
     )
     .expect("valid sample data");
 
-    let fml = "y ~ log(x1)*x2 + C(category, reference='a') + F(f1, f2)";
+    let fml = "y ~ add(x1, x2) + log(x1)*sqrt(x2) + C(category, reference='a') + F(f1, f2)";
     let specification = formula::parse(fml).expect("valid formula");
     let model = specification
         .materialize(&data)

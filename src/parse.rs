@@ -1,6 +1,6 @@
 use crate::formula::{Expression, Factor, Formula, Term};
 use crate::transform::{
-    CategoricalTransform, ExpTransform, IntegerEncodingTransform, LogTransform, Transform,
+    CategoricalTransform, ExpressionTransform, IntegerEncodingTransform, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -244,11 +244,31 @@ impl TryFrom<TransformCall> for Factor {
         let transform = match call.name.as_str() {
             "log" => {
                 reject_keywords("log", keywords)?;
-                Transform::Log(LogTransform)
+                Transform::Expression(ExpressionTransform::LOG)
             }
             "exp" => {
                 reject_keywords("exp", keywords)?;
-                Transform::Exp(ExpTransform)
+                Transform::Expression(ExpressionTransform::EXP)
+            }
+            "sqrt" => {
+                reject_keywords("sqrt", keywords)?;
+                Transform::Expression(ExpressionTransform::SQRT)
+            }
+            "add" => {
+                reject_keywords("add", keywords)?;
+                Transform::Expression(ExpressionTransform::ADD)
+            }
+            "sub" => {
+                reject_keywords("sub", keywords)?;
+                Transform::Expression(ExpressionTransform::SUB)
+            }
+            "mul" => {
+                reject_keywords("mul", keywords)?;
+                Transform::Expression(ExpressionTransform::MUL)
+            }
+            "div" => {
+                reject_keywords("div", keywords)?;
+                Transform::Expression(ExpressionTransform::DIV)
             }
             "C" => {
                 let reference = keywords.remove("reference");
@@ -352,14 +372,14 @@ mod tests {
             (
                 "log(x)",
                 Factor::Call {
-                    transform: Transform::Log(LogTransform),
+                    transform: Transform::Expression(ExpressionTransform::LOG),
                     arguments: vec![Factor::from("x")],
                 },
             ),
             (
                 "exp(x)",
                 Factor::Call {
-                    transform: Transform::Exp(ExpTransform),
+                    transform: Transform::Expression(ExpressionTransform::EXP),
                     arguments: vec![Factor::from("x")],
                 },
             ),
@@ -441,7 +461,7 @@ mod tests {
                 "F(log(x), z)",
                 vec![
                     Factor::Call {
-                        transform: Transform::Log(LogTransform),
+                        transform: Transform::Expression(ExpressionTransform::LOG),
                         arguments: vec![Factor::from("x")],
                     },
                     Factor::from("z"),
@@ -533,7 +553,7 @@ mod tests {
             (
                 "log(C(x))",
                 Factor::Call {
-                    transform: Transform::Log(LogTransform),
+                    transform: Transform::Expression(ExpressionTransform::LOG),
                     arguments: vec![Factor::Call {
                         transform: Transform::C(CategoricalTransform::new(None)),
                         arguments: vec![Factor::from("x")],
@@ -545,7 +565,7 @@ mod tests {
                 Factor::Call {
                     transform: Transform::C(CategoricalTransform::new(None)),
                     arguments: vec![Factor::Call {
-                        transform: Transform::Log(LogTransform),
+                        transform: Transform::Expression(ExpressionTransform::LOG),
                         arguments: vec![Factor::from("x")],
                     }],
                 },
@@ -553,9 +573,9 @@ mod tests {
             (
                 "log(exp(x))",
                 Factor::Call {
-                    transform: Transform::Log(LogTransform),
+                    transform: Transform::Expression(ExpressionTransform::LOG),
                     arguments: vec![Factor::Call {
-                        transform: Transform::Exp(ExpTransform),
+                        transform: Transform::Expression(ExpressionTransform::EXP),
                         arguments: vec![Factor::from("x")],
                     }],
                 },
