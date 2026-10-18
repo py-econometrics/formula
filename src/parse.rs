@@ -262,6 +262,14 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("sub", keywords)?;
                 Transform::Expression(ExpressionTransform::SUB)
             }
+            "mul" => {
+                reject_keywords("mul", keywords)?;
+                Transform::Expression(ExpressionTransform::MUL)
+            }
+            "div" => {
+                reject_keywords("div", keywords)?;
+                Transform::Expression(ExpressionTransform::DIV)
+            }
             "C" => {
                 let reference = keywords.remove("reference");
                 reject_keywords("C", keywords)?;

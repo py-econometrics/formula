@@ -98,6 +98,30 @@ impl ExpressionTransform {
         },
     };
 
+    pub(crate) const MUL: Self = Self {
+        name: "mul",
+        argument_count: ArgumentCount::AtLeast(2),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| {
+            Ok(inputs[1..]
+                .iter()
+                .fold(inputs[0].clone(), |product, input| product * input.clone()))
+        },
+    };
+
+    pub(crate) const DIV: Self = Self {
+        name: "div",
+        argument_count: ArgumentCount::AtLeast(2),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| {
+            Ok(inputs[1..]
+                .iter()
+                .fold(inputs[0].clone(), |quotient, input| {
+                    quotient / input.clone()
+                }))
+        },
+    };
+
     fn output_name(&self, inputs: &[Series]) -> PlSmallStr {
         call_name(self.name, inputs.iter().map(|input| input.name().as_str()))
     }
@@ -229,6 +253,34 @@ mod tests {
             &output.to_frame().unwrap(),
             "sub(x, y, z)",
             &[Some(5.0), Some(-8.0)],
+        );
+    }
+
+    #[test]
+    fn mul_multiplies_all_arguments() {
+        let data = polars::df!("x" => [2, 3], "y" => [3, 4], "z" => [4, 5]).unwrap();
+        let output = crate::parse_expression("mul(x, y, z)")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert_numeric_output(
+            &output.to_frame().unwrap(),
+            "mul(x, y, z)",
+            &[Some(24.0), Some(60.0)],
+        );
+    }
+
+    #[test]
+    fn div_preserves_argument_order_and_associates_left() {
+        let data = polars::df!("x" => [24, 3], "y" => [3, 24], "z" => [2, 2]).unwrap();
+        let output = crate::parse_expression("div(x, y, z)")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert_numeric_output(
+            &output.to_frame().unwrap(),
+            "div(x, y, z)",
+            &[Some(4.0), Some(0.0625)],
         );
     }
 
