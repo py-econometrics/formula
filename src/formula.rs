@@ -89,9 +89,22 @@ impl Factor {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Term {
     factors: Vec<Factor>,
+}
+
+// Interaction identity ignores factor order: a:b equals b:a.
+// Keep storage order for output naming and column ordering.
+// This comparison relies on terms containing no duplicate factors.
+impl PartialEq for Term {
+    fn eq(&self, other: &Self) -> bool {
+        self.factors.len() == other.factors.len()
+            && self
+                .factors
+                .iter()
+                .all(|factor| other.factors.contains(factor))
+    }
 }
 
 impl Term {
@@ -284,6 +297,26 @@ mod tests {
     use super::*;
     use crate::transform::{CategoricalTransform, ExpressionTransform, IntegerEncodingTransform};
     use polars::prelude::Scalar;
+
+    #[test]
+    fn interaction_identity_preserves_function_argument_order() {
+        let expression = crate::parse_expression("sub(a,b):x + x:sub(b,a)").unwrap();
+        assert_eq!(expression.terms.len(), 2);
+    }
+
+    #[test]
+    fn interaction_deduplication_preserves_first_output_name() {
+        let data = polars::df!("a" => [2.0, 4.0], "b" => [3.0, 5.0]).unwrap();
+        let output = crate::parse_expression("b:a + a:b")
+            .unwrap()
+            .materialize(&data)
+            .unwrap()
+            .to_frame()
+            .unwrap();
+        assert_eq!(output.shape(), (2, 1));
+        assert_eq!(output.columns()[0].name().as_str(), "b:a");
+    }
+
     fn assert_requires_one_argument(transform: Transform) {
         for count in [0, 1, 2, 3] {
             let arguments = (0..count)
