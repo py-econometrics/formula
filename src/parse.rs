@@ -496,6 +496,9 @@ mod tests {
             ("x+y-y", expression(&[&["x"]])),
             ("x+x", expression(&[&["x"]])),
             ("x:x", expression(&[&["x"]])),
+            ("a:b + b:a", expression(&[&["a", "b"]])),
+            ("a:b - b:a", expression(&[])),
+            ("a*b*a", expression(&[&["a"], &["b"], &["a", "b"]])),
         ];
 
         for (source, expected) in cases {
