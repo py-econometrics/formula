@@ -139,7 +139,10 @@ impl TransformOperation for CategoricalTransform {
                     .alias(column_name)
             })
             .collect::<Vec<_>>();
-
+        // Preserve input row count even when expression is empty
+        if expressions.is_empty() {
+            return Ok(DataFrame::empty_with_height(input.len()));
+        }
         let result = frame.lazy().select(expressions).collect()?;
         Ok(result)
     }
@@ -150,6 +153,29 @@ mod tests {
     use super::*;
     use crate::transform::Transform;
     use polars::prelude::NamedFrom;
+
+    #[test]
+    fn reference_only_encoding_preserves_input_height() -> Result<(), TransformError> {
+        let inputs = [Series::new("group".into(), [1_i32, 1, 1])];
+        let mut transform = CategoricalTransform::new(Some(Scalar::from(1_i64)));
+        transform.fit(&inputs)?;
+        assert_eq!(transform.transform(&inputs)?.shape(), (3, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_fitted_levels_preserve_nonempty_input_height() -> Result<(), TransformError> {
+        let inputs = [Series::new("group".into(), [7_i32, 8])];
+        for training in [
+            Series::new("group".into(), Vec::<i32>::new()),
+            Series::new("group".into(), [None::<i32>, None]),
+        ] {
+            let mut transform = CategoricalTransform::new(None);
+            transform.fit(&[training])?;
+            assert_eq!(transform.transform(&inputs)?.shape(), (2, 0));
+        }
+        Ok(())
+    }
 
     #[test]
     fn transform_enum_delegates_categorical_operations() -> Result<(), TransformError> {
