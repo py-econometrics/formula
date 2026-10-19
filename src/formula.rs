@@ -232,10 +232,10 @@ impl Expression {
         for term in &mut self.terms {
             columns.extend(term.materialize(data, mode)?);
         }
+        let frame = DataFrame::new(data.height(), columns.into_iter().map(Into::into).collect())
+            .map_err(TransformError::from)?;
 
-        Design::new(self, columns)
-            .map_err(TransformError::from)
-            .map_err(MaterializationError::from)
+        Ok(Design::new(self, frame))
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -299,6 +299,33 @@ mod tests {
     use polars::prelude::Scalar;
 
     #[test]
+    fn cancelled_terms_preserve_model_row_counts() {
+        let specification = crate::parse("y ~ x-x").unwrap();
+        for values in [vec![1.0, 2.0, 3.0], vec![]] {
+            let height = values.len();
+            let data = polars::df!("y" => values.clone(), "x" => values).unwrap();
+            let model = specification.materialize(&data).unwrap();
+            assert_eq!(model.dependent().frame().shape(), (height, 1));
+            assert_eq!(model.independent().frame().shape(), (height, 0));
+        }
+    }
+
+    #[test]
+    fn empty_design_uses_new_input_height_on_rematerialization() {
+        let training = polars::df!("x" => [1.0, 2.0, 3.0]).unwrap();
+        let design = crate::parse_expression("x-x")
+            .unwrap()
+            .materialize(&training)
+            .unwrap();
+        for values in [vec![4.0, 5.0], vec![]] {
+            let height = values.len();
+            let input = polars::df!("x" => values).unwrap();
+            let output = design.materialize(&input).unwrap();
+            assert_eq!(output.frame().shape(), (height, 0));
+        }
+    }
+
+    #[test]
     fn interaction_identity_preserves_function_argument_order() {
         let expression = crate::parse_expression("sub(a,b):x + x:sub(b,a)").unwrap();
         assert_eq!(expression.terms.len(), 2);
@@ -307,12 +334,11 @@ mod tests {
     #[test]
     fn interaction_deduplication_preserves_first_output_name() {
         let data = polars::df!("a" => [2.0, 4.0], "b" => [3.0, 5.0]).unwrap();
-        let output = crate::parse_expression("b:a + a:b")
+        let design = crate::parse_expression("b:a + a:b")
             .unwrap()
             .materialize(&data)
-            .unwrap()
-            .to_frame()
             .unwrap();
+        let output = design.frame();
         assert_eq!(output.shape(), (2, 1));
         assert_eq!(output.columns()[0].name().as_str(), "b:a");
     }
@@ -427,18 +453,18 @@ mod tests {
         let specification = crate::parse("y ~ F(f1, f2)").unwrap();
         let model = specification.materialize(&training).unwrap();
         let rematerialized = model.materialize(&input).unwrap();
-        let output = rematerialized.independent().columns();
+        let output = rematerialized.independent().frame();
 
-        assert_eq!(output.len(), 1);
+        assert_eq!(output.width(), 1);
         assert_eq!(output[0].name().as_str(), "F(f1, f2)");
         assert_eq!(output[0].dtype(), &DataType::UInt32);
         assert_eq!(
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),
             vec![Some(2), Some(1), Some(0), None]
         );
-        assert_eq!(rematerialized.dependent().columns()[0].len(), 4);
+        assert_eq!(rematerialized.dependent().frame()[0].len(), 4);
 
-        let original = model.independent().columns()[0]
+        let original = model.independent().frame()[0]
             .u32()
             .unwrap()
             .iter()
@@ -500,7 +526,7 @@ mod tests {
             let expected = outer
                 .transform(&[encoded[0].as_materialized_series().clone()])
                 .unwrap();
-            assert!(design.to_frame().unwrap().equals_missing(&expected));
+            assert!(design.frame().equals_missing(&expected));
         }
     }
 }

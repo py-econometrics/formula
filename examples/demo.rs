@@ -16,8 +16,8 @@ fn main() {
     let model = specification
         .materialize(&data)
         .expect("successful materialisation");
-    let dependent = model.dependent().to_frame().expect("valid frame");
-    let independent = model.independent().to_frame().expect("valid frame");
+    let dependent = model.dependent().frame();
+    let independent = model.independent().frame();
 
     println!("Formula: {fml}\n");
     println!("Dependent:\n{dependent}\n");

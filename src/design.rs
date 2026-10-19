@@ -1,7 +1,6 @@
 use crate::formula::{Expression, ValidationError};
 use crate::transform::TransformError;
-use polars::error::{PolarsError, PolarsResult};
-use polars::prelude::{DataFrame, Series};
+use polars::prelude::DataFrame;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MaterializationMode {
@@ -12,27 +11,12 @@ pub(crate) enum MaterializationMode {
 #[derive(Clone, Debug)]
 pub struct Design {
     expression: Expression,
-    columns: Vec<Series>,
+    frame: DataFrame,
 }
 
 impl Design {
-    pub(crate) fn new(expression: Expression, columns: Vec<Series>) -> PolarsResult<Self> {
-        let design = Self {
-            expression,
-            columns,
-        };
-
-        let height = design.height();
-        if design.columns.iter().any(|column| column.len() != height) {
-            return Err(PolarsError::ShapeMismatch(
-                "design columns must have equal lengths".into(),
-            ));
-        }
-
-        Ok(design)
-    }
-    fn height(&self) -> usize {
-        self.columns.first().map_or(0, |column| column.len())
+    pub(crate) fn new(expression: Expression, frame: DataFrame) -> Self {
+        Self { expression, frame }
     }
     pub fn materialize(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
         self.expression
@@ -42,15 +26,8 @@ impl Design {
     pub fn expression(&self) -> &Expression {
         &self.expression
     }
-    pub fn columns(&self) -> &[Series] {
-        &self.columns
-    }
-
-    pub fn to_frame(&self) -> PolarsResult<DataFrame> {
-        DataFrame::new(
-            self.height(),
-            self.columns.iter().cloned().map(Into::into).collect(),
-        )
+    pub fn frame(&self) -> &DataFrame {
+        &self.frame
     }
 }
 

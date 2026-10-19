@@ -222,7 +222,7 @@ mod tests {
             .materialize(&data)
             .unwrap();
         assert_numeric_output(
-            &output.to_frame().unwrap(),
+            output.frame(),
             "sqrt(x)",
             &[Some(3.0), Some(1.0), Some(2.0), None, Some(f64::NAN)],
         );
@@ -235,11 +235,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        assert_numeric_output(
-            &output.to_frame().unwrap(),
-            "add(x, y, x)",
-            &[Some(6.5), None],
-        );
+        assert_numeric_output(output.frame(), "add(x, y, x)", &[Some(6.5), None]);
     }
 
     #[test]
@@ -249,11 +245,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        assert_numeric_output(
-            &output.to_frame().unwrap(),
-            "sub(x, y, z)",
-            &[Some(5.0), Some(-8.0)],
-        );
+        assert_numeric_output(output.frame(), "sub(x, y, z)", &[Some(5.0), Some(-8.0)]);
     }
 
     #[test]
@@ -263,11 +255,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        assert_numeric_output(
-            &output.to_frame().unwrap(),
-            "mul(x, y, z)",
-            &[Some(24.0), Some(60.0)],
-        );
+        assert_numeric_output(output.frame(), "mul(x, y, z)", &[Some(24.0), Some(60.0)]);
     }
 
     #[test]
@@ -277,11 +265,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        assert_numeric_output(
-            &output.to_frame().unwrap(),
-            "div(x, y, z)",
-            &[Some(4.0), Some(0.0625)],
-        );
+        assert_numeric_output(output.frame(), "div(x, y, z)", &[Some(4.0), Some(0.0625)]);
     }
 
     #[test]
