@@ -1,6 +1,6 @@
 use crate::formula::{Expression, Factor, Formula, Term};
 use crate::transform::{
-    CategoricalTransform, ExpressionTransform, IntegerEncodingTransform, Transform,
+    CategoricalDefinition, ExpressionTransform, Fit, IntegerEncodingDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -293,11 +293,11 @@ impl TryFrom<TransformCall> for Factor {
             "C" => {
                 let reference = keywords.remove("reference");
                 reject_keywords("C", keywords)?;
-                Transform::C(CategoricalTransform::new(reference))
+                Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
             }
             "F" => {
                 reject_keywords("F", keywords)?;
-                Transform::F(IntegerEncodingTransform::default())
+                Transform::F(Fit::Unfitted(IntegerEncodingDefinition))
             }
             _ => return Err(TransformError::Unknown(call.name)),
         };
@@ -387,7 +387,8 @@ mod tests {
 
     #[test]
     fn transforms_preserve_arguments_order_and_allowed_whitespace() {
-        let categorical = |reference| Transform::C(CategoricalTransform::new(reference));
+        let categorical =
+            |reference| Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)));
         let cases = [
             (
                 "log(x)",
@@ -491,7 +492,7 @@ mod tests {
 
         for (source, arguments) in cases {
             let expected = Factor::Call {
-                transform: Transform::F(IntegerEncodingTransform::default()),
+                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
                 arguments,
             };
             assert_eq!(
@@ -591,7 +592,7 @@ mod tests {
                 Factor::Call {
                     transform: Transform::Expression(ExpressionTransform::LOG),
                     arguments: vec![Factor::Call {
-                        transform: Transform::C(CategoricalTransform::new(None)),
+                        transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
                         arguments: vec![Factor::from("x")],
                     }],
                 },
@@ -599,7 +600,7 @@ mod tests {
             (
                 "C(log(x))",
                 Factor::Call {
-                    transform: Transform::C(CategoricalTransform::new(None)),
+                    transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
                     arguments: vec![Factor::Call {
                         transform: Transform::Expression(ExpressionTransform::LOG),
                         arguments: vec![Factor::from("x")],

@@ -1,5 +1,5 @@
 use super::input::input_frame;
-use super::{ArgumentCount, TransformError, TransformOperation, call_name};
+use super::{ArgumentCount, TransformError, call_name};
 use polars::error::PolarsError;
 use polars::prelude::{DataFrame, DataType, Expr, IntoLazy, PlSmallStr, Series, col, lit};
 
@@ -142,20 +142,20 @@ impl ExpressionTransform {
     }
 }
 
-impl TransformOperation for ExpressionTransform {
-    fn expands(&self) -> bool {
+impl ExpressionTransform {
+    pub(crate) fn expands(&self) -> bool {
         false
     }
 
-    fn argument_count(&self) -> ArgumentCount {
+    pub(crate) fn argument_count(&self) -> ArgumentCount {
         self.argument_count
     }
 
-    fn fit(&mut self, _inputs: &[Series]) -> Result<(), TransformError> {
+    pub(crate) fn fit(&mut self, _inputs: &[Series]) -> Result<(), TransformError> {
         Ok(())
     }
 
-    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
         self.validate_inputs(inputs)?;
         let frame = input_frame(inputs)?;
         let height = frame.height();

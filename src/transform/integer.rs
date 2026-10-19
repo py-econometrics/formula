@@ -1,21 +1,26 @@
 use super::input::input_frame;
-use super::{ArgumentCount, TransformError, TransformOperation, call_name};
+use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
     DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, Series, col,
 };
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct IntegerEncodingTransform {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IntegerEncodingDefinition;
+
+#[derive(Clone, Debug)]
+pub(crate) struct IntegerEncodingFit {
     names: Vec<PlSmallStr>,
-    mapping: Option<DataFrame>,
+    mapping: DataFrame,
 }
 
-impl IntegerEncodingTransform {
+impl IntegerEncodingDefinition {
     const CODE_COLUMN: &'static str = "__code";
 }
 
-impl TransformOperation for IntegerEncodingTransform {
+impl TransformDefinition for IntegerEncodingDefinition {
+    type Fit = IntegerEncodingFit;
+
     fn expands(&self) -> bool {
         false
     }
@@ -24,7 +29,7 @@ impl TransformOperation for IntegerEncodingTransform {
         ArgumentCount::AtLeast(1)
     }
 
-    fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
+    fn fit(&self, inputs: &[Series]) -> Result<Self::Fit, TransformError> {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -32,18 +37,15 @@ impl TransformOperation for IntegerEncodingTransform {
             .with_row_index(Self::CODE_COLUMN, None)
             .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
             .collect()?;
-        self.names = inputs.iter().map(|input| input.name().clone()).collect();
-        self.mapping = Some(mapping);
-        Ok(())
+        Ok(IntegerEncodingFit {
+            names: inputs.iter().map(|input| input.name().clone()).collect(),
+            mapping,
+        })
     }
 
-    fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        let mapping = self.mapping.as_ref().ok_or(TransformError::NotFitted)?;
-        if !inputs
-            .iter()
-            .map(|input| input.name())
-            .eq(self.names.iter())
-        {
+    fn transform(&self, fit: &Self::Fit, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        let mapping = &fit.mapping;
+        if !inputs.iter().map(|input| input.name()).eq(fit.names.iter()) {
             return Err(TransformError::InvalidParameter(
                 "input column names differ from the fitted encoding".into(),
             ));
@@ -61,7 +63,7 @@ impl TransformOperation for IntegerEncodingTransform {
             .map(|column| col(column.name().clone()))
             .collect::<Vec<_>>();
 
-        let output_name = call_name("F", self.names.iter().map(|name| name.as_str()));
+        let output_name = call_name("F", fit.names.iter().map(|name| name.as_str()));
 
         Ok(input_frame
             .lazy()
@@ -72,7 +74,7 @@ impl TransformOperation for IntegerEncodingTransform {
             .join_nulls(false)
             .maintain_order(MaintainOrderJoin::Left)
             .finish()
-            .select([col(Self::CODE_COLUMN).alias(output_name)])
+            .select([col(IntegerEncodingDefinition::CODE_COLUMN).alias(output_name)])
             .collect()?)
     }
 }
@@ -81,7 +83,7 @@ impl TransformOperation for IntegerEncodingTransform {
 mod tests {
     use super::super::input::argument_column_name;
     use super::*;
-    use crate::transform::Transform;
+    use crate::transform::{Fit, Fitted};
     use polars::error::PolarsError;
     use polars::prelude::NamedFrom;
 
@@ -99,12 +101,36 @@ mod tests {
 
     #[test]
     fn integer_encoding_requires_fit() {
-        let transform = IntegerEncodingTransform::default();
+        let transform = Fit::Unfitted(IntegerEncodingDefinition);
         let input = [Series::new("f1".into(), ["a", "b"])];
         assert!(matches!(
             transform.transform(&input),
             Err(TransformError::NotFitted)
         ));
+    }
+
+    #[test]
+    fn integer_definition_produces_independent_fits() -> Result<(), TransformError> {
+        let definition = IntegerEncodingDefinition;
+        let first_input = [Series::new("group".into(), ["a", "b"])];
+        let second_input = [Series::new("group".into(), ["b", "a"])];
+        let first = definition.fit(&first_input)?;
+        let second = definition.fit(&second_input)?;
+
+        assert_integer_output(
+            &definition.transform(&first, &first_input)?,
+            &[Some(0), Some(1)],
+        );
+        assert_integer_output(
+            &definition.transform(&second, &first_input)?,
+            &[Some(1), Some(0)],
+        );
+        assert_integer_output(
+            &definition.transform(&first, &first_input)?,
+            &[Some(0), Some(1)],
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -121,11 +147,14 @@ mod tests {
         ];
 
         for (count, expected) in cases {
-            let mut transform = Transform::F(IntegerEncodingTransform::default());
-            assert!(!transform.expands());
-            assert_eq!(transform.argument_count(), ArgumentCount::AtLeast(1));
-            transform.fit(&input[..count])?;
-            assert_integer_output(&transform.transform(&input[..count])?, &expected);
+            let definition = IntegerEncodingDefinition;
+            assert!(!definition.expands());
+            assert_eq!(definition.argument_count(), ArgumentCount::AtLeast(1));
+            let transform = definition.fit(&input[..count])?;
+            assert_integer_output(
+                &definition.transform(&transform, &input[..count])?,
+                &expected,
+            );
         }
         Ok(())
     }
@@ -140,19 +169,18 @@ mod tests {
             Series::new("f1".into(), ["c", "b", "a", "b", "a"]),
             Series::new("f2".into(), [1_i32, 2, 1, 1, 2]),
         ];
-        let mut transform = IntegerEncodingTransform::default();
-        transform.fit(&training)?;
-        let fitted = transform.clone();
+        let definition = IntegerEncodingDefinition;
+        let transform = definition.fit(&training)?;
+        let fitted_names = transform.names.clone();
+        let fitted_mapping = transform.mapping.clone();
 
         for _ in 0..2 {
-            let output = transform.transform(&input)?;
+            let output = definition.transform(&transform, &input)?;
             // Codes are returned in order input data
             assert_integer_output(&output, &[Some(3), Some(2), Some(1), Some(0), None]);
             assert_eq!(output.columns()[0].name().as_str(), "F(f1, f2)");
-            assert_eq!(
-                transform, fitted,
-                "application must not change fitted state"
-            );
+            assert_eq!(transform.names, fitted_names);
+            assert!(transform.mapping.equals_missing(&fitted_mapping));
         }
         Ok(())
     }
@@ -177,10 +205,10 @@ mod tests {
                 [Some(1_i32), Some(2), Some(1), Some(1), None, None],
             ),
         ];
-        let mut transform = IntegerEncodingTransform::default();
-        transform.fit(&training)?;
+        let definition = IntegerEncodingDefinition;
+        let transform = definition.fit(&training)?;
         assert_integer_output(
-            &transform.transform(&input)?,
+            &definition.transform(&transform, &input)?,
             &[Some(0), Some(1), None, None, None, None],
         );
         Ok(())
@@ -192,8 +220,8 @@ mod tests {
             Series::new("f1".into(), ["a", "b"]),
             Series::new("f2".into(), [1_i32, 2]),
         ];
-        let mut transform = IntegerEncodingTransform::default();
-        transform.fit(&training)?;
+        let definition = IntegerEncodingDefinition;
+        let transform = definition.fit(&training)?;
         let cases = [
             vec![Series::new("other".into(), ["a", "b"]), training[1].clone()],
             vec![training[1].clone(), training[0].clone()],
@@ -209,7 +237,7 @@ mod tests {
         for input in cases {
             assert!(
                 matches!(
-                    transform.transform(&input),
+                    definition.transform(&transform, &input),
                     Err(TransformError::InvalidParameter(_))
                 ),
                 "{input:?}"
@@ -224,8 +252,8 @@ mod tests {
             Series::new("f1".into(), [1_i32, 2]),
             Series::new("f2".into(), ["a", "b"]),
         ];
-        let mut transform = IntegerEncodingTransform::default();
-        transform.fit(&training)?;
+        let definition = IntegerEncodingDefinition;
+        let transform = definition.fit(&training)?;
         let cases = [
             [Series::new("f1".into(), [1_i64, 2]), training[1].clone()],
             [training[0].clone(), Series::new("f2".into(), [1_i32, 2])],
@@ -233,7 +261,7 @@ mod tests {
 
         for input in cases {
             assert!(matches!(
-                transform.transform(&input),
+                definition.transform(&transform, &input),
                 Err(TransformError::InputTypeMismatch)
             ));
         }
@@ -244,7 +272,7 @@ mod tests {
     fn integer_encoding_accepts_repeated_arguments_and_reserved_input_names()
     -> Result<(), TransformError> {
         let column = Series::new(
-            IntegerEncodingTransform::CODE_COLUMN.into(),
+            IntegerEncodingDefinition::CODE_COLUMN.into(),
             ["a", "b", "a"],
         );
         let cases = [
@@ -259,9 +287,9 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            let mut transform = IntegerEncodingTransform::default();
-            transform.fit(&input)?;
-            assert_integer_output(&transform.transform(&input)?, &expected);
+            let definition = IntegerEncodingDefinition;
+            let transform = definition.fit(&input)?;
+            assert_integer_output(&definition.transform(&transform, &input)?, &expected);
         }
         Ok(())
     }
@@ -273,13 +301,16 @@ mod tests {
         let known_dtype = [Series::new("f1".into(), [1_i32, 2])];
 
         for training in [empty, all_null] {
-            let mut transform = IntegerEncodingTransform::default();
-            transform.fit(&training)?;
+            let definition = IntegerEncodingDefinition;
+            let transform = definition.fit(&training)?;
             assert_integer_output(
-                &transform.transform(&training)?,
+                &definition.transform(&transform, &training)?,
                 &vec![None; training[0].len()],
             );
-            assert_integer_output(&transform.transform(&known_dtype)?, &[None, None]);
+            assert_integer_output(
+                &definition.transform(&transform, &known_dtype)?,
+                &[None, None],
+            );
         }
         Ok(())
     }
@@ -289,8 +320,8 @@ mod tests {
         let first = [Series::new("f1".into(), ["a", "b"])];
         let second = [Series::new("other".into(), ["c", "a"])];
         let input = [Series::new("other".into(), ["b", "c", "a"])];
-        let mut transform = IntegerEncodingTransform::default();
-        transform.fit(&first)?;
+        let mut transform: Fit<IntegerEncodingDefinition> =
+            Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &first)?);
         transform.fit(&second)?;
 
         assert_integer_output(&transform.transform(&input)?, &[None, Some(0), Some(1)]);
@@ -305,9 +336,9 @@ mod tests {
     fn integer_encoding_rejects_invalid_fit_inputs_without_replacing_state()
     -> Result<(), TransformError> {
         let training = [Series::new("f1".into(), ["a", "b"])];
-        let mut transform = IntegerEncodingTransform::default();
-        transform.fit(&training)?;
-        let fitted = transform.clone();
+        let mut transform: Fit<IntegerEncodingDefinition> =
+            Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &training)?);
+        let original = transform.transform(&training)?;
         assert!(matches!(
             transform.fit(&[]),
             Err(TransformError::InvalidParameter(_))
@@ -318,7 +349,7 @@ mod tests {
             transform.fit(&unequal_lengths),
             Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
         ));
-        assert_eq!(transform, fitted);
+        assert!(transform.transform(&training)?.equals_missing(&original));
         assert_integer_output(&transform.transform(&training)?, &[Some(0), Some(1)]);
         Ok(())
     }
