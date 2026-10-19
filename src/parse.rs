@@ -9,7 +9,7 @@ use winnow::Result;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    alt, delimited, eof, expression, peek, separated, separated_pair, terminated,
+    alt, delimited, eof, expression, peek, preceded, separated, separated_pair, terminated,
 };
 use winnow::token::{one_of, take_while};
 
@@ -65,6 +65,7 @@ fn is_argument_boundary(c: char) -> bool {
 fn parse_bare_token<'i>(cursor: &mut &'i str) -> Result<&'i str> {
     take_while(1.., |c: char| !is_argument_boundary(c)).parse_next(cursor)
 }
+
 fn parse_scalar(cursor: &mut &str) -> Result<Scalar> {
     terminated(
         alt((
@@ -81,6 +82,20 @@ fn parse_scalar(cursor: &mut &str) -> Result<Scalar> {
 fn parse_literal_string(cursor: &mut &str) -> Result<Scalar> {
     delimited('\'', take_while(0.., |c: char| c != '\''), '\'')
         .map(|text: &str| Scalar::from(PlSmallStr::from(text)))
+        .parse_next(cursor)
+}
+
+fn parse_intercept(cursor: &mut &str) -> Result<Expression> {
+    take_while(1.., is_identifier_character)
+        .verify(|name: &str| name == "1")
+        .value(Expression::from(Term::intercept()))
+        .parse_next(cursor)
+}
+
+// Support a leading suppressed intercept, e.g., `y ~ -1 + x`
+fn parse_suppressed_intercept(cursor: &mut &str) -> Result<Expression> {
+    preceded(('-', multispace0), parse_intercept)
+        .map(|intercept| Expression::from_iter([]).subtract(intercept))
         .parse_next(cursor)
 }
 
@@ -189,6 +204,8 @@ fn parse_operand(cursor: &mut &str) -> Result<Expression> {
         multispace0,
         alt((
             delimited('(', parse_expression_inner, ')'),
+            parse_suppressed_intercept,
+            parse_intercept,
             parse_factor.map(Term::from).map(Expression::from),
         )),
         multispace0,
@@ -199,8 +216,10 @@ fn parse_operand(cursor: &mut &str) -> Result<Expression> {
 fn parse_formula(cursor: &mut &str) -> Result<Formula> {
     separated_pair(parse_expression_inner, '~', parse_expression_inner)
         .map(|(dependent, independent)| Formula {
-            dependent,
-            independent,
+            // The left-hand side of a formula doesn't attract an intercept by default
+            dependent: dependent.resolve_intercept(false),
+            // The right-hand side of a formula attracts an intercept by default
+            independent: independent.resolve_intercept(true),
         })
         .parse_next(cursor)
 }
@@ -212,7 +231,8 @@ pub fn parse(source: &str) -> ParseResult<'_, Formula> {
     terminated(parse_formula, eof).parse(source)
 }
 
-pub fn parse_expression(source: &str) -> ParseResult<'_, Expression> {
+#[cfg(test)]
+pub(crate) fn parse_expression(source: &str) -> ParseResult<'_, Expression> {
     terminated(parse_expression_inner, eof).parse(source)
 }
 
@@ -499,6 +519,9 @@ mod tests {
             ("a:b + b:a", expression(&[&["a", "b"]])),
             ("a:b - b:a", expression(&[])),
             ("a*b*a", expression(&[&["a"], &["b"], &["a", "b"]])),
+            ("1", expression(&[&[]])),
+            ("1 + x + 1", expression(&[&[], &["x"]])),
+            ("1:x", expression(&[&["x"]])),
         ];
 
         for (source, expected) in cases {
@@ -514,14 +537,17 @@ mod tests {
     fn formulas_keep_dependent_and_independent_expressions_separate() {
         let expected = Formula {
             dependent: expression(&[&["y"]]),
-            independent: expression(&[&["x"], &["z"]]),
+            independent: expression(&[&[], &["x"], &["z"]]),
         };
 
         for source in ["y~x+z", "y ~ x + z", " \n y \t~\n x + z \t"] {
             assert_eq!(parse(source).expect(source), expected, "{source}");
         }
 
-        assert_eq!(parse_expression("x + z").unwrap(), expected.independent);
+        assert_eq!(
+            parse_expression("x + z").unwrap(),
+            expression(&[&["x"], &["z"]])
+        );
     }
 
     #[test]
@@ -547,6 +573,13 @@ mod tests {
     fn expression_parser_rejects_incomplete_or_trailing_input() {
         for source in ["", " ", "y ~ x", "x C(group)", "(x + z", "x)", "x +", "x ?"] {
             assert!(parse_expression(source).is_err(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn leading_minus_only_accepts_intercept() {
+        for source in ["y ~ -x + x*z", "y ~ -(x + 1)", "y ~ -1x"] {
+            assert!(parse(source).is_err(), "{source}");
         }
     }
 

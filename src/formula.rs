@@ -2,12 +2,20 @@ use crate::design::{Design, MaterializationError, MaterializationMode, Model};
 use crate::transform::{ArgumentCount, Transform, TransformError, TransformOperation};
 use polars::error::PolarsResult;
 use polars::frame::DataFrame;
-use polars::prelude::{DataType, Series};
+use polars::prelude::{DataType, NamedFrom, Series};
 
 fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
         items.push(item);
     }
+}
+
+fn collect_unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut unique = Vec::new();
+    for item in items {
+        push_unique(&mut unique, item);
+    }
+    unique
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +116,14 @@ impl PartialEq for Term {
 }
 
 impl Term {
+    const INTERCEPT_COLUMN_NAME: &'static str = "Intercept";
+    pub(crate) fn intercept() -> Self {
+        Self { factors: vec![] }
+    }
+    fn is_intercept(&self) -> bool {
+        self.factors.is_empty()
+    }
+
     fn interact(&self, right: &Term) -> Term {
         self.factors
             .iter()
@@ -117,9 +133,6 @@ impl Term {
     }
 
     fn validate(&self) -> Result<(), ValidationError> {
-        if self.factors.is_empty() {
-            return Err(ValidationError::EmptyTerm);
-        }
         for factor in &self.factors {
             factor.validate()?;
         }
@@ -131,10 +144,16 @@ impl Term {
         data: &DataFrame,
         mode: MaterializationMode,
     ) -> Result<Vec<Series>, TransformError> {
+        if self.is_intercept() {
+            return Ok(vec![Series::new(
+                Self::INTERCEPT_COLUMN_NAME.into(),
+                vec![1.0_f64; data.height()],
+            )]);
+        }
         let (first, rest) = self
             .factors
             .split_first_mut()
-            .expect("validate terms contain at least one factor");
+            .expect("non-intercept terms contain at least one factor");
         let mut columns = first.materialize(data, mode)?;
         // A single-factor term returns its columns directly.
         for factor in rest {
@@ -167,11 +186,9 @@ impl Term {
 
 impl FromIterator<Factor> for Term {
     fn from_iter<T: IntoIterator<Item = Factor>>(factors: T) -> Self {
-        let mut unique = Vec::new();
-        for factor in factors {
-            push_unique(&mut unique, factor);
+        Self {
+            factors: collect_unique(factors),
         }
-        Self { factors: unique }
     }
 }
 
@@ -184,18 +201,14 @@ impl From<Factor> for Term {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expression {
     terms: Vec<Term>,
-    intercept: Option<bool>,
+    suppress_intercept: bool,
 }
 
 impl FromIterator<Term> for Expression {
     fn from_iter<T: IntoIterator<Item = Term>>(terms: T) -> Self {
-        let mut unique = Vec::new();
-        for term in terms {
-            push_unique(&mut unique, term);
-        }
         Self {
-            terms: unique,
-            intercept: None,
+            terms: collect_unique(terms),
+            suppress_intercept: false,
         }
     }
 }
@@ -204,12 +217,25 @@ impl From<Term> for Expression {
     fn from(term: Term) -> Self {
         Self {
             terms: Vec::from([term]),
-            intercept: None,
+            suppress_intercept: false,
         }
     }
 }
 
 impl Expression {
+    fn has_intercept(&self) -> bool {
+        self.terms.iter().any(Term::is_intercept)
+    }
+
+    pub(crate) fn resolve_intercept(mut self, include: bool) -> Self {
+        let include_intercept = !self.suppress_intercept && (include || self.has_intercept());
+        self.terms.retain(|term| !term.is_intercept());
+        if include_intercept {
+            self.terms.insert(0, Term::intercept());
+        }
+        self
+    }
+
     fn validate(&self) -> Result<(), ValidationError> {
         for term in &self.terms {
             term.validate()?
@@ -239,22 +265,27 @@ impl Expression {
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
-        self.terms
-            .iter()
-            .chain(other.into().terms.iter())
-            .cloned()
-            .collect()
+        let other = other.into();
+        Self {
+            terms: collect_unique(self.terms.into_iter().chain(other.terms)),
+            suppress_intercept: self.suppress_intercept || other.suppress_intercept,
+        }
     }
     pub(crate) fn subtract(mut self, other: impl Into<Self>) -> Self {
         let other = other.into();
+        self.suppress_intercept |= other.suppress_intercept || other.has_intercept();
         self.terms.retain(|term| !other.terms.contains(term));
         self
     }
     pub(crate) fn interact(&self, other: &Self) -> Self {
-        self.terms
-            .iter()
-            .flat_map(|left| other.terms.iter().map(move |right| left.interact(right)))
-            .collect()
+        Self {
+            terms: collect_unique(
+                self.terms
+                    .iter()
+                    .flat_map(|left| other.terms.iter().map(move |right| left.interact(right))),
+            ),
+            suppress_intercept: self.suppress_intercept || other.suppress_intercept,
+        }
     }
     pub(crate) fn interact_fully(self, other: Self) -> Self {
         let interactions = self.interact(&other);
@@ -289,7 +320,6 @@ pub enum ValidationError {
         actual: usize,
     },
     InvalidTransformComposition,
-    EmptyTerm,
 }
 
 #[cfg(test)]
@@ -299,8 +329,88 @@ mod tests {
     use polars::prelude::Scalar;
 
     #[test]
+    fn intercept_is_first_and_included_once() {
+        let data = polars::df!("y" => [2.0, 3.0], "x" => [4.0, 5.0]).unwrap();
+        for source in ["y ~ x", "y ~ x + 1", "y ~ 1 + x + 1"] {
+            let model = crate::parse(source).unwrap().materialize(&data).unwrap();
+            let frame = model.independent().frame();
+            assert_eq!(frame.get_column_names(), ["Intercept", "x"]);
+            assert_eq!(
+                frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
+                vec![Some(1.0), Some(1.0)]
+            );
+            assert_eq!(model.dependent().frame().get_column_names(), ["y"]);
+        }
+    }
+
+    #[test]
+    fn intercept_suppression_survives_later_addition() {
+        let data = polars::df!("y" => [2.0], "x" => [3.0]).unwrap();
+        for source in ["y ~ -1 + x", "y ~ - 1 + x", "y ~ x - 1", "y ~ x - 1 + 1"] {
+            let model = crate::parse(source).unwrap().materialize(&data).unwrap();
+            assert_eq!(
+                model.independent().frame().get_column_names(),
+                ["x"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_subtraction_suppresses_intercept() {
+        let data = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
+        for source in ["y ~ (x - 1)", "y ~ (-1 + x)", "y ~ x - (z + 1)"] {
+            let model = crate::parse(source).unwrap().materialize(&data).unwrap();
+            assert_eq!(
+                model.independent().frame().get_column_names(),
+                ["x"],
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn intercept_name_collision_requires_suppression() {
+        let data = polars::df!("y" => [2.0], "Intercept" => [3.0]).unwrap();
+        assert!(matches!(
+            crate::parse("y ~ Intercept").unwrap().materialize(&data),
+            Err(MaterializationError::Transform(TransformError::Polars(
+                polars::error::PolarsError::Duplicate(_)
+            )))
+        ));
+        let model = crate::parse("y ~ Intercept - 1")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert_eq!(
+            model.independent().frame(),
+            &data.select(["Intercept"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn intercept_uses_new_input_height_on_rematerialization() {
+        let training = polars::df!("y" => [2.0, 3.0]).unwrap();
+        let model = crate::parse("y ~ 1")
+            .unwrap()
+            .materialize(&training)
+            .unwrap();
+        for values in [vec![4.0, 5.0, 6.0], vec![]] {
+            let height = values.len();
+            let input = polars::df!("y" => values).unwrap();
+            let output = model.materialize(&input).unwrap();
+            let frame = output.independent().frame();
+            assert_eq!(frame.shape(), (height, 1));
+            assert_eq!(
+                frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
+                vec![Some(1.0); height]
+            );
+        }
+    }
+
+    #[test]
     fn cancelled_terms_preserve_model_row_counts() {
-        let specification = crate::parse("y ~ x-x").unwrap();
+        let specification = crate::parse("y ~ x-x-1").unwrap();
         for values in [vec![1.0, 2.0, 3.0], vec![]] {
             let height = values.len();
             let data = polars::df!("y" => values.clone(), "x" => values).unwrap();
@@ -450,7 +560,7 @@ mod tests {
             "f2" => [2_i32, 1, 1, 1],
         )
         .unwrap();
-        let specification = crate::parse("y ~ F(f1, f2)").unwrap();
+        let specification = crate::parse("y ~ F(f1, f2) - 1").unwrap();
         let model = specification.materialize(&training).unwrap();
         let rematerialized = model.materialize(&input).unwrap();
         let output = rematerialized.independent().frame();
@@ -490,7 +600,7 @@ mod tests {
             "f2" => ["v", "u", "u", "v"],
         )
         .unwrap();
-        let specification = crate::parse("y ~ exp(F(f1, f2))").unwrap();
+        let specification = crate::parse("y ~ exp(F(f1, f2)) - 1").unwrap();
         let model = specification.materialize(&training).unwrap();
         let rematerialized = model.materialize(&input).unwrap();
 
