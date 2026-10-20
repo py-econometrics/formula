@@ -1,8 +1,7 @@
-use crate::design::{Design, MaterializationError, MaterializationMode, Model};
+use crate::design::{Design, MaterializationError, Model};
 use crate::transform::{ArgumentCount, Transform, TransformError};
-use polars::error::PolarsResult;
-use polars::frame::DataFrame;
-use polars::prelude::{DataType, NamedFrom, Series};
+use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
+use std::sync::Arc;
 
 fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
@@ -18,12 +17,12 @@ fn collect_unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
     unique
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum Factor {
     Variable(String),
     Call {
         transform: Transform,
-        arguments: Vec<Factor>,
+        arguments: Vec<Arc<Factor>>,
     },
 }
 
@@ -52,8 +51,7 @@ impl Factor {
 
                 for argument in arguments {
                     argument.validate()?;
-
-                    if let Self::Call { transform, .. } = argument
+                    if let Self::Call { transform, .. } = argument.as_ref()
                         && transform.expands()
                     {
                         return Err(ValidationError::InvalidTransformComposition);
@@ -64,42 +62,11 @@ impl Factor {
             }
         }
     }
-    fn materialize(
-        &mut self,
-        data: &DataFrame,
-        mode: MaterializationMode,
-    ) -> Result<Vec<Series>, TransformError> {
-        match self {
-            Self::Variable(name) => {
-                let column = data.column(name)?.as_materialized_series().clone();
-                Ok(vec![column])
-            }
-            Self::Call {
-                transform,
-                arguments,
-            } => {
-                let mut inputs = Vec::with_capacity(arguments.len());
-                for argument in arguments {
-                    inputs.extend(argument.materialize(data, mode)?);
-                }
-                match mode {
-                    MaterializationMode::Fit => transform.fit(&inputs)?,
-                    MaterializationMode::Apply => {}
-                }
-                let output = transform.transform(&inputs)?;
-                Ok(output
-                    .columns()
-                    .iter()
-                    .map(|column| column.as_materialized_series().clone())
-                    .collect())
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Term {
-    factors: Vec<Factor>,
+    factors: Vec<Arc<Factor>>,
 }
 
 // Interaction identity ignores factor order: a:b equals b:a.
@@ -112,6 +79,26 @@ impl PartialEq for Term {
                 .factors
                 .iter()
                 .all(|factor| other.factors.contains(factor))
+    }
+}
+
+impl FromIterator<Arc<Factor>> for Term {
+    fn from_iter<T: IntoIterator<Item = Arc<Factor>>>(factors: T) -> Self {
+        Self {
+            factors: collect_unique(factors),
+        }
+    }
+}
+
+impl FromIterator<Factor> for Term {
+    fn from_iter<T: IntoIterator<Item = Factor>>(factors: T) -> Self {
+        factors.into_iter().map(Arc::new).collect()
+    }
+}
+
+impl From<Factor> for Term {
+    fn from(factor: Factor) -> Self {
+        std::iter::once(factor).collect()
     }
 }
 
@@ -139,26 +126,22 @@ impl Term {
         Ok(())
     }
 
-    fn materialize(
-        &mut self,
-        data: &DataFrame,
-        mode: MaterializationMode,
+    fn assemble_columns(
+        &self,
+        height: usize,
+        factor_columns: Vec<Vec<Series>>,
     ) -> Result<Vec<Series>, TransformError> {
         if self.is_intercept() {
             return Ok(vec![Series::new(
                 Self::INTERCEPT_COLUMN_NAME.into(),
-                vec![1.0_f64; data.height()],
+                vec![1.0_f64; height],
             )]);
         }
-        let (first, rest) = self
-            .factors
-            .split_first_mut()
+        let mut column_groups = factor_columns.into_iter();
+        let mut columns = column_groups
+            .next()
             .expect("non-intercept terms contain at least one factor");
-        let mut columns = first.materialize(data, mode)?;
-        // A single-factor term returns its columns directly.
-        for factor in rest {
-            let right_columns = factor.materialize(data, mode)?;
-
+        for right_columns in column_groups {
             let left_columns = columns
                 .iter()
                 .map(|column| column.cast(&DataType::Float64))
@@ -178,23 +161,30 @@ impl Term {
                     interactions.push(column);
                 }
             }
-            columns = interactions
+
+            columns = interactions;
         }
+
         Ok(columns)
     }
-}
 
-impl FromIterator<Factor> for Term {
-    fn from_iter<T: IntoIterator<Item = Factor>>(factors: T) -> Self {
-        Self {
-            factors: collect_unique(factors),
+    fn assemble(
+        &self,
+        height: usize,
+        evaluated: &[EvaluatedFactor],
+    ) -> Result<(Self, Vec<Series>), TransformError> {
+        let mut factors = Vec::with_capacity(self.factors.len());
+        let mut factor_columns = Vec::with_capacity(self.factors.len());
+        for factor in &self.factors {
+            let result = lookup_factor(evaluated, factor);
+            factors.push(Arc::clone(&result.factor));
+            factor_columns.push(result.columns.clone());
         }
-    }
-}
 
-impl From<Factor> for Term {
-    fn from(factor: Factor) -> Self {
-        std::iter::once(factor).collect()
+        let columns = self.assemble_columns(height, factor_columns)?;
+        let term = Self { factors };
+
+        Ok((term, columns))
     }
 }
 
@@ -243,25 +233,44 @@ impl Expression {
         Ok(())
     }
 
-    pub fn materialize(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
-        self.clone()
-            .materialize_with_mode(data, MaterializationMode::Fit)
-    }
-
-    pub(crate) fn materialize_with_mode(
-        mut self,
-        data: &DataFrame,
-        mode: MaterializationMode,
+    fn assemble(
+        &self,
+        height: usize,
+        evaluated: &[EvaluatedFactor],
     ) -> Result<Design, MaterializationError> {
-        self.validate()?;
+        let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
-        for term in &mut self.terms {
-            columns.extend(term.materialize(data, mode)?);
+        for term in &self.terms {
+            let (term, term_columns) = term.assemble(height, evaluated)?;
+            terms.push(term);
+            columns.extend(term_columns);
         }
-        let frame = DataFrame::new(data.height(), columns.into_iter().map(Into::into).collect())
+
+        let expression = Self {
+            terms,
+            suppress_intercept: self.suppress_intercept,
+        };
+
+        let frame = DataFrame::new(height, columns.into_iter().map(Into::into).collect())
             .map_err(TransformError::from)?;
 
-        Ok(Design::new(self, frame))
+        Ok(Design::new(expression, frame))
+    }
+
+    pub fn materialize(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
+        self.validate()?;
+
+        let scheduled = schedule_factors(&[self]);
+        let evaluated = fit_and_evaluate_factors(&scheduled, data)?;
+
+        self.assemble(data.height(), &evaluated)
+    }
+
+    pub(crate) fn apply(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
+        let scheduled = schedule_factors(&[self]);
+        let evaluated = evaluate_factors(&scheduled, data)?;
+
+        self.assemble(data.height(), &evaluated)
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -307,8 +316,12 @@ impl Formula {
 
     pub fn materialize(&self, data: &DataFrame) -> Result<Model, MaterializationError> {
         self.validate()?;
-        let dependent = self.dependent.materialize(data)?;
-        let independent = self.independent.materialize(data)?;
+        let scheduled = schedule_factors(&[&self.dependent, &self.independent]);
+        let evaluated = fit_and_evaluate_factors(&scheduled, data)?;
+
+        let dependent = self.dependent.assemble(data.height(), &evaluated)?;
+        let independent = self.independent.assemble(data.height(), &evaluated)?;
+
         Ok(Model::new(dependent, independent))
     }
 }
@@ -322,6 +335,147 @@ pub enum ValidationError {
     InvalidTransformComposition,
 }
 
+struct EvaluatedFactor {
+    factor: Arc<Factor>,
+    columns: Vec<Series>,
+}
+
+fn lookup_factor<'a>(
+    evaluated: &'a [EvaluatedFactor],
+    factor: &Arc<Factor>,
+) -> &'a EvaluatedFactor {
+    evaluated
+        .iter()
+        .find(|entry| entry.factor.as_ref() == factor.as_ref())
+        .expect("factor dependencies must be evaluated before their consumers")
+}
+
+fn fit_and_evaluate_factors(
+    scheduled: &[Arc<Factor>],
+    data: &DataFrame,
+) -> Result<Vec<EvaluatedFactor>, TransformError> {
+    let mut evaluated = Vec::with_capacity(scheduled.len());
+
+    for factor in scheduled {
+        let result = match factor.as_ref() {
+            Factor::Variable(name) => EvaluatedFactor {
+                factor: Arc::clone(factor),
+                columns: vec![data.column(name)?.as_materialized_series().clone()],
+            },
+            Factor::Call {
+                transform,
+                arguments,
+            } => {
+                let mut fitted_arguments = Vec::with_capacity(arguments.len());
+                let mut inputs = Vec::new();
+                for argument in arguments {
+                    let result = lookup_factor(&evaluated, argument);
+                    fitted_arguments.push(Arc::clone(&result.factor));
+                    inputs.extend(result.columns.iter().cloned());
+                }
+
+                let transform = transform.fit(&inputs)?;
+                let output = transform.transform(&inputs)?;
+
+                let columns = output
+                    .columns()
+                    .iter()
+                    .map(|column| column.as_materialized_series().clone())
+                    .collect();
+                EvaluatedFactor {
+                    factor: Arc::new(Factor::Call {
+                        transform,
+                        arguments: fitted_arguments,
+                    }),
+                    columns,
+                }
+            }
+        };
+        evaluated.push(result)
+    }
+    Ok(evaluated)
+}
+
+fn evaluate_factors(
+    scheduled: &[Arc<Factor>],
+    data: &DataFrame,
+) -> Result<Vec<EvaluatedFactor>, TransformError> {
+    let mut evaluated = Vec::with_capacity(scheduled.len());
+
+    for factor in scheduled {
+        let columns = match factor.as_ref() {
+            Factor::Variable(name) => {
+                vec![data.column(name)?.as_materialized_series().clone()]
+            }
+
+            Factor::Call {
+                transform,
+                arguments,
+            } => {
+                let mut inputs = Vec::new();
+                for argument in arguments {
+                    let result = lookup_factor(&evaluated, argument);
+                    inputs.extend(result.columns.iter().cloned());
+                }
+
+                let output = transform.transform(&inputs)?;
+                output
+                    .columns()
+                    .iter()
+                    .map(|column| column.as_materialized_series().clone())
+                    .collect()
+            }
+        };
+        evaluated.push(EvaluatedFactor {
+            factor: Arc::clone(factor),
+            columns,
+        });
+    }
+    Ok(evaluated)
+}
+
+fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
+    fn schedule(factor: &Arc<Factor>, scheduled: &mut Vec<Arc<Factor>>) {
+        // Structural equality check if factor is already scheduled.
+        if scheduled.contains(factor) {
+            return;
+        }
+        // Traverse arguments of factor call recursively.
+        if let Factor::Call { arguments, .. } = factor.as_ref() {
+            for argument in arguments {
+                schedule(argument, scheduled);
+            }
+        }
+        // At this point, arguments have been scheduled before the parent factor.
+        scheduled.push(Arc::clone(factor));
+    }
+
+    let mut scheduled = Vec::new();
+    for expression in expressions {
+        for term in &expression.terms {
+            for factor in &term.factors {
+                schedule(factor, &mut scheduled);
+            }
+        }
+    }
+
+    scheduled
+}
+
+pub(crate) fn apply_model(
+    dependent: &Expression,
+    independent: &Expression,
+    data: &DataFrame,
+) -> Result<Model, MaterializationError> {
+    let scheduled = schedule_factors(&[dependent, independent]);
+    let evaluated = evaluate_factors(&scheduled, data)?;
+
+    let dependent = dependent.assemble(data.height(), &evaluated)?;
+    let independent = independent.assemble(data.height(), &evaluated)?;
+
+    Ok(Model::new(dependent, independent))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +484,255 @@ mod tests {
         TransformDefinition,
     };
     use polars::prelude::Scalar;
+
+    #[test]
+    fn shared_stateful_factors_execute_once_and_retain_shared_nodes() {
+        use crate::transform::TRANSFORM_CALLS;
+
+        let training = polars::df!("g" => ["a", "b", "a"], "x" => [2.0, 3.0, 4.0]).unwrap();
+        let specification = crate::parse("F(g) ~ F(g):x + exp(F(g)) - 1").unwrap();
+
+        TRANSFORM_CALLS.set((0, 0));
+        let model = specification.materialize(&training).unwrap();
+        // F(g) and exp(F(g)) each fit and transform once, across both sides.
+        assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
+
+        let encoding = &model.dependent().expression().terms[0].factors[0];
+        let independent = model.independent().expression();
+        assert!(Arc::ptr_eq(encoding, &independent.terms[0].factors[0]));
+        let Factor::Call { arguments, .. } = independent.terms[1].factors[0].as_ref() else {
+            panic!("expected exp call");
+        };
+        assert!(Arc::ptr_eq(encoding, &arguments[0]));
+
+        let input = polars::df!("g" => ["b", "a", "unseen"], "x" => [5.0, 6.0, 7.0]).unwrap();
+        TRANSFORM_CALLS.set((0, 0));
+        let applied = model.evaluate(&input).unwrap();
+        assert_eq!(TRANSFORM_CALLS.get(), (0, 2));
+        assert!(Arc::ptr_eq(
+            encoding,
+            &applied.dependent().expression().terms[0].factors[0],
+        ));
+        assert!(Arc::ptr_eq(
+            &independent.terms[1].factors[0],
+            &applied.independent().expression().terms[1].factors[0],
+        ));
+        assert!(Arc::ptr_eq(
+            encoding,
+            &applied.independent().expression().terms[0].factors[0],
+        ));
+
+        let expected_dependent = polars::df!("F(g)" => [Some(1_u32), Some(0), None]).unwrap();
+        let expected_independent = polars::df!(
+            "F(g):x" => [Some(5.0), Some(0.0), None],
+            "exp(F(g))" => [Some(std::f64::consts::E), Some(1.0), None],
+        )
+        .unwrap();
+        assert!(
+            applied
+                .dependent()
+                .frame()
+                .equals_missing(&expected_dependent)
+        );
+        assert!(
+            applied
+                .independent()
+                .frame()
+                .equals_missing(&expected_independent)
+        );
+    }
+
+    #[test]
+    fn repeated_nested_stateless_factors_execute_once_per_call() {
+        use crate::transform::TRANSFORM_CALLS;
+
+        let specification = crate::parse_expression("log(x) + sqrt(log(x)) + log(x):z").unwrap();
+        let training = polars::df!("x" => [1.0, 4.0], "z" => [2.0, 3.0]).unwrap();
+
+        TRANSFORM_CALLS.set((0, 0));
+        let design = specification.materialize(&training).unwrap();
+        assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
+
+        let log = &design.expression().terms[0].factors[0];
+        let sqrt = &design.expression().terms[1].factors[0];
+        let Factor::Call { arguments, .. } = sqrt.as_ref() else {
+            panic!("expected sqrt call");
+        };
+        assert!(Arc::ptr_eq(log, &arguments[0]));
+        assert!(Arc::ptr_eq(log, &design.expression().terms[2].factors[0]));
+
+        let input = polars::df!("x" => [9.0, 16.0], "z" => [4.0, 5.0]).unwrap();
+        TRANSFORM_CALLS.set((0, 0));
+        let applied = design.evaluate(&input).unwrap();
+        assert_eq!(TRANSFORM_CALLS.get(), (0, 2));
+        assert!(!applied.frame().equals_missing(design.frame()));
+        assert!(Arc::ptr_eq(log, &applied.expression().terms[0].factors[0]));
+    }
+
+    #[test]
+    fn separate_materializations_learn_independent_state() {
+        let specification = crate::parse_expression("C(g)").unwrap();
+        let first_training = polars::df!("g" => ["a", "b"]).unwrap();
+        let second_training = polars::df!("g" => ["b", "c"]).unwrap();
+        let first = specification.materialize(&first_training).unwrap();
+        let second = specification.materialize(&second_training).unwrap();
+
+        assert!(!Arc::ptr_eq(
+            &first.expression().terms[0].factors[0],
+            &second.expression().terms[0].factors[0],
+        ));
+        assert!(matches!(
+            specification.terms[0].factors[0].as_ref(),
+            Factor::Call {
+                transform: Transform::C(Fit::Unfitted(_)),
+                ..
+            }
+        ));
+
+        let input = polars::df!("g" => ["a", "b", "c"]).unwrap();
+        let expected_first = polars::df!(
+            "C(g)[a]" => [Some(true), Some(false), None],
+            "C(g)[b]" => [Some(false), Some(true), None],
+        )
+        .unwrap();
+        let expected_second = polars::df!(
+            "C(g)[b]" => [None, Some(true), Some(false)],
+            "C(g)[c]" => [None, Some(false), Some(true)],
+        )
+        .unwrap();
+        assert!(
+            first
+                .evaluate(&input)
+                .unwrap()
+                .frame()
+                .equals_missing(&expected_first)
+        );
+        assert!(
+            second
+                .evaluate(&input)
+                .unwrap()
+                .frame()
+                .equals_missing(&expected_second)
+        );
+
+        // Materializing the retained expression starts a new fit.
+        let refitted = first.expression().materialize(&input).unwrap();
+        assert_eq!(
+            refitted.frame().get_column_names(),
+            ["C(g)[a]", "C(g)[b]", "C(g)[c]"]
+        );
+        assert!(!Arc::ptr_eq(
+            &first.expression().terms[0].factors[0],
+            &refitted.expression().terms[0].factors[0],
+        ));
+    }
+
+    #[test]
+    fn independent_design_applies_without_outcome_or_sibling_design() {
+        use crate::transform::TRANSFORM_CALLS;
+
+        let training = polars::df!("y" => [1.0, 2.0], "g" => ["a", "b"]).unwrap();
+        let model = crate::parse("y ~ F(g) - 1")
+            .unwrap()
+            .materialize(&training)
+            .unwrap();
+        let independent = model.independent().clone();
+        drop(model);
+
+        let input = polars::df!("g" => ["b", "unseen", "a"]).unwrap();
+        TRANSFORM_CALLS.set((0, 0));
+        let applied = independent.evaluate(&input).unwrap();
+        assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
+        let expected = polars::df!("F(g)" => [Some(1_u32), None, Some(0)]).unwrap();
+        assert!(applied.frame().equals_missing(&expected));
+        assert!(Arc::ptr_eq(
+            &independent.expression().terms[0].factors[0],
+            &applied.expression().terms[0].factors[0],
+        ));
+    }
+
+    #[test]
+    fn public_formula_and_design_types_remain_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Expression>();
+        assert_send_sync::<Formula>();
+        assert_send_sync::<Design>();
+        assert_send_sync::<Model>();
+    }
+
+    #[test]
+    fn planning_deduplicates_factors_across_formula_sides() {
+        let formula = crate::parse("log(x) ~ log(x) - 1").unwrap();
+        let scheduled = schedule_factors(&[&formula.dependent, &formula.independent]);
+
+        assert_eq!(scheduled.len(), 2);
+        assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
+        assert_eq!(scheduled[1], formula.dependent.terms[0].factors[0]);
+        assert_eq!(scheduled[1], formula.independent.terms[0].factors[0]);
+    }
+
+    #[test]
+    fn planning_orders_dependencies_before_parents() {
+        let expression = crate::parse_expression("log(x) + sqrt(log(x))").unwrap();
+        let scheduled = schedule_factors(&[&expression]);
+
+        assert_eq!(scheduled.len(), 3);
+        assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
+        assert_eq!(scheduled[1], expression.terms[0].factors[0]);
+        assert_eq!(scheduled[2], expression.terms[1].factors[0]);
+    }
+
+    #[test]
+    fn planning_preserves_repeated_arguments() {
+        let expression = crate::parse_expression("sub(x, x)").unwrap();
+        let scheduled = schedule_factors(&[&expression]);
+
+        assert_eq!(scheduled.len(), 2);
+        let Factor::Call { arguments, .. } = scheduled[1].as_ref() else {
+            panic!("expected sub call");
+        };
+
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(arguments[0], scheduled[0]);
+        assert_eq!(arguments[1], scheduled[0]);
+    }
+
+    #[test]
+    fn planning_distinguishes_argument_order() {
+        let expression = crate::parse_expression("sub(x, y) + sub(y, x)").unwrap();
+        let scheduled = schedule_factors(&[&expression]);
+
+        assert_eq!(scheduled.len(), 4);
+        assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
+        assert_eq!(scheduled[1].as_ref(), &Factor::from("y"));
+        assert_eq!(scheduled[2], expression.terms[0].factors[0]);
+        assert_eq!(scheduled[3], expression.terms[1].factors[0]);
+        assert_ne!(scheduled[2], scheduled[3]);
+    }
+
+    #[test]
+    fn planning_distinguishes_transform_parameters() {
+        let expression =
+            crate::parse_expression("C(g, reference='a') + C(g, reference='b')").unwrap();
+        let scheduled = schedule_factors(&[&expression]);
+
+        assert_eq!(scheduled.len(), 3);
+        assert_eq!(scheduled[0].as_ref(), &Factor::from("g"));
+        assert_eq!(scheduled[1], expression.terms[0].factors[0]);
+        assert_eq!(scheduled[2], expression.terms[1].factors[0]);
+        assert_ne!(scheduled[1], scheduled[2]);
+    }
+
+    #[test]
+    fn planning_excludes_cancelled_factors_and_intercepts() {
+        let formula = crate::parse("y ~ sqrt(x) - sqrt(x) + 1").unwrap();
+        let scheduled = schedule_factors(&[&formula.dependent, &formula.independent]);
+
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
+        assert!(schedule_factors(&[&formula.independent]).is_empty());
+    }
 
     #[test]
     fn intercept_is_first_and_included_once() {
@@ -401,7 +804,7 @@ mod tests {
         for values in [vec![4.0, 5.0, 6.0], vec![]] {
             let height = values.len();
             let input = polars::df!("y" => values).unwrap();
-            let output = model.materialize(&input).unwrap();
+            let output = model.evaluate(&input).unwrap();
             let frame = output.independent().frame();
             assert_eq!(frame.shape(), (height, 1));
             assert_eq!(
@@ -433,7 +836,7 @@ mod tests {
         for values in [vec![4.0, 5.0], vec![]] {
             let height = values.len();
             let input = polars::df!("x" => values).unwrap();
-            let output = design.materialize(&input).unwrap();
+            let output = design.evaluate(&input).unwrap();
             assert_eq!(output.frame().shape(), (height, 0));
         }
     }
@@ -456,14 +859,14 @@ mod tests {
         assert_eq!(output.columns()[0].name().as_str(), "b:a");
     }
 
-    fn assert_requires_one_argument(transform: Transform) {
+    fn assert_requires_one_argument(make_transform: impl Fn() -> Transform) {
         for count in [0, 1, 2, 3] {
             let arguments = (0..count)
-                .map(|index| Factor::Variable(format!("x{index}")))
+                .map(|index| Arc::new(Factor::Variable(format!("x{index}"))))
                 .collect();
 
             let factor = Factor::Call {
-                transform: transform.clone(),
+                transform: make_transform(),
                 arguments,
             };
 
@@ -491,23 +894,25 @@ mod tests {
 
     #[test]
     fn log_requires_exactly_one_argument() {
-        assert_requires_one_argument(Transform::Expression(ExpressionTransform::LOG));
+        assert_requires_one_argument(|| Transform::Expression(ExpressionTransform::LOG));
     }
 
     #[test]
     fn exp_requires_exactly_one_argument() {
-        assert_requires_one_argument(Transform::Expression(ExpressionTransform::EXP));
+        assert_requires_one_argument(|| Transform::Expression(ExpressionTransform::EXP));
     }
 
     #[test]
     fn categorical_requires_exactly_one_argument() {
-        assert_requires_one_argument(Transform::C(Fit::Unfitted(CategoricalDefinition::new(
-            None,
-        ))));
+        assert_requires_one_argument(|| {
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(None)))
+        });
 
-        assert_requires_one_argument(Transform::C(Fit::Unfitted(CategoricalDefinition::new(
-            Some(Scalar::from(1_i64)),
-        ))));
+        assert_requires_one_argument(|| {
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
+                Scalar::from(1_i64),
+            ))))
+        });
     }
 
     #[test]
@@ -515,7 +920,7 @@ mod tests {
         for count in [0, 1, 2, 3, 16] {
             let factor = Factor::Call {
                 transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                arguments: vec![Factor::from("x"); count],
+                arguments: (0..count).map(|_| Arc::new(Factor::from("x"))).collect(),
             };
             let result = factor.validate();
             if count == 0 {
@@ -535,11 +940,11 @@ mod tests {
     #[test]
     fn integer_encoding_rejects_expanding_arguments_in_any_position() {
         for position in 0..3 {
-            let mut arguments = vec![Factor::from("x"); 3];
-            arguments[position] = Factor::Call {
+            let mut arguments: Vec<_> = (0..3).map(|_| Arc::new(Factor::from("x"))).collect();
+            arguments[position] = Arc::new(Factor::Call {
                 transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
-                arguments: vec![Factor::from("group")],
-            };
+                arguments: vec![Arc::new(Factor::from("group"))],
+            });
             let factor = Factor::Call {
                 transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
                 arguments,
@@ -567,7 +972,7 @@ mod tests {
         .unwrap();
         let specification = crate::parse("y ~ F(f1, f2) - 1").unwrap();
         let model = specification.materialize(&training).unwrap();
-        let rematerialized = model.materialize(&input).unwrap();
+        let rematerialized = model.evaluate(&input).unwrap();
         let output = rematerialized.independent().frame();
 
         assert_eq!(output.width(), 1);
@@ -607,7 +1012,7 @@ mod tests {
         .unwrap();
         let specification = crate::parse("y ~ exp(F(f1, f2)) - 1").unwrap();
         let model = specification.materialize(&training).unwrap();
-        let rematerialized = model.materialize(&input).unwrap();
+        let rematerialized = model.evaluate(&input).unwrap();
 
         let training_inputs = [
             training
@@ -623,11 +1028,7 @@ mod tests {
         ];
         let definition = IntegerEncodingDefinition;
         let inner = definition.fit(&training_inputs).unwrap();
-        let encoded = definition.transform(&inner, &training_inputs).unwrap();
-        let mut outer = ExpressionTransform::EXP;
-        outer
-            .fit(&[encoded[0].as_materialized_series().clone()])
-            .unwrap();
+        let outer = ExpressionTransform::EXP.fit();
 
         for (data, design) in [
             (&training, model.independent()),

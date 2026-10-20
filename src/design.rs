@@ -2,12 +2,6 @@ use crate::formula::{Expression, ValidationError};
 use crate::transform::TransformError;
 use polars::prelude::DataFrame;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum MaterializationMode {
-    Fit,
-    Apply,
-}
-
 #[derive(Clone, Debug)]
 pub struct Design {
     expression: Expression,
@@ -18,10 +12,8 @@ impl Design {
     pub(crate) fn new(expression: Expression, frame: DataFrame) -> Self {
         Self { expression, frame }
     }
-    pub fn materialize(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
-        self.expression
-            .clone()
-            .materialize_with_mode(data, MaterializationMode::Apply)
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+        self.expression.apply(data)
     }
     pub fn expression(&self) -> &Expression {
         &self.expression
@@ -53,11 +45,12 @@ impl Model {
         &self.independent
     }
 
-    pub fn materialize(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
-        Ok(Self::new(
-            self.dependent.materialize(data)?,
-            self.independent.materialize(data)?,
-        ))
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+        crate::formula::apply_model(
+            self.dependent.expression(),
+            self.independent.expression(),
+            data,
+        )
     }
 }
 
