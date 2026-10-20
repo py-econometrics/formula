@@ -145,7 +145,7 @@ impl TransformDefinition for CategoricalDefinition {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct CategoricalFit {
     levels: Series,
 }
@@ -183,15 +183,14 @@ mod tests {
     fn transform_enum_delegates_categorical_operations() -> Result<(), TransformError> {
         let input = [Series::new("group".into(), ["a", "b"])];
         let reference = Scalar::from(PlSmallStr::from_static("a"));
-        let mut transform =
-            Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(reference))));
+        let transform = Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(reference))));
 
         assert!(transform.expands());
         assert!(matches!(
             transform.transform(&input),
             Err(TransformError::NotFitted)
         ));
-        transform.fit(&input)?;
+        let transform = transform.fit(&input)?;
         let output = transform.transform(&input)?;
         let Transform::C(Fit::Fitted(categorical)) = &transform else {
             unreachable!();
@@ -250,7 +249,7 @@ mod tests {
     #[test]
     fn categorical_requires_fit() {
         let reference = Scalar::from(PlSmallStr::from_static("missing"));
-        let mut transform = Fit::Unfitted(CategoricalDefinition::new(Some(reference)));
+        let transform = Fit::Unfitted(CategoricalDefinition::new(Some(reference)));
         let input = [Series::new("group".into(), ["a", "b"])];
 
         assert!(matches!(
@@ -301,8 +300,7 @@ mod tests {
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
         let training = [Series::new("group".into(), ["a", "b"])];
         let invalid = [Series::new("group".into(), ["b", "c"])];
-        let mut transform: Fit<CategoricalDefinition> =
-            Fit::Fitted(Fitted::new(definition.clone(), &training)?);
+        let transform = Fit::Fitted(Fitted::new(definition.clone(), &training)?);
         let original = transform.transform(&training)?;
 
         assert!(matches!(
@@ -522,10 +520,9 @@ mod tests {
         let second = [Series::new("group".into(), ["b", "c"])];
         let input = [Series::new("group".into(), ["a", "b", "c"])];
         let definition = CategoricalDefinition::new(None);
-        let original = Fitted::new(definition, &first)?;
+        let original = Fit::Fitted(Fitted::new(definition, &first)?);
         let original_output = original.transform(&input)?;
-        let mut transform: Fit<CategoricalDefinition> = Fit::Fitted(original.clone());
-        transform.fit(&second)?;
+        let transform = original.fit(&second)?;
         assert!(original.transform(&input)?.equals_missing(&original_output));
 
         let Fit::Fitted(transform) = transform else {

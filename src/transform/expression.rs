@@ -151,8 +151,8 @@ impl ExpressionTransform {
         self.argument_count
     }
 
-    pub(crate) fn fit(&mut self, _inputs: &[Series]) -> Result<(), TransformError> {
-        Ok(())
+    pub(crate) fn fit(&self) -> Self {
+        self.clone()
     }
 
     pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
@@ -315,10 +315,10 @@ mod tests {
             "x".into(),
             [Some(1.0), Some(std::f64::consts::E), None],
         )];
-        let mut transform = Transform::Expression(ExpressionTransform::LOG);
+        let transform = Transform::Expression(ExpressionTransform::LOG);
 
         assert!(!transform.expands());
-        transform.fit(&input)?;
+        let transform = transform.fit(&input)?;
         assert_numeric_output(
             &transform.transform(&input)?,
             "log(x)",
@@ -333,10 +333,10 @@ mod tests {
             "x".into(),
             [Some(0.0), Some(1.0), Some(-1.0), None],
         )];
-        let mut transform = Transform::Expression(ExpressionTransform::EXP);
+        let transform = Transform::Expression(ExpressionTransform::EXP);
 
         assert!(!transform.expands());
-        transform.fit(&input)?;
+        let transform = transform.fit(&input)?;
         assert_numeric_output(
             &transform.transform(&input)?,
             "exp(x)",
@@ -384,11 +384,11 @@ mod tests {
         ];
 
         for input in cases {
-            for mut transform in [
+            for transform in [
                 Transform::Expression(ExpressionTransform::LOG),
                 Transform::Expression(ExpressionTransform::EXP),
             ] {
-                assert!(transform.fit(&input).is_ok());
+                let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
                     Err(TransformError::InputTypeMismatch)

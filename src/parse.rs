@@ -4,6 +4,7 @@ use crate::transform::{
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use winnow::Parser;
 use winnow::Result;
 use winnow::ascii::{Caseless, multispace0};
@@ -247,7 +248,7 @@ impl TryFrom<TransformCall> for Factor {
         for argument in call.arguments {
             match argument {
                 TransformCallArgument::Positional(argument) if !saw_keyword => {
-                    arguments.push(argument);
+                    arguments.push(Arc::new(argument));
                 }
                 TransformCallArgument::Positional(_) => {
                     return Err(TransformError::InvalidCall);
@@ -394,28 +395,28 @@ mod tests {
                 "log(x)",
                 Factor::Call {
                     transform: Transform::Expression(ExpressionTransform::LOG),
-                    arguments: vec![Factor::from("x")],
+                    arguments: vec![Arc::new(Factor::from("x"))],
                 },
             ),
             (
                 "exp(x)",
                 Factor::Call {
                     transform: Transform::Expression(ExpressionTransform::EXP),
-                    arguments: vec![Factor::from("x")],
+                    arguments: vec![Arc::new(Factor::from("x"))],
                 },
             ),
             (
                 "C(group)",
                 Factor::Call {
                     transform: categorical(None),
-                    arguments: vec![Factor::from("group")],
+                    arguments: vec![Arc::new(Factor::from("group"))],
                 },
             ),
             (
                 "C(group, reference='a')",
                 Factor::Call {
                     transform: categorical(Some(Scalar::from(PlSmallStr::from_static("a")))),
-                    arguments: vec![Factor::from("group")],
+                    arguments: vec![Arc::new(Factor::from("group"))],
                 },
             ),
         ];
@@ -430,7 +431,7 @@ mod tests {
 
         let expected = Expression::from(Term::from(Factor::Call {
             transform: categorical(Some(Scalar::from(1_i64))),
-            arguments: vec![Factor::from("x")],
+            arguments: vec![Arc::new(Factor::from("x"))],
         }));
         for source in [
             "C(x, reference=1)",
@@ -483,7 +484,7 @@ mod tests {
                 vec![
                     Factor::Call {
                         transform: Transform::Expression(ExpressionTransform::LOG),
-                        arguments: vec![Factor::from("x")],
+                        arguments: vec![Arc::new(Factor::from("x"))],
                     },
                     Factor::from("z"),
                 ],
@@ -493,7 +494,7 @@ mod tests {
         for (source, arguments) in cases {
             let expected = Factor::Call {
                 transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                arguments,
+                arguments: arguments.into_iter().map(Arc::new).collect(),
             };
             assert_eq!(
                 parse_factor.parse(source).expect(source),
@@ -591,30 +592,30 @@ mod tests {
                 "log(C(x))",
                 Factor::Call {
                     transform: Transform::Expression(ExpressionTransform::LOG),
-                    arguments: vec![Factor::Call {
+                    arguments: vec![Arc::new(Factor::Call {
                         transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
-                        arguments: vec![Factor::from("x")],
-                    }],
+                        arguments: vec![Arc::new(Factor::from("x"))],
+                    })],
                 },
             ),
             (
                 "C(log(x))",
                 Factor::Call {
                     transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
-                    arguments: vec![Factor::Call {
+                    arguments: vec![Arc::new(Factor::Call {
                         transform: Transform::Expression(ExpressionTransform::LOG),
-                        arguments: vec![Factor::from("x")],
-                    }],
+                        arguments: vec![Arc::new(Factor::from("x"))],
+                    })],
                 },
             ),
             (
                 "log(exp(x))",
                 Factor::Call {
                     transform: Transform::Expression(ExpressionTransform::LOG),
-                    arguments: vec![Factor::Call {
+                    arguments: vec![Arc::new(Factor::Call {
                         transform: Transform::Expression(ExpressionTransform::EXP),
-                        arguments: vec![Factor::from("x")],
-                    }],
+                        arguments: vec![Arc::new(Factor::from("x"))],
+                    })],
                 },
             ),
         ];

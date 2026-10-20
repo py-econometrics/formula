@@ -17,7 +17,7 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
     format!("{name}({arguments})").into()
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Transform {
     Expression(ExpressionTransform),
     C(Fit<CategoricalDefinition>),
@@ -59,19 +59,6 @@ impl<D: TransformDefinition> Fitted<D> {
     }
 }
 
-impl<D> Clone for Fitted<D>
-where
-    D: TransformDefinition + Clone,
-    D::Fit: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            definition: self.definition.clone(),
-            fit: self.fit.clone(),
-        }
-    }
-}
-
 impl<D> fmt::Debug for Fitted<D>
 where
     D: TransformDefinition + fmt::Debug,
@@ -91,21 +78,6 @@ impl<D: TransformDefinition> Fit<D> {
         match self {
             Self::Unfitted(definition) => definition,
             Self::Fitted(operation) => &operation.definition,
-        }
-    }
-}
-
-// Compatibility with the current owned factor trees. The lifecycle trait
-// itself does not require definitions or learned data to be cloneable.
-impl<D> Clone for Fit<D>
-where
-    D: TransformDefinition + Clone,
-    D::Fit: Clone,
-{
-    fn clone(&self) -> Self {
-        match self {
-            Self::Unfitted(definition) => Self::Unfitted(definition.clone()),
-            Self::Fitted(operation) => Self::Fitted(operation.clone()),
         }
     }
 }
@@ -141,10 +113,9 @@ impl<D: TransformDefinition + Clone> Fit<D> {
         self.definition().argument_count()
     }
 
-    pub(crate) fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
-        let operation = Fitted::new(self.definition().clone(), inputs)?;
-        *self = Self::Fitted(operation);
-        Ok(())
+    pub(crate) fn fit(&self, inputs: &[Series]) -> Result<Self, TransformError> {
+        let fitted = Fitted::new(self.definition().clone(), inputs)?;
+        Ok(Self::Fitted(fitted))
     }
 
     pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
@@ -172,21 +143,34 @@ impl Transform {
         }
     }
 
-    pub(crate) fn fit(&mut self, inputs: &[Series]) -> Result<(), TransformError> {
+    pub(crate) fn fit(&self, inputs: &[Series]) -> Result<Self, TransformError> {
+        #[cfg(test)]
+        TRANSFORM_CALLS.update(|(fits, transforms)| (fits + 1, transforms));
+
         match self {
-            Self::Expression(expression) => expression.fit(inputs),
-            Self::C(categorical) => categorical.fit(inputs),
-            Self::F(integer) => integer.fit(inputs),
+            Self::Expression(expression) => Ok(Self::Expression(expression.fit())),
+            Self::C(categorical) => Ok(Self::C(categorical.fit(inputs)?)),
+            Self::F(integer) => Ok(Self::F(integer.fit(inputs)?)),
         }
     }
 
     pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        #[cfg(test)]
+        TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
+
         match self {
             Self::Expression(expression) => expression.transform(inputs),
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),
         }
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Counts (fit calls, transform calls) on the current test thread.
+    pub(crate) static TRANSFORM_CALLS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 #[derive(Debug)]
@@ -232,7 +216,7 @@ mod tests {
     #[test]
     fn transform_enum_delegates_integer_operations() -> Result<(), TransformError> {
         let inputs = [Series::new("group".into(), ["a", "b", "a"])];
-        let mut transform = Transform::F(Fit::Unfitted(IntegerEncodingDefinition));
+        let transform = Transform::F(Fit::Unfitted(IntegerEncodingDefinition));
 
         assert!(!transform.expands());
         assert_eq!(transform.argument_count(), ArgumentCount::AtLeast(1));
@@ -241,7 +225,7 @@ mod tests {
             Err(TransformError::NotFitted)
         ));
 
-        transform.fit(&inputs)?;
+        let transform = transform.fit(&inputs)?;
         let output = transform.transform(&inputs)?;
         assert_eq!(output.get_column_names(), ["F(group)"]);
         assert_eq!(

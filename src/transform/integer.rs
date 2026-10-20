@@ -8,7 +8,7 @@ use polars::prelude::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IntegerEncodingDefinition;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct IntegerEncodingFit {
     names: Vec<PlSmallStr>,
     mapping: DataFrame,
@@ -320,9 +320,8 @@ mod tests {
         let first = [Series::new("f1".into(), ["a", "b"])];
         let second = [Series::new("other".into(), ["c", "a"])];
         let input = [Series::new("other".into(), ["b", "c", "a"])];
-        let mut transform: Fit<IntegerEncodingDefinition> =
-            Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &first)?);
-        transform.fit(&second)?;
+        let transform = Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &first)?);
+        let transform = transform.fit(&second)?;
 
         assert_integer_output(&transform.transform(&input)?, &[None, Some(0), Some(1)]);
         assert!(matches!(
@@ -336,8 +335,7 @@ mod tests {
     fn integer_encoding_rejects_invalid_fit_inputs_without_replacing_state()
     -> Result<(), TransformError> {
         let training = [Series::new("f1".into(), ["a", "b"])];
-        let mut transform: Fit<IntegerEncodingDefinition> =
-            Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &training)?);
+        let transform = Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &training)?);
         let original = transform.transform(&training)?;
         assert!(matches!(
             transform.fit(&[]),
