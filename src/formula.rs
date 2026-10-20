@@ -1,5 +1,5 @@
 use crate::design::{Design, MaterializationError, MaterializationMode, Model};
-use crate::transform::{ArgumentCount, Transform, TransformError, TransformOperation};
+use crate::transform::{ArgumentCount, Transform, TransformError};
 use polars::error::PolarsResult;
 use polars::frame::DataFrame;
 use polars::prelude::{DataType, NamedFrom, Series};
@@ -325,7 +325,10 @@ pub enum ValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{CategoricalTransform, ExpressionTransform, IntegerEncodingTransform};
+    use crate::transform::{
+        CategoricalDefinition, ExpressionTransform, Fit, IntegerEncodingDefinition,
+        TransformDefinition,
+    };
     use polars::prelude::Scalar;
 
     #[test]
@@ -498,18 +501,20 @@ mod tests {
 
     #[test]
     fn categorical_requires_exactly_one_argument() {
-        assert_requires_one_argument(Transform::C(CategoricalTransform::new(None)));
+        assert_requires_one_argument(Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+            None,
+        ))));
 
-        assert_requires_one_argument(Transform::C(CategoricalTransform::new(Some(Scalar::from(
-            1_i64,
-        )))));
+        assert_requires_one_argument(Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+            Some(Scalar::from(1_i64)),
+        ))));
     }
 
     #[test]
     fn integer_encoding_requires_at_least_one_argument_and_allows_repetition() {
         for count in [0, 1, 2, 3, 16] {
             let factor = Factor::Call {
-                transform: Transform::F(IntegerEncodingTransform::default()),
+                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
                 arguments: vec![Factor::from("x"); count],
             };
             let result = factor.validate();
@@ -532,11 +537,11 @@ mod tests {
         for position in 0..3 {
             let mut arguments = vec![Factor::from("x"); 3];
             arguments[position] = Factor::Call {
-                transform: Transform::C(CategoricalTransform::new(None)),
+                transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
                 arguments: vec![Factor::from("group")],
             };
             let factor = Factor::Call {
-                transform: Transform::F(IntegerEncodingTransform::default()),
+                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
                 arguments,
             };
             assert!(matches!(
@@ -616,9 +621,9 @@ mod tests {
                 .as_materialized_series()
                 .clone(),
         ];
-        let mut inner = IntegerEncodingTransform::default();
-        inner.fit(&training_inputs).unwrap();
-        let encoded = inner.transform(&training_inputs).unwrap();
+        let definition = IntegerEncodingDefinition;
+        let inner = definition.fit(&training_inputs).unwrap();
+        let encoded = definition.transform(&inner, &training_inputs).unwrap();
         let mut outer = ExpressionTransform::EXP;
         outer
             .fit(&[encoded[0].as_materialized_series().clone()])
@@ -632,7 +637,7 @@ mod tests {
                 data.column("f1").unwrap().as_materialized_series().clone(),
                 data.column("f2").unwrap().as_materialized_series().clone(),
             ];
-            let encoded = inner.transform(&inputs).unwrap();
+            let encoded = definition.transform(&inner, &inputs).unwrap();
             let expected = outer
                 .transform(&[encoded[0].as_materialized_series().clone()])
                 .unwrap();
