@@ -11,15 +11,15 @@ fn main() {
     )
     .expect("valid sample data");
 
-    let fml = "y ~ add(x1, x2) + log(x1)*sqrt(x2) + C(category, reference='a') + F(f1, f2)";
-    let specification = formula::parse(fml).expect("valid formula");
-    let model = specification
+    let fml = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) + F(f1, f2)";
+    let specification = formula::parse(fml).expect("valid formulas");
+    let models = specification
         .materialize(&data)
         .expect("successful materialisation");
-    let dependent = model.dependent().frame();
-    let independent = model.independent().frame();
-
     println!("Formula: {fml}\n");
-    println!("Dependent:\n{dependent}\n");
-    println!("Independent:\n{independent}");
+    for (formula, model) in &models {
+        println!("Model {formula:?}\n");
+        println!("Dependent:\n{}\n", model.dependent().frame());
+        println!("Independent:\n{}\n", model.independent().frame());
+    }
 }
