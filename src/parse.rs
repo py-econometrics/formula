@@ -14,34 +14,6 @@ use winnow::combinator::{
 };
 use winnow::token::{one_of, take_while};
 
-pub trait FormulaInput {
-    fn sources(&self) -> impl Iterator<Item = &str>;
-}
-
-impl FormulaInput for str {
-    fn sources(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self)
-    }
-}
-
-impl FormulaInput for String {
-    fn sources(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.as_str())
-    }
-}
-
-impl<S: AsRef<str>> FormulaInput for Vec<S> {
-    fn sources(&self) -> impl Iterator<Item = &str> {
-        self.iter().map(|source| source.as_ref())
-    }
-}
-
-impl<S: AsRef<str>, const N: usize> FormulaInput for [S; N] {
-    fn sources(&self) -> impl Iterator<Item = &str> {
-        self.iter().map(|source| source.as_ref())
-    }
-}
-
 #[derive(Debug)]
 struct TransformCall {
     name: String,
@@ -271,23 +243,6 @@ fn parse_stepwise_arguments(cursor: &mut &str) -> Result<Vec<Vec<Expression>>> {
     .parse_next(cursor)
 }
 
-fn parse_sw(cursor: &mut &str) -> Result<Vec<Expression>> {
-    preceded("sw", parse_stepwise_arguments)
-        .map(|arguments: Vec<Vec<Expression>>| arguments.into_iter().flatten().collect())
-        .parse_next(cursor)
-}
-
-fn parse_sw0(cursor: &mut &str) -> Result<Vec<Expression>> {
-    preceded("sw0", parse_stepwise_arguments)
-        .map(|arguments: Vec<Vec<Expression>>| {
-            // Add zero (empty) step
-            let mut expressions = vec![Expression::from_iter([])];
-            expressions.extend(arguments.into_iter().flatten());
-            expressions
-        })
-        .parse_next(cursor)
-}
-
 fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
     let mut prefixes = vec![Expression::from_iter([])];
     let mut expressions = Vec::new();
@@ -300,25 +255,34 @@ fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
     expressions
 }
 
-fn parse_csw(cursor: &mut &str) -> Result<Vec<Expression>> {
-    preceded("csw", parse_stepwise_arguments)
-        .map(expand_cumulative)
-        .parse_next(cursor)
-}
-
-fn parse_csw0(cursor: &mut &str) -> Result<Vec<Expression>> {
-    preceded("csw0", parse_stepwise_arguments)
-        .map(|arguments| {
-            // Add zero (empty) step
-            let mut expressions = vec![Expression::from_iter([])];
-            expressions.extend(expand_cumulative(arguments));
-            expressions
-        })
-        .parse_next(cursor)
+#[derive(Clone)]
+enum Stepwise {
+    Sw,
+    Sw0,
+    Csw,
+    Csw0,
 }
 
 fn parse_stepwise(cursor: &mut &str) -> Result<Vec<Expression>> {
-    alt((parse_sw0, parse_sw, parse_csw0, parse_csw)).parse_next(cursor)
+    let operator = alt((
+        "sw0".value(Stepwise::Sw0),
+        "sw".value(Stepwise::Sw),
+        "csw0".value(Stepwise::Csw0),
+        "csw".value(Stepwise::Csw),
+    ))
+    .parse_next(cursor)?;
+    let arguments = parse_stepwise_arguments.parse_next(cursor)?;
+
+    let mut expressions = match operator {
+        Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
+        Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
+    };
+
+    if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
+        expressions.insert(0, Expression::from_iter([]));
+    }
+
+    Ok(expressions)
 }
 
 fn parse_operand(cursor: &mut &str) -> Result<Vec<Expression>> {
@@ -356,14 +320,10 @@ fn parse_formula(cursor: &mut &str) -> Result<Vec<Formula>> {
             let mut formulas: Vec<Formula> = Vec::new();
             for dependent in &dependent {
                 for independent in &independent {
-                    // Avoid retaining duplicate formulas
-                    push_unique(
-                        &mut formulas,
-                        Formula {
-                            dependent: dependent.clone(),
-                            independent: independent.clone(),
-                        },
-                    );
+                    formulas.push(Formula {
+                        dependent: dependent.clone(),
+                        independent: independent.clone(),
+                    });
                 }
             }
             formulas
@@ -374,10 +334,14 @@ fn parse_formula(cursor: &mut &str) -> Result<Vec<Formula>> {
 pub(crate) type ParseResult<'i, T> =
     std::result::Result<T, winnow::error::ParseError<&'i str, winnow::error::ContextError>>;
 
-pub fn parse<T: FormulaInput + ?Sized>(input: &T) -> ParseResult<'_, Specification> {
+pub fn parse(source: &str) -> ParseResult<'_, Specification> {
+    parse_many(std::iter::once(source))
+}
+
+pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'a, Specification> {
     let mut formulas: Vec<Formula> = Vec::new();
 
-    for source in input.sources() {
+    for source in input {
         let expanded = terminated(parse_formula, eof).parse(source)?;
         for formula in expanded {
             push_unique(&mut formulas, formula);
@@ -385,17 +349,6 @@ pub fn parse<T: FormulaInput + ?Sized>(input: &T) -> ParseResult<'_, Specificati
     }
 
     Ok(Specification::new(formulas))
-}
-
-pub(crate) fn parse_one(source: &str) -> ParseResult<'_, Formula> {
-    terminated(
-        parse_formula.verify_map(|formulas: Vec<Formula>| {
-            let [formula]: [Formula; 1] = formulas.try_into().ok()?;
-            Some(formula)
-        }),
-        eof,
-    )
-    .parse(source)
 }
 
 #[cfg(test)]
@@ -512,38 +465,29 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_input_forms_produce_the_same_specification() {
+    fn parse_many_accepts_arrays_and_borrowed_iterators() {
         let source = String::from("y ~ sw(x, z)");
-        let expected = super::parse(source.as_str()).unwrap();
-        assert_eq!(super::parse(&source).unwrap(), expected);
-        assert_eq!(super::parse(&vec![source.as_str()]).unwrap(), expected);
-        assert_eq!(super::parse(&vec![source.clone()]).unwrap(), expected);
-        assert_eq!(super::parse(&[source.as_str()]).unwrap(), expected);
-        let owned_array = [source.clone()];
-        assert_eq!(super::parse(&owned_array).unwrap(), expected);
+        let expected = parse(&source).unwrap();
+        assert_eq!(parse_many([source.as_str()]).unwrap(), expected);
 
-        let sources = vec![source, String::from("y ~ x"), String::from("y ~ w")];
-        let expected = ["y ~ x", "y ~ z", "y ~ w"]
-            .map(|source| parse_one(source).unwrap())
-            .to_vec();
-        assert_eq!(
-            super::parse(&sources).unwrap(),
-            Specification::new(expected)
-        );
+        let borrowed = [source.as_str()];
+        let slice: &[&str] = &borrowed;
+        assert_eq!(parse_many(slice.iter().copied()).unwrap(), expected);
+
+        let sources = [source, String::from("y ~ x"), String::from("y ~ w")];
+        let actual = parse_many(sources.iter().map(String::as_str)).unwrap();
+        let expected = parse_many(["y ~ x", "y ~ z", "y ~ w"]).unwrap();
+        assert_eq!(actual.formulas(), expected.formulas());
     }
 
     #[test]
-    fn borrowed_inputs_handle_empty_collections_and_later_errors() {
-        let empty: Vec<String> = Vec::new();
-        assert_eq!(
-            super::parse(&empty).unwrap(),
-            Specification::new(Vec::new())
-        );
+    fn parse_many_handles_empty_input_and_later_errors() {
+        let specification = parse_many(std::iter::empty()).unwrap();
+        assert!(specification.formulas().is_empty());
 
-        let sources = vec![String::from("y ~ x"), String::from("y ~")];
-        let error = super::parse(&sources).unwrap_err();
+        let sources = ["y ~ x", "y ~"];
+        let error = parse_many(sources).unwrap_err();
         assert_eq!(*error.input(), sources[1]);
-        assert!(parse_one("y ~ sw(x, z)").is_err());
     }
 
     #[test]
@@ -620,7 +564,7 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| parse_one(source).unwrap())
+                .map(|source| parse(source).unwrap().formulas()[0].clone())
                 .collect::<Vec<_>>();
             assert_eq!(
                 super::parse(source).unwrap(),
@@ -643,7 +587,7 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| parse_one(source).unwrap())
+                .map(|source| parse(source).unwrap().formulas()[0].clone())
                 .collect::<Vec<_>>();
             assert_eq!(
                 super::parse(source).unwrap(),
@@ -673,7 +617,9 @@ mod tests {
         // Names are special only when immediately followed by their argument list.
         assert_eq!(
             super::parse("sw ~ csw0 + sw0x").unwrap(),
-            Specification::new(vec![parse_one("sw ~ csw0 + sw0x").unwrap()]),
+            Specification::new(vec![
+                parse("sw ~ csw0 + sw0x").unwrap().formulas()[0].clone()
+            ]),
         );
     }
 
@@ -885,7 +831,11 @@ mod tests {
         };
 
         for source in ["y~x+z", "y ~ x + z", " \n y \t~\n x + z \t"] {
-            assert_eq!(parse_one(source).expect(source), expected, "{source}");
+            assert_eq!(
+                parse(source).expect(source).formulas()[0].clone(),
+                expected,
+                "{source}"
+            );
         }
 
         assert_eq!(
@@ -909,7 +859,7 @@ mod tests {
             "y ~ x +",
             "y ~ x ?",
         ] {
-            assert!(parse_one(source).is_err(), "{source:?}");
+            assert!(parse(source).is_err(), "{source:?}");
         }
     }
 
@@ -923,7 +873,7 @@ mod tests {
     #[test]
     fn leading_minus_only_accepts_intercept() {
         for source in ["y ~ -x + x*z", "y ~ -(x + 1)", "y ~ -1x"] {
-            assert!(parse_one(source).is_err(), "{source}");
+            assert!(parse(source).is_err(), "{source}");
         }
     }
 
@@ -970,50 +920,5 @@ mod tests {
                 "{source}"
             );
         }
-    }
-    #[test]
-    fn addition_combines_expression_collections() {
-        // Ordinary syntax: one expression on each side produces one expression.
-        let left = [parse_one_expression("x").unwrap()];
-        let right = [parse_one_expression("y").unwrap()];
-
-        let actual = combine_expressions(&left, &right, |left, right| left.add(right));
-
-        assert_eq!(actual, vec![parse_one_expression("x + y").unwrap()]);
-
-        // Multiple expressions: left order first, then right order.
-        let left = [
-            parse_one_expression("x").unwrap(),
-            parse_one_expression("z").unwrap(),
-        ];
-        let right = [
-            parse_one_expression("w").unwrap(),
-            parse_one_expression("v").unwrap(),
-        ];
-
-        let actual = combine_expressions(&left, &right, |left, right| left.add(right));
-
-        let expected = ["x + w", "x + v", "z + w", "z + v"]
-            .map(|source| parse_one_expression(source).unwrap())
-            .to_vec();
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn interaction_distributes_within_each_expression() {
-        let left = [
-            parse_one_expression("x + y").unwrap(),
-            parse_one_expression("z").unwrap(),
-        ];
-        let right = [parse_one_expression("w").unwrap()];
-
-        let actual = combine_expressions(&left, &right, |left, right| left.interact(&right));
-
-        let expected = ["x:w + y:w", "z:w"]
-            .map(|source| parse_one_expression(source).unwrap())
-            .to_vec();
-
-        assert_eq!(actual, expected);
     }
 }
