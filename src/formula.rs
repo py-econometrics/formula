@@ -236,14 +236,14 @@ impl Expression {
     fn assemble(
         &self,
         height: usize,
-        evaluated: &[EvaluatedFactor],
+        evaluated: &[EvaluatedTerm],
     ) -> Result<Design, MaterializationError> {
         let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
         for term in &self.terms {
-            let (term, term_columns) = term.assemble(height, evaluated)?;
-            terms.push(term);
-            columns.extend(term_columns);
+            let entry = lookup_term(evaluated, term);
+            terms.push(entry.term.clone());
+            columns.extend(entry.columns.iter().cloned());
         }
 
         let expression = Self {
@@ -259,18 +259,13 @@ impl Expression {
 
     pub fn materialize(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
         self.validate()?;
-
-        let scheduled = schedule_factors(&[self]);
-        let evaluated = fit_and_evaluate_factors(&scheduled, data)?;
-
-        self.assemble(data.height(), &evaluated)
+        let terms = fit_and_evaluate_terms(&[self], data)?;
+        self.assemble(data.height(), &terms)
     }
 
     pub(crate) fn apply(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
-        let scheduled = schedule_factors(&[self]);
-        let evaluated = evaluate_factors(&scheduled, data)?;
-
-        self.assemble(data.height(), &evaluated)
+        let terms = evaluate_terms(&[self], data)?;
+        self.assemble(data.height(), &terms)
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -316,11 +311,9 @@ impl Formula {
 
     pub fn materialize(&self, data: &DataFrame) -> Result<Model, MaterializationError> {
         self.validate()?;
-        let scheduled = schedule_factors(&[&self.dependent, &self.independent]);
-        let evaluated = fit_and_evaluate_factors(&scheduled, data)?;
-
-        let dependent = self.dependent.assemble(data.height(), &evaluated)?;
-        let independent = self.independent.assemble(data.height(), &evaluated)?;
+        let terms = fit_and_evaluate_terms(&[&self.dependent, &self.independent], data)?;
+        let dependent = self.dependent.assemble(data.height(), &terms)?;
+        let independent = self.independent.assemble(data.height(), &terms)?;
 
         Ok(Model::new(dependent, independent))
     }
@@ -338,16 +331,6 @@ pub enum ValidationError {
 struct EvaluatedFactor {
     factor: Arc<Factor>,
     columns: Vec<Series>,
-}
-
-fn lookup_factor<'a>(
-    evaluated: &'a [EvaluatedFactor],
-    factor: &Arc<Factor>,
-) -> &'a EvaluatedFactor {
-    evaluated
-        .iter()
-        .find(|entry| entry.factor.as_ref() == factor.as_ref())
-        .expect("factor dependencies must be evaluated before their consumers")
 }
 
 fn fit_and_evaluate_factors(
@@ -407,7 +390,6 @@ fn evaluate_factors(
             Factor::Variable(name) => {
                 vec![data.column(name)?.as_materialized_series().clone()]
             }
-
             Factor::Call {
                 transform,
                 arguments,
@@ -462,16 +444,74 @@ fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
     scheduled
 }
 
+struct EvaluatedTerm {
+    term: Term,
+    columns: Vec<Series>,
+}
+
+fn assemble_terms(
+    expressions: &[&Expression],
+    height: usize,
+    factors: &[EvaluatedFactor],
+) -> Result<Vec<EvaluatedTerm>, TransformError> {
+    let mut evaluated: Vec<EvaluatedTerm> = Vec::new();
+
+    for expression in expressions {
+        for term in &expression.terms {
+            if evaluated.iter().any(|entry| &entry.term == term) {
+                continue;
+            }
+            let (term, columns) = term.assemble(height, factors)?;
+            evaluated.push(EvaluatedTerm { term, columns });
+        }
+    }
+
+    Ok(evaluated)
+}
+
+fn evaluate_terms(
+    expressions: &[&Expression],
+    data: &DataFrame,
+) -> Result<Vec<EvaluatedTerm>, TransformError> {
+    let scheduled = schedule_factors(expressions);
+    let factors = evaluate_factors(&scheduled, data)?;
+    assemble_terms(expressions, data.height(), &factors)
+}
+
+fn fit_and_evaluate_terms(
+    expressions: &[&Expression],
+    data: &DataFrame,
+) -> Result<Vec<EvaluatedTerm>, TransformError> {
+    let scheduled = schedule_factors(expressions);
+    let factors = fit_and_evaluate_factors(&scheduled, data)?;
+    assemble_terms(expressions, data.height(), &factors)
+}
+
+fn lookup_factor<'a>(
+    evaluated: &'a [EvaluatedFactor],
+    factor: &Arc<Factor>,
+) -> &'a EvaluatedFactor {
+    evaluated
+        .iter()
+        .find(|entry| &entry.factor == factor)
+        .expect("factor must be evaluated before its consumer")
+}
+
+fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a EvaluatedTerm {
+    evaluated
+        .iter()
+        .find(|entry| &entry.term == term)
+        .expect("every term must have an evaluated entry")
+}
+
 pub(crate) fn apply_model(
     dependent: &Expression,
     independent: &Expression,
     data: &DataFrame,
 ) -> Result<Model, MaterializationError> {
-    let scheduled = schedule_factors(&[dependent, independent]);
-    let evaluated = evaluate_factors(&scheduled, data)?;
-
-    let dependent = dependent.assemble(data.height(), &evaluated)?;
-    let independent = independent.assemble(data.height(), &evaluated)?;
+    let terms = evaluate_terms(&[dependent, independent], data)?;
+    let dependent = dependent.assemble(data.height(), &terms)?;
+    let independent = independent.assemble(data.height(), &terms)?;
 
     Ok(Model::new(dependent, independent))
 }
@@ -484,6 +524,75 @@ mod tests {
         TransformDefinition,
     };
     use polars::prelude::Scalar;
+
+    #[test]
+    fn expressions_share_equivalent_interaction_buffers() {
+        use crate::transform::TRANSFORM_CALLS;
+
+        let expressions = [
+            &crate::parse_expression("sqrt(exp(F(g))):x + w").unwrap(),
+            &crate::parse_expression("x:sqrt(exp(F(g))) + v").unwrap(),
+        ];
+        let training = polars::df!(
+            "g" => ["a", "b"], "x" => [2.0, 3.0],
+            "w" => [6.0, 7.0], "v" => [8.0, 9.0],
+        )
+        .unwrap();
+        TRANSFORM_CALLS.set((0, 0));
+        let terms = fit_and_evaluate_terms(&expressions, &training).unwrap();
+        assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
+        assert_eq!(terms.len(), 3);
+        let designs = expressions
+            .iter()
+            .map(|expression| expression.assemble(training.height(), &terms).unwrap())
+            .collect::<Vec<_>>();
+
+        let assert_shared = |designs: &[Design], expected: &[Option<f64>]| {
+            let name = "sqrt(exp(F(g))):x";
+            assert_eq!(designs[0].frame().get_column_names(), [name, "w"]);
+            assert_eq!(designs[1].frame().get_column_names(), [name, "v"]);
+            let left = designs[0].frame()[0].f64().unwrap();
+            let right = designs[1].frame()[0].f64().unwrap();
+            assert_eq!(left.len(), expected.len());
+            assert!(designs[0].frame()[0].equals_missing(&designs[1].frame()[0]));
+            for (actual, expected) in left.iter().zip(expected) {
+                match (actual, expected) {
+                    (Some(actual), Some(expected)) => {
+                        assert!((actual - expected).abs() < 1e-12);
+                    }
+                    (None, None) => {}
+                    values => panic!("unexpected interaction values: {values:?}"),
+                }
+            }
+            // Inspect the values buffer directly: cont_slice rejects nulls.
+            let left = left.downcast_iter().next().unwrap().values();
+            let right = right.downcast_iter().next().unwrap().values();
+            assert_eq!(left.as_ptr(), right.as_ptr());
+        };
+        assert_shared(
+            &designs,
+            &[Some(2.0), Some(3.0 * std::f64::consts::E.sqrt())],
+        );
+
+        let input = polars::df!(
+            "g" => ["b", "a", "unseen"], "x" => [4.0, 5.0, 6.0],
+            "w" => [7.0, 8.0, 9.0], "v" => [10.0, 11.0, 12.0],
+        )
+        .unwrap();
+        let fitted = [designs[0].expression(), designs[1].expression()];
+        TRANSFORM_CALLS.set((0, 0));
+        let terms = evaluate_terms(&fitted, &input).unwrap();
+        assert_eq!(TRANSFORM_CALLS.get(), (0, 3));
+        assert_eq!(terms.len(), 3);
+        let applied = fitted
+            .iter()
+            .map(|expression| expression.assemble(input.height(), &terms).unwrap())
+            .collect::<Vec<_>>();
+        assert_shared(
+            &applied,
+            &[Some(4.0 * std::f64::consts::E.sqrt()), Some(5.0), None],
+        );
+    }
 
     #[test]
     fn shared_stateful_factors_execute_once_and_retain_shared_nodes() {
