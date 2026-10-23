@@ -1,4 +1,4 @@
-use crate::formula::{Expression, Factor, Formula, Term};
+use crate::formula::{Expression, Factor, Formula, Specification, Term, push_unique};
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, Fit, IntegerEncodingDefinition, Transform,
 };
@@ -181,60 +181,189 @@ fn parse_transform_call_keyword_arguments(cursor: &mut &str) -> Result<Transform
     .parse_next(cursor)
 }
 
-fn parse_expression_inner(cursor: &mut &str) -> Result<Expression> {
+fn combine_expressions(
+    left: &[Expression],
+    right: &[Expression],
+    combine: impl Fn(Expression, Expression) -> Expression,
+) -> Vec<Expression> {
+    let mut expressions = Vec::new();
+    for left_expression in left {
+        for right_expression in right {
+            expressions.push(combine(left_expression.clone(), right_expression.clone()));
+        }
+    }
+    expressions
+}
+
+fn parse_expression_inner(cursor: &mut &str) -> Result<Vec<Expression>> {
     expression(parse_operand)
         .infix(alt((
-            '+'.value(Left(10, |_, left: Expression, right: Expression| {
-                Ok(left.add(right))
-            })),
-            '-'.value(Left(10, |_, left: Expression, right: Expression| {
-                Ok(left.subtract(right))
-            })),
-            '*'.value(Right(20, |_, left: Expression, right: Expression| {
-                Ok(left.interact_fully(right))
-            })),
-            ':'.value(Right(30, |_, left: Expression, right: Expression| {
-                Ok(left.interact(&right))
-            })),
+            '+'.value(Left(
+                10,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.add(right)
+                    }))
+                },
+            )),
+            '-'.value(Left(
+                10,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.subtract(right)
+                    }))
+                },
+            )),
+            '*'.value(Right(
+                20,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.interact_fully(right)
+                    }))
+                },
+            )),
+            ':'.value(Right(
+                30,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.interact(&right)
+                    }))
+                },
+            )),
         )))
         .parse_next(cursor)
 }
 
-fn parse_operand(cursor: &mut &str) -> Result<Expression> {
+fn parse_stepwise_arguments(cursor: &mut &str) -> Result<Vec<Vec<Expression>>> {
+    delimited(
+        '(',
+        separated(1.., parse_expression_inner, (multispace0, ',', multispace0)),
+        (multispace0, ')'),
+    )
+    .parse_next(cursor)
+}
+
+fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
+    let mut prefixes = vec![Expression::from_iter([])];
+    let mut expressions = Vec::new();
+
+    for argument in arguments {
+        prefixes = combine_expressions(&prefixes, &argument, |left, right| left.add(right));
+        expressions.extend(prefixes.iter().cloned());
+    }
+
+    expressions
+}
+
+#[derive(Clone)]
+enum Stepwise {
+    Sw,
+    Sw0,
+    Csw,
+    Csw0,
+}
+
+fn parse_stepwise(cursor: &mut &str) -> Result<Vec<Expression>> {
+    let operator = alt((
+        "sw0".value(Stepwise::Sw0),
+        "sw".value(Stepwise::Sw),
+        "csw0".value(Stepwise::Csw0),
+        "csw".value(Stepwise::Csw),
+    ))
+    .parse_next(cursor)?;
+    let arguments = parse_stepwise_arguments.parse_next(cursor)?;
+
+    let mut expressions = match operator {
+        Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
+        Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
+    };
+
+    if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
+        expressions.insert(0, Expression::from_iter([]));
+    }
+
+    Ok(expressions)
+}
+
+fn parse_operand(cursor: &mut &str) -> Result<Vec<Expression>> {
     delimited(
         multispace0,
         alt((
             delimited('(', parse_expression_inner, ')'),
-            parse_suppressed_intercept,
-            parse_intercept,
-            parse_factor.map(Term::from).map(Expression::from),
+            parse_stepwise,
+            alt((
+                parse_suppressed_intercept,
+                parse_intercept,
+                parse_factor.map(Term::from).map(Expression::from),
+            ))
+            .map(|expression| vec![expression]),
         )),
         multispace0,
     )
     .parse_next(cursor)
 }
 
-fn parse_formula(cursor: &mut &str) -> Result<Formula> {
+fn parse_formula(cursor: &mut &str) -> Result<Vec<Formula>> {
     separated_pair(parse_expression_inner, '~', parse_expression_inner)
-        .map(|(dependent, independent)| Formula {
-            // The left-hand side of a formula doesn't attract an intercept by default
-            dependent: dependent.resolve_intercept(false),
-            // The right-hand side of a formula attracts an intercept by default
-            independent: independent.resolve_intercept(true),
+        .map(|(dependent, independent)| {
+            let dependent = dependent
+                .into_iter()
+                // The left-hand side of a formula doesn't attract an intercept by default
+                .map(|expression| expression.resolve_intercept(false))
+                .collect::<Vec<_>>();
+            let independent = independent
+                .into_iter()
+                // The right-hand side of a formula attracts an intercept by default
+                .map(|expression| expression.resolve_intercept(true))
+                .collect::<Vec<_>>();
+
+            let mut formulas: Vec<Formula> = Vec::new();
+            for dependent in &dependent {
+                for independent in &independent {
+                    formulas.push(Formula {
+                        dependent: dependent.clone(),
+                        independent: independent.clone(),
+                    });
+                }
+            }
+            formulas
         })
         .parse_next(cursor)
 }
 
-type ParseResult<'i, T> =
+pub(crate) type ParseResult<'i, T> =
     std::result::Result<T, winnow::error::ParseError<&'i str, winnow::error::ContextError>>;
 
-pub fn parse(source: &str) -> ParseResult<'_, Formula> {
-    terminated(parse_formula, eof).parse(source)
+pub fn parse(source: &str) -> ParseResult<'_, Specification> {
+    parse_many(std::iter::once(source))
+}
+
+pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'a, Specification> {
+    let mut formulas: Vec<Formula> = Vec::new();
+
+    for source in input {
+        let expanded = terminated(parse_formula, eof).parse(source)?;
+        for formula in expanded {
+            push_unique(&mut formulas, formula);
+        }
+    }
+
+    Ok(Specification::new(formulas))
 }
 
 #[cfg(test)]
-pub(crate) fn parse_expression(source: &str) -> ParseResult<'_, Expression> {
+pub(crate) fn parse_expression(source: &str) -> ParseResult<'_, Vec<Expression>> {
     terminated(parse_expression_inner, eof).parse(source)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_one_expression(source: &str) -> ParseResult<'_, Expression> {
+    parse_expression(source).map(|expressions| {
+        let [expression]: [Expression; 1] = expressions
+            .try_into()
+            .expect("expected exactly one expression");
+        expression
+    })
 }
 
 impl TryFrom<TransformCall> for Factor {
@@ -333,6 +462,165 @@ mod tests {
             .iter()
             .map(|factors| factors.iter().copied().map(Factor::from).collect::<Term>())
             .collect()
+    }
+
+    #[test]
+    fn parse_many_accepts_arrays_and_borrowed_iterators() {
+        let source = String::from("y ~ sw(x, z)");
+        let expected = parse(&source).unwrap();
+        assert_eq!(parse_many([source.as_str()]).unwrap(), expected);
+
+        let borrowed = [source.as_str()];
+        let slice: &[&str] = &borrowed;
+        assert_eq!(parse_many(slice.iter().copied()).unwrap(), expected);
+
+        let sources = [source, String::from("y ~ x"), String::from("y ~ w")];
+        let actual = parse_many(sources.iter().map(String::as_str)).unwrap();
+        let expected = parse_many(["y ~ x", "y ~ z", "y ~ w"]).unwrap();
+        assert_eq!(actual.formulas(), expected.formulas());
+    }
+
+    #[test]
+    fn parse_many_handles_empty_input_and_later_errors() {
+        let specification = parse_many(std::iter::empty()).unwrap();
+        assert!(specification.formulas().is_empty());
+
+        let sources = ["y ~ x", "y ~"];
+        let error = parse_many(sources).unwrap_err();
+        assert_eq!(*error.input(), sources[1]);
+    }
+
+    #[test]
+    fn stepwise_operators_expand_in_order() {
+        let cases: &[(&str, &[&str])] = &[
+            ("sw(x, z)", &["x", "z"]),
+            ("sw0(x, z)", &["x-x", "x", "z"]),
+            ("csw(x, z)", &["x", "x + z"]),
+            ("csw0(x, z)", &["x-x", "x", "x + z"]),
+            ("sw(x)", &["x"]),
+            ("sw( x + y,\n log(z) )", &["x + y", "log(z)"]),
+            ("sw(x, sw(y, z))", &["x", "y", "z"]),
+            (
+                "csw(sw(x, y), sw(z, w))",
+                &["x", "y", "x+z", "x+w", "y+z", "y+w"],
+            ),
+            ("sw(csw(x, y), z)", &["x", "x+y", "z"]),
+            ("csw0(x + y, z)", &["x-x", "x+y", "x+y+z"]),
+        ];
+
+        for &(source, expected) in cases {
+            let expected = expected
+                .iter()
+                .map(|source| parse_one_expression(source).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::parse_expression(source).unwrap(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn stepwise_expansion_preserves_operators_and_precedence() {
+        let cases: &[(&str, &[&str])] = &[
+            ("a + sw(x:y):sw(w, v)", &["a+x:y:w", "a+x:y:v"]),
+            ("sw(x, z) + sw(w, v)", &["x+w", "x+v", "z+w", "z+v"]),
+            ("sw(x+y, z):w", &["x:w+y:w", "z:w"]),
+            ("a - sw(x, a)", &["a", "a-a"]),
+            ("sw(x, y)*z", &["x*z", "y*z"]),
+            ("sw0(x)*z", &["z", "x*z"]),
+            ("(a + sw(x, y)):z", &["a:z+x:z", "a:z+y:z"]),
+            ("a + sw(x, y)*z", &["a+x+z+x:z", "a+y+z+y:z"]),
+        ];
+
+        for &(source, expected) in cases {
+            let expected = expected
+                .iter()
+                .map(|source| parse_one_expression(source).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::parse_expression(source).unwrap(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_estimation_expands_both_sides_and_resolves_intercepts() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "sw(y1, y2) ~ a + sw(x, z)",
+                &["y1~a+x", "y1~a+z", "y2~a+x", "y2~a+z"],
+            ),
+            ("sw(y1, y2):w ~ x", &["y1:w~x", "y2:w~x"]),
+            ("y ~ sw0(x, z)", &["y~1", "y~x", "y~z"]),
+            ("y ~ csw0(x, z) - 1", &["y~1-1", "y~x-1", "y~x+z-1"]),
+            ("y ~ sw0(x, z):w", &["y~1", "y~x:w", "y~z:w"]),
+            ("y ~ sw(1, x - 1)", &["y~1", "y~x-1"]),
+        ];
+
+        for &(source, expected) in cases {
+            let expected = expected
+                .iter()
+                .map(|source| parse(source).unwrap().formulas()[0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::parse(source).unwrap(),
+                Specification::new(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_estimation_deduplicates_complete_formulas_stably() {
+        let cases: &[(&str, &[&str])] = &[
+            ("y ~ x + sw(x, x+x, z)", &["y~x", "y~x+z"]),
+            ("sw(y1, y1, y2) ~ sw(x, x)", &["y1~x", "y2~x"]),
+            ("y ~ sw(x:z, z:x)", &["y~x:z"]),
+            ("y ~ sw(x+z, z+x)", &["y~x+z", "y~z+x"]),
+            ("sw(y, y-1) ~ x", &["y~x", "y-1~x"]),
+        ];
+
+        for &(source, expected) in cases {
+            let expected = expected
+                .iter()
+                .map(|source| parse(source).unwrap().formulas()[0].clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::parse(source).unwrap(),
+                Specification::new(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn stepwise_calls_reject_malformed_arguments_and_name_spacing() {
+        for name in ["sw", "sw0", "csw", "csw0"] {
+            for arguments in [
+                "()", "( )", "(,x)", "(x,)", "(x,,y)", "(x", "(x))", "(x +)", "(x y)", " (x)",
+            ] {
+                let source = format!("y ~ {name}{arguments}");
+                assert!(super::parse(&source).is_err(), "{source}");
+            }
+        }
+        for source in [
+            "y ~ sw(x, sw())",
+            "y ~ log(sw(x, z))",
+            "y ~ sw(x, reference=1)",
+        ] {
+            assert!(super::parse(source).is_err(), "{source}");
+        }
+        // Names are special only when immediately followed by their argument list.
+        assert_eq!(
+            super::parse("sw ~ csw0 + sw0x").unwrap(),
+            Specification::new(vec![
+                parse("sw ~ csw0 + sw0x").unwrap().formulas()[0].clone()
+            ]),
+        );
     }
 
     #[test]
@@ -440,13 +728,13 @@ mod tests {
             " \n C(\tx,\nreference\t=\t1\n) \t",
         ] {
             assert_eq!(
-                parse_expression(source).expect(source),
+                parse_one_expression(source).expect(source),
                 expected,
                 "{source}"
             );
         }
 
-        assert!(parse_expression("C (x)").is_err());
+        assert!(parse_one_expression("C (x)").is_err());
     }
 
     #[test]
@@ -461,7 +749,7 @@ mod tests {
             "C(x, reference=tr ue)",
             "F(x, unknown=1)",
         ] {
-            assert!(parse_expression(source).is_err(), "{source}");
+            assert!(parse_one_expression(source).is_err(), "{source}");
         }
     }
 
@@ -528,7 +816,7 @@ mod tests {
 
         for (source, expected) in cases {
             assert_eq!(
-                parse_expression(source).expect(source),
+                parse_one_expression(source).expect(source),
                 expected,
                 "{source}"
             );
@@ -543,11 +831,15 @@ mod tests {
         };
 
         for source in ["y~x+z", "y ~ x + z", " \n y \t~\n x + z \t"] {
-            assert_eq!(parse(source).expect(source), expected, "{source}");
+            assert_eq!(
+                parse(source).expect(source).formulas()[0].clone(),
+                expected,
+                "{source}"
+            );
         }
 
         assert_eq!(
-            parse_expression("x + z").unwrap(),
+            parse_one_expression("x + z").unwrap(),
             expression(&[&["x"], &["z"]])
         );
     }
@@ -574,7 +866,7 @@ mod tests {
     #[test]
     fn expression_parser_rejects_incomplete_or_trailing_input() {
         for source in ["", " ", "y ~ x", "x C(group)", "(x + z", "x)", "x +", "x ?"] {
-            assert!(parse_expression(source).is_err(), "{source:?}");
+            assert!(parse_one_expression(source).is_err(), "{source:?}");
         }
     }
 
@@ -623,7 +915,7 @@ mod tests {
         for (source, factor) in cases {
             let expected = Expression::from(Term::from(factor));
             assert_eq!(
-                parse_expression(source).expect(source),
+                parse_one_expression(source).expect(source),
                 expected,
                 "{source}"
             );

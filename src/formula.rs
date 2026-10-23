@@ -1,9 +1,9 @@
-use crate::design::{Design, MaterializationError, Model};
+use crate::design::{Design, MaterializationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError};
 use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
 use std::sync::Arc;
 
-fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
+pub(crate) fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
         items.push(item);
     }
@@ -319,6 +319,47 @@ impl Formula {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct Specification {
+    formulas: Vec<Formula>,
+}
+
+impl Specification {
+    pub(crate) fn new(formulas: Vec<Formula>) -> Self {
+        Self { formulas }
+    }
+
+    pub fn formulas(&self) -> &[Formula] {
+        &self.formulas
+    }
+
+    pub fn materialize(&self, data: &DataFrame) -> Result<Models, MaterializationError> {
+        for formula in &self.formulas {
+            formula.validate()?;
+        }
+        let expressions = self
+            .formulas
+            .iter()
+            .flat_map(|formula| [&formula.dependent, &formula.independent])
+            .collect::<Vec<_>>();
+
+        // Fit factors and assemble terms once across every formula
+        let terms = fit_and_evaluate_terms(&expressions, data)?;
+
+        let entries = self
+            .formulas
+            .iter()
+            .map(|formula| {
+                let dependent = formula.dependent.assemble(data.height(), &terms)?;
+                let independent = formula.independent.assemble(data.height(), &terms)?;
+                Ok((formula.clone(), Model::new(dependent, independent)))
+            })
+            .collect::<Result<Vec<_>, MaterializationError>>()?;
+
+        Ok(Models::new(entries))
+    }
+}
+
 #[derive(Debug)]
 pub enum ValidationError {
     InvalidArgumentCount {
@@ -526,12 +567,289 @@ mod tests {
     use polars::prelude::Scalar;
 
     #[test]
+    fn empty_batch_materializes_without_models() {
+        let data = polars::df!("y" => [1.0]).unwrap();
+        let models = crate::parse_many(std::iter::empty())
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn batch_materialization_validates_all_formulas_before_fitting() {
+        use crate::transform::TRANSFORM_CALLS;
+
+        let data = polars::df!("y" => [1.0], "x" => [2.0], "g" => ["a"]).unwrap();
+        let specification = crate::parse("y ~ sw(F(g), sqrt(x, x))").unwrap();
+        TRANSFORM_CALLS.set((0, 0));
+        assert!(matches!(
+            specification.materialize(&data),
+            Err(MaterializationError::Validation(
+                ValidationError::InvalidArgumentCount { .. }
+            ))
+        ));
+        assert_eq!(TRANSFORM_CALLS.get(), (0, 0));
+    }
+
+    mod multiple_estimation {
+        use super::*;
+
+        const INTERACTION: &str = "sqrt(exp(F(g))):x";
+
+        fn fixture() -> (Specification, DataFrame) {
+            let data = polars::df!(
+                "y1" => [1.0, 2.0, 3.0], "y2" => [4.0, 5.0, 6.0],
+                "g" => [Some("a"), Some("b"), None], "x" => [2.0, 3.0, 4.0],
+                "w" => [7.0, 8.0, 9.0], "v" => [10.0, 11.0, 12.0],
+            )
+            .unwrap();
+            let specification =
+                crate::parse("sw(y1, y2) ~ sw0(w, v) + sw(sqrt(exp(F(g))):x, x:sqrt(exp(F(g))))")
+                    .unwrap();
+            (specification, data)
+        }
+
+        #[test]
+        fn preserves_model_contents_and_order() {
+            let (specification, data) = fixture();
+            assert_eq!(specification.formulas().len(), 6);
+            let collection = specification.materialize(&data).unwrap();
+            assert_eq!(collection.len(), 6);
+            let expected_interaction = Series::new(
+                INTERACTION.into(),
+                [Some(2.0), Some(3.0 * std::f64::consts::E.sqrt()), None],
+            );
+
+            let cases: &[(&str, &str, &[&str])] = &[
+                ("y1 ~ sqrt(exp(F(g))):x", "y1", &["Intercept", INTERACTION]),
+                (
+                    "y1 ~ w + sqrt(exp(F(g))):x",
+                    "y1",
+                    &["Intercept", "w", INTERACTION],
+                ),
+                (
+                    "y1 ~ v + sqrt(exp(F(g))):x",
+                    "y1",
+                    &["Intercept", "v", INTERACTION],
+                ),
+                ("y2 ~ sqrt(exp(F(g))):x", "y2", &["Intercept", INTERACTION]),
+                (
+                    "y2 ~ w + sqrt(exp(F(g))):x",
+                    "y2",
+                    &["Intercept", "w", INTERACTION],
+                ),
+                (
+                    "y2 ~ v + sqrt(exp(F(g))):x",
+                    "y2",
+                    &["Intercept", "v", INTERACTION],
+                ),
+            ];
+            let mut expected_columns = data.clone();
+            expected_columns
+                .with_column(Series::new("Intercept".into(), [1.0; 3]).into())
+                .unwrap();
+            expected_columns
+                .with_column(expected_interaction.into())
+                .unwrap();
+
+            for ((formula, model), &(source, response, names)) in collection.iter().zip(cases) {
+                let expected_formula = crate::parse(source).unwrap();
+                assert_eq!(formula, &expected_formula.formulas()[0], "{source}");
+                assert_eq!(model.dependent().frame().get_column_names(), [response]);
+                assert!(
+                    model.dependent().frame()[0].equals_missing(data.column(response).unwrap())
+                );
+                let frame = model.independent().frame();
+                assert_eq!(frame.get_column_names(), names);
+                for name in names {
+                    assert!(
+                        frame
+                            .column(name)
+                            .unwrap()
+                            .equals_missing(expected_columns.column(name).unwrap()),
+                        "{source}: {name}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn evaluates_nested_transforms_once_per_batch() {
+            use crate::transform::TRANSFORM_CALLS;
+
+            let data =
+                polars::df!("y" => [1.0, 2.0], "g" => ["a", "b"], "x" => [3.0, 4.0]).unwrap();
+            let specification = crate::parse("y ~ sqrt(exp(F(g))) + sw0(x)").unwrap();
+            assert_eq!(specification.formulas().len(), 2);
+            TRANSFORM_CALLS.set((0, 0));
+            let _models = specification.materialize(&data).unwrap();
+            // F, exp, and sqrt each fit and transform once across all models.
+            assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
+        }
+
+        #[test]
+        fn shares_column_buffers_across_models() {
+            let data =
+                polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
+            let specification = crate::parse("y ~ x:z + sw0(x)").unwrap();
+            let collection = specification.materialize(&data).unwrap();
+            assert_eq!(collection.len(), 2);
+            let mut models = collection.iter().map(|(_, model)| model);
+            let first = models.next().unwrap();
+            let second = models.next().unwrap();
+            let values_ptr = |column: &polars::prelude::Column| {
+                column
+                    .f64()
+                    .unwrap()
+                    .downcast_iter()
+                    .next()
+                    .unwrap()
+                    .values()
+                    .as_ptr()
+            };
+            for name in ["Intercept", "x:z"] {
+                assert_eq!(
+                    values_ptr(first.independent().frame().column(name).unwrap()),
+                    values_ptr(second.independent().frame().column(name).unwrap()),
+                    "{name}",
+                );
+            }
+            assert_eq!(
+                values_ptr(&first.dependent().frame()[0]),
+                values_ptr(&second.dependent().frame()[0])
+            );
+            assert_eq!(
+                values_ptr(second.independent().frame().column("x").unwrap()),
+                values_ptr(data.column("x").unwrap())
+            );
+        }
+
+        #[test]
+        fn expanding_transform_runs_once_and_shares_all_columns() {
+            use crate::transform::TRANSFORM_CALLS;
+
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0, 4.0],
+                "g" => [Some("c"), Some("a"), Some("b"), None],
+                "x" => [5.0, 6.0, 7.0, 8.0],
+            )
+            .unwrap();
+            let specification = crate::parse("y ~ C(g, reference='a') + sw0(x)").unwrap();
+            TRANSFORM_CALLS.set((0, 0));
+            let collection = specification.materialize(&data).unwrap();
+            assert_eq!(TRANSFORM_CALLS.get(), (1, 1));
+            assert_eq!(collection.len(), 2);
+
+            let mut models = collection.iter().map(|(_, model)| model);
+            let first = models.next().unwrap().independent().frame();
+            let second = models.next().unwrap().independent().frame();
+            let b = "C(g, reference=\"a\")[T.b]";
+            let c = "C(g, reference=\"a\")[T.c]";
+            // C preserves the order in which levels first appear.
+            assert_eq!(first.get_column_names(), ["Intercept", c, b]);
+            assert_eq!(second.get_column_names(), ["Intercept", c, b, "x"]);
+
+            for (name, values) in [
+                (b, [Some(false), Some(false), Some(true), None]),
+                (c, [Some(true), Some(false), Some(false), None]),
+            ] {
+                let expected = Series::new(name.into(), values);
+                let left = first.column(name).unwrap();
+                let right = second.column(name).unwrap();
+                assert!(
+                    left.as_materialized_series().equals_missing(&expected),
+                    "{name}"
+                );
+                assert!(
+                    right.as_materialized_series().equals_missing(&expected),
+                    "{name}"
+                );
+                let left = left.bool().unwrap();
+                let right = right.bool().unwrap();
+                let left = left.downcast_iter().next().unwrap();
+                let right = right.downcast_iter().next().unwrap();
+                assert_eq!(
+                    left.values().as_slice().0.as_ptr(),
+                    right.values().as_slice().0.as_ptr(),
+                    "{name}"
+                );
+                assert_eq!(
+                    left.validity().unwrap().as_slice().0.as_ptr(),
+                    right.validity().unwrap().as_slice().0.as_ptr(),
+                    "{name}: validity"
+                );
+            }
+        }
+
+        #[test]
+        fn retained_design_outlives_specification_and_models() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0],
+                "g" => [Some("a"), Some("b"), None],
+                "x" => [2.0, 3.0, 4.0],
+            )
+            .unwrap();
+            let specification = crate::parse("y ~ sqrt(exp(F(g))):x + sw0(x)").unwrap();
+            let collection = specification.materialize(&data).unwrap();
+            let retained = (&collection)
+                .into_iter()
+                .next()
+                .unwrap()
+                .1
+                .independent()
+                .clone();
+            drop(specification);
+            drop(collection);
+            drop(data);
+
+            let expected = Series::new(
+                INTERACTION.into(),
+                [Some(2.0), Some(3.0 * std::f64::consts::E.sqrt()), None],
+            );
+            assert!(
+                retained
+                    .frame()
+                    .column(INTERACTION)
+                    .unwrap()
+                    .as_materialized_series()
+                    .equals_missing(&expected)
+            );
+
+            let fresh = polars::df!(
+                "g" => [Some("b"), Some("a"), Some("unseen"), None],
+                "x" => [4.0, 5.0, 6.0, 7.0],
+            )
+            .unwrap();
+            let evaluated = retained.evaluate(&fresh).unwrap();
+            let expected = Series::new(
+                INTERACTION.into(),
+                [
+                    Some(4.0 * std::f64::consts::E.sqrt()),
+                    Some(5.0),
+                    None,
+                    None,
+                ],
+            );
+            assert_eq!(evaluated.frame().height(), 4);
+            assert!(
+                evaluated
+                    .frame()
+                    .column(INTERACTION)
+                    .unwrap()
+                    .as_materialized_series()
+                    .equals_missing(&expected)
+            );
+        }
+    }
+
+    #[test]
     fn expressions_share_equivalent_interaction_buffers() {
         use crate::transform::TRANSFORM_CALLS;
 
         let expressions = [
-            &crate::parse_expression("sqrt(exp(F(g))):x + w").unwrap(),
-            &crate::parse_expression("x:sqrt(exp(F(g))) + v").unwrap(),
+            &crate::parse_one_expression("sqrt(exp(F(g))):x + w").unwrap(),
+            &crate::parse_one_expression("x:sqrt(exp(F(g))) + v").unwrap(),
         ];
         let training = polars::df!(
             "g" => ["a", "b"], "x" => [2.0, 3.0],
@@ -599,7 +917,10 @@ mod tests {
         use crate::transform::TRANSFORM_CALLS;
 
         let training = polars::df!("g" => ["a", "b", "a"], "x" => [2.0, 3.0, 4.0]).unwrap();
-        let specification = crate::parse("F(g) ~ F(g):x + exp(F(g)) - 1").unwrap();
+        let specification = crate::parse("F(g) ~ F(g):x + exp(F(g)) - 1")
+            .unwrap()
+            .formulas()[0]
+            .clone();
 
         TRANSFORM_CALLS.set((0, 0));
         let model = specification.materialize(&training).unwrap();
@@ -655,7 +976,8 @@ mod tests {
     fn repeated_nested_stateless_factors_execute_once_per_call() {
         use crate::transform::TRANSFORM_CALLS;
 
-        let specification = crate::parse_expression("log(x) + sqrt(log(x)) + log(x):z").unwrap();
+        let specification =
+            crate::parse_one_expression("log(x) + sqrt(log(x)) + log(x):z").unwrap();
         let training = polars::df!("x" => [1.0, 4.0], "z" => [2.0, 3.0]).unwrap();
 
         TRANSFORM_CALLS.set((0, 0));
@@ -680,7 +1002,7 @@ mod tests {
 
     #[test]
     fn separate_materializations_learn_independent_state() {
-        let specification = crate::parse_expression("C(g)").unwrap();
+        let specification = crate::parse_one_expression("C(g)").unwrap();
         let first_training = polars::df!("g" => ["a", "b"]).unwrap();
         let second_training = polars::df!("g" => ["b", "c"]).unwrap();
         let first = specification.materialize(&first_training).unwrap();
@@ -741,8 +1063,8 @@ mod tests {
         use crate::transform::TRANSFORM_CALLS;
 
         let training = polars::df!("y" => [1.0, 2.0], "g" => ["a", "b"]).unwrap();
-        let model = crate::parse("y ~ F(g) - 1")
-            .unwrap()
+        let model = crate::parse("y ~ F(g) - 1").unwrap().formulas()[0]
+            .clone()
             .materialize(&training)
             .unwrap();
         let independent = model.independent().clone();
@@ -772,7 +1094,7 @@ mod tests {
 
     #[test]
     fn planning_deduplicates_factors_across_formula_sides() {
-        let formula = crate::parse("log(x) ~ log(x) - 1").unwrap();
+        let formula = crate::parse("log(x) ~ log(x) - 1").unwrap().formulas()[0].clone();
         let scheduled = schedule_factors(&[&formula.dependent, &formula.independent]);
 
         assert_eq!(scheduled.len(), 2);
@@ -783,7 +1105,7 @@ mod tests {
 
     #[test]
     fn planning_orders_dependencies_before_parents() {
-        let expression = crate::parse_expression("log(x) + sqrt(log(x))").unwrap();
+        let expression = crate::parse_one_expression("log(x) + sqrt(log(x))").unwrap();
         let scheduled = schedule_factors(&[&expression]);
 
         assert_eq!(scheduled.len(), 3);
@@ -794,7 +1116,7 @@ mod tests {
 
     #[test]
     fn planning_preserves_repeated_arguments() {
-        let expression = crate::parse_expression("sub(x, x)").unwrap();
+        let expression = crate::parse_one_expression("sub(x, x)").unwrap();
         let scheduled = schedule_factors(&[&expression]);
 
         assert_eq!(scheduled.len(), 2);
@@ -809,7 +1131,7 @@ mod tests {
 
     #[test]
     fn planning_distinguishes_argument_order() {
-        let expression = crate::parse_expression("sub(x, y) + sub(y, x)").unwrap();
+        let expression = crate::parse_one_expression("sub(x, y) + sub(y, x)").unwrap();
         let scheduled = schedule_factors(&[&expression]);
 
         assert_eq!(scheduled.len(), 4);
@@ -823,7 +1145,7 @@ mod tests {
     #[test]
     fn planning_distinguishes_transform_parameters() {
         let expression =
-            crate::parse_expression("C(g, reference='a') + C(g, reference='b')").unwrap();
+            crate::parse_one_expression("C(g, reference='a') + C(g, reference='b')").unwrap();
         let scheduled = schedule_factors(&[&expression]);
 
         assert_eq!(scheduled.len(), 3);
@@ -835,7 +1157,10 @@ mod tests {
 
     #[test]
     fn planning_excludes_cancelled_factors_and_intercepts() {
-        let formula = crate::parse("y ~ sqrt(x) - sqrt(x) + 1").unwrap();
+        let formula = crate::parse("y ~ sqrt(x) - sqrt(x) + 1")
+            .unwrap()
+            .formulas()[0]
+            .clone();
         let scheduled = schedule_factors(&[&formula.dependent, &formula.independent]);
 
         assert_eq!(scheduled.len(), 1);
@@ -847,7 +1172,10 @@ mod tests {
     fn intercept_is_first_and_included_once() {
         let data = polars::df!("y" => [2.0, 3.0], "x" => [4.0, 5.0]).unwrap();
         for source in ["y ~ x", "y ~ x + 1", "y ~ 1 + x + 1"] {
-            let model = crate::parse(source).unwrap().materialize(&data).unwrap();
+            let model = crate::parse(source).unwrap().formulas()[0]
+                .clone()
+                .materialize(&data)
+                .unwrap();
             let frame = model.independent().frame();
             assert_eq!(frame.get_column_names(), ["Intercept", "x"]);
             assert_eq!(
@@ -862,7 +1190,10 @@ mod tests {
     fn intercept_suppression_survives_later_addition() {
         let data = polars::df!("y" => [2.0], "x" => [3.0]).unwrap();
         for source in ["y ~ -1 + x", "y ~ - 1 + x", "y ~ x - 1", "y ~ x - 1 + 1"] {
-            let model = crate::parse(source).unwrap().materialize(&data).unwrap();
+            let model = crate::parse(source).unwrap().formulas()[0]
+                .clone()
+                .materialize(&data)
+                .unwrap();
             assert_eq!(
                 model.independent().frame().get_column_names(),
                 ["x"],
@@ -875,7 +1206,10 @@ mod tests {
     fn grouped_subtraction_suppresses_intercept() {
         let data = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
         for source in ["y ~ (x - 1)", "y ~ (-1 + x)", "y ~ x - (z + 1)"] {
-            let model = crate::parse(source).unwrap().materialize(&data).unwrap();
+            let model = crate::parse(source).unwrap().formulas()[0]
+                .clone()
+                .materialize(&data)
+                .unwrap();
             assert_eq!(
                 model.independent().frame().get_column_names(),
                 ["x"],
@@ -888,13 +1222,15 @@ mod tests {
     fn intercept_name_collision_requires_suppression() {
         let data = polars::df!("y" => [2.0], "Intercept" => [3.0]).unwrap();
         assert!(matches!(
-            crate::parse("y ~ Intercept").unwrap().materialize(&data),
+            crate::parse("y ~ Intercept").unwrap().formulas()[0]
+                .clone()
+                .materialize(&data),
             Err(MaterializationError::Transform(TransformError::Polars(
                 polars::error::PolarsError::Duplicate(_)
             )))
         ));
-        let model = crate::parse("y ~ Intercept - 1")
-            .unwrap()
+        let model = crate::parse("y ~ Intercept - 1").unwrap().formulas()[0]
+            .clone()
             .materialize(&data)
             .unwrap();
         assert_eq!(
@@ -906,8 +1242,8 @@ mod tests {
     #[test]
     fn intercept_uses_new_input_height_on_rematerialization() {
         let training = polars::df!("y" => [2.0, 3.0]).unwrap();
-        let model = crate::parse("y ~ 1")
-            .unwrap()
+        let model = crate::parse("y ~ 1").unwrap().formulas()[0]
+            .clone()
             .materialize(&training)
             .unwrap();
         for values in [vec![4.0, 5.0, 6.0], vec![]] {
@@ -925,7 +1261,7 @@ mod tests {
 
     #[test]
     fn cancelled_terms_preserve_model_row_counts() {
-        let specification = crate::parse("y ~ x-x-1").unwrap();
+        let specification = crate::parse("y ~ x-x-1").unwrap().formulas()[0].clone();
         for values in [vec![1.0, 2.0, 3.0], vec![]] {
             let height = values.len();
             let data = polars::df!("y" => values.clone(), "x" => values).unwrap();
@@ -938,7 +1274,7 @@ mod tests {
     #[test]
     fn empty_design_uses_new_input_height_on_rematerialization() {
         let training = polars::df!("x" => [1.0, 2.0, 3.0]).unwrap();
-        let design = crate::parse_expression("x-x")
+        let design = crate::parse_one_expression("x-x")
             .unwrap()
             .materialize(&training)
             .unwrap();
@@ -952,14 +1288,14 @@ mod tests {
 
     #[test]
     fn interaction_identity_preserves_function_argument_order() {
-        let expression = crate::parse_expression("sub(a,b):x + x:sub(b,a)").unwrap();
+        let expression = crate::parse_one_expression("sub(a,b):x + x:sub(b,a)").unwrap();
         assert_eq!(expression.terms.len(), 2);
     }
 
     #[test]
     fn interaction_deduplication_preserves_first_output_name() {
         let data = polars::df!("a" => [2.0, 4.0], "b" => [3.0, 5.0]).unwrap();
-        let design = crate::parse_expression("b:a + a:b")
+        let design = crate::parse_one_expression("b:a + a:b")
             .unwrap()
             .materialize(&data)
             .unwrap();
@@ -1079,7 +1415,7 @@ mod tests {
             "f2" => [2_i32, 1, 1, 1],
         )
         .unwrap();
-        let specification = crate::parse("y ~ F(f1, f2) - 1").unwrap();
+        let specification = crate::parse("y ~ F(f1, f2) - 1").unwrap().formulas()[0].clone();
         let model = specification.materialize(&training).unwrap();
         let rematerialized = model.evaluate(&input).unwrap();
         let output = rematerialized.independent().frame();
@@ -1119,7 +1455,7 @@ mod tests {
             "f2" => ["v", "u", "u", "v"],
         )
         .unwrap();
-        let specification = crate::parse("y ~ exp(F(f1, f2)) - 1").unwrap();
+        let specification = crate::parse("y ~ exp(F(f1, f2)) - 1").unwrap().formulas()[0].clone();
         let model = specification.materialize(&training).unwrap();
         let rematerialized = model.evaluate(&input).unwrap();
 

@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn sqrt_preserves_row_order_nulls_and_domain_behavior() {
         let data = polars::df!("x" => [Some(9.0), Some(1.0), Some(4.0), None, Some(-1.0)]).unwrap();
-        let output = crate::parse_expression("sqrt(x)")
+        let output = crate::parse_one_expression("sqrt(x)")
             .unwrap()
             .materialize(&data)
             .unwrap();
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn add_accepts_repeated_arguments_and_mixed_numeric_types() {
         let data = polars::df!("x" => [3_i32, 1], "y" => [Some(0.5_f32), None]).unwrap();
-        let output = crate::parse_expression("add(x, y, x)")
+        let output = crate::parse_one_expression("add(x, y, x)")
             .unwrap()
             .materialize(&data)
             .unwrap();
@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn sub_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [10, 3], "y" => [3, 10], "z" => [2, 1]).unwrap();
-        let output = crate::parse_expression("sub(x, y, z)")
+        let output = crate::parse_one_expression("sub(x, y, z)")
             .unwrap()
             .materialize(&data)
             .unwrap();
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn mul_multiplies_all_arguments() {
         let data = polars::df!("x" => [2, 3], "y" => [3, 4], "z" => [4, 5]).unwrap();
-        let output = crate::parse_expression("mul(x, y, z)")
+        let output = crate::parse_one_expression("mul(x, y, z)")
             .unwrap()
             .materialize(&data)
             .unwrap();
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn div_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [24, 3], "y" => [3, 24], "z" => [2, 2]).unwrap();
-        let output = crate::parse_expression("div(x, y, z)")
+        let output = crate::parse_one_expression("div(x, y, z)")
             .unwrap()
             .materialize(&data)
             .unwrap();
@@ -274,7 +274,9 @@ mod tests {
         for source in ["sqrt()", "sqrt(x, x)", "add()", "add(x)", "sub()", "sub(x)"] {
             assert!(
                 matches!(
-                    crate::parse_expression(source).unwrap().materialize(&data),
+                    crate::parse_one_expression(source)
+                        .unwrap()
+                        .materialize(&data),
                     Err(crate::MaterializationError::Validation(
                         crate::ValidationError::InvalidArgumentCount { .. }
                     ))
@@ -283,15 +285,15 @@ mod tests {
             );
         }
         for source in ["sqrt(x, base=2)", "add(x, x, base=2)", "sub(x, x, base=2)"] {
-            assert!(crate::parse_expression(source).is_err(), "{source}");
+            assert!(crate::parse_one_expression(source).is_err(), "{source}");
         }
     }
 
     #[test]
     fn repeated_expression_factors_are_deduplicated() {
         assert_eq!(
-            crate::parse_expression("log(x) + log(x)").unwrap(),
-            crate::parse_expression("log(x)").unwrap(),
+            crate::parse_one_expression("log(x) + log(x)").unwrap(),
+            crate::parse_one_expression("log(x)").unwrap(),
         );
     }
 
