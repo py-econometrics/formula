@@ -1,10 +1,10 @@
-mod design;
 mod formula;
+mod model;
 mod parse;
 mod transform;
 
-pub use self::formula::{Expression, Formula, Specification, ValidationError};
-pub use design::{Design, MaterializationError, Model, Models};
+pub use self::formula::{EvaluatedExpression, Expression, Formula, Specification, ValidationError};
+pub use model::{MaterializationError, Model, Models};
 pub use parse::{parse, parse_many};
 pub use transform::{ArgumentCount, TransformError};
 

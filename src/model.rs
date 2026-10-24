@@ -1,58 +1,34 @@
 use crate::Formula;
-use crate::formula::{Expression, ValidationError};
+use crate::formula::{EvaluatedExpression, Expression, ValidationError, evaluate_terms};
 use crate::parse::{ParseResult, parse};
 use crate::transform::TransformError;
 use polars::prelude::DataFrame;
 
 #[derive(Clone, Debug)]
-pub struct Design {
-    expression: Expression,
-    frame: DataFrame,
-}
-
-impl Design {
-    pub(crate) fn new(expression: Expression, frame: DataFrame) -> Self {
-        Self { expression, frame }
-    }
-    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
-        self.expression.apply(data)
-    }
-    pub fn expression(&self) -> &Expression {
-        &self.expression
-    }
-    pub fn frame(&self) -> &DataFrame {
-        &self.frame
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct Model {
-    dependent: Design,
-    independent: Design,
+    left: EvaluatedExpression,
+    right: EvaluatedExpression,
 }
 
 impl Model {
-    pub(crate) fn new(dependent: Design, independent: Design) -> Self {
-        Self {
-            dependent,
-            independent,
-        }
+    pub(crate) fn new(left: EvaluatedExpression, right: EvaluatedExpression) -> Self {
+        Self { left, right }
     }
 
-    pub fn dependent(&self) -> &Design {
-        &self.dependent
+    pub fn left(&self) -> &EvaluatedExpression {
+        &self.left
     }
 
-    pub fn independent(&self) -> &Design {
-        &self.independent
+    pub fn right(&self) -> &EvaluatedExpression {
+        &self.right
     }
 
     pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
-        crate::formula::apply_model(
-            self.dependent.expression(),
-            self.independent.expression(),
-            data,
-        )
+        let terms = evaluate_terms(&[self.left().expression(), self.right().expression()], data)?;
+        let left = self.left().expression().assemble(data.height(), &terms)?;
+        let right = self.right().expression().assemble(data.height(), &terms)?;
+
+        Ok(Model::new(left, right))
     }
 }
 
@@ -89,6 +65,26 @@ impl Models {
             [formula] => self.get(formula),
             _ => None,
         })
+    }
+
+    fn expressions(&self) -> impl Iterator<Item = &Expression> {
+        self.iter()
+            .flat_map(|(_, model)| [model.left.expression(), model.right.expression()])
+    }
+
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+        let expressions: Vec<&Expression> = self.expressions().collect();
+        let terms = evaluate_terms(&expressions, data)?;
+
+        let entries = self
+            .iter()
+            .map(|(formula, model)| {
+                let left = model.left().expression().assemble(data.height(), &terms)?;
+                let right = model.right().expression().assemble(data.height(), &terms)?;
+                Ok((formula.clone(), Model::new(left, right)))
+            })
+            .collect::<Result<Vec<_>, MaterializationError>>()?;
+        Ok(Self { entries })
     }
 }
 
@@ -134,7 +130,7 @@ mod tests {
         assert!(!models.is_empty());
         for ((formula, model), expected) in models.iter().zip(expected.formulas()) {
             assert_eq!(formula, expected);
-            assert_eq!(model.dependent().frame().get_column_names(), ["y"]);
+            assert_eq!(model.left().frame().get_column_names(), ["y"]);
         }
         // Borrowed iteration remains available alongside the explicit iterator.
         assert_eq!((&models).into_iter().count(), models.len());
