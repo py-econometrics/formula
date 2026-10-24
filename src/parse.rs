@@ -321,8 +321,8 @@ fn parse_formula(cursor: &mut &str) -> Result<Vec<Formula>> {
             for dependent in &dependent {
                 for independent in &independent {
                     formulas.push(Formula {
-                        dependent: dependent.clone(),
-                        independent: independent.clone(),
+                        left: dependent.clone(),
+                        right: independent.clone(),
                     });
                 }
             }
@@ -826,8 +826,8 @@ mod tests {
     #[test]
     fn formulas_keep_dependent_and_independent_expressions_separate() {
         let expected = Formula {
-            dependent: expression(&[&["y"]]),
-            independent: expression(&[&[], &["x"], &["z"]]),
+            left: expression(&[&["y"]]),
+            right: expression(&[&[], &["x"], &["z"]]),
         };
 
         for source in ["y~x+z", "y ~ x + z", " \n y \t~\n x + z \t"] {

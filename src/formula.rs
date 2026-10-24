@@ -1,4 +1,4 @@
-use crate::design::{Design, MaterializationError, Model, Models};
+use crate::model::{MaterializationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError};
 use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
 use std::sync::Arc;
@@ -233,11 +233,11 @@ impl Expression {
         Ok(())
     }
 
-    fn assemble(
+    pub(crate) fn assemble(
         &self,
         height: usize,
         evaluated: &[EvaluatedTerm],
-    ) -> Result<Design, MaterializationError> {
+    ) -> Result<EvaluatedExpression, MaterializationError> {
         let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
         for term in &self.terms {
@@ -254,16 +254,19 @@ impl Expression {
         let frame = DataFrame::new(height, columns.into_iter().map(Into::into).collect())
             .map_err(TransformError::from)?;
 
-        Ok(Design::new(expression, frame))
+        Ok(EvaluatedExpression::new(expression, frame))
     }
 
-    pub fn materialize(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
+    pub fn materialize(
+        &self,
+        data: &DataFrame,
+    ) -> Result<EvaluatedExpression, MaterializationError> {
         self.validate()?;
         let terms = fit_and_evaluate_terms(&[self], data)?;
         self.assemble(data.height(), &terms)
     }
 
-    pub(crate) fn apply(&self, data: &DataFrame) -> Result<Design, MaterializationError> {
+    fn evaluate(&self, data: &DataFrame) -> Result<EvaluatedExpression, MaterializationError> {
         let terms = evaluate_terms(&[self], data)?;
         self.assemble(data.height(), &terms)
     }
@@ -299,21 +302,21 @@ impl Expression {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Formula {
-    pub(crate) dependent: Expression,
-    pub(crate) independent: Expression,
+    pub(crate) left: Expression,
+    pub(crate) right: Expression,
 }
 
 impl Formula {
     pub(crate) fn validate(&self) -> Result<(), ValidationError> {
-        self.dependent.validate()?;
-        self.independent.validate()
+        self.left.validate()?;
+        self.right.validate()
     }
 
     pub fn materialize(&self, data: &DataFrame) -> Result<Model, MaterializationError> {
         self.validate()?;
-        let terms = fit_and_evaluate_terms(&[&self.dependent, &self.independent], data)?;
-        let dependent = self.dependent.assemble(data.height(), &terms)?;
-        let independent = self.independent.assemble(data.height(), &terms)?;
+        let terms = fit_and_evaluate_terms(&[&self.left, &self.right], data)?;
+        let dependent = self.left.assemble(data.height(), &terms)?;
+        let independent = self.right.assemble(data.height(), &terms)?;
 
         Ok(Model::new(dependent, independent))
     }
@@ -340,7 +343,7 @@ impl Specification {
         let expressions = self
             .formulas
             .iter()
-            .flat_map(|formula| [&formula.dependent, &formula.independent])
+            .flat_map(|formula| [&formula.left, &formula.right])
             .collect::<Vec<_>>();
 
         // Fit factors and assemble terms once across every formula
@@ -350,8 +353,8 @@ impl Specification {
             .formulas
             .iter()
             .map(|formula| {
-                let dependent = formula.dependent.assemble(data.height(), &terms)?;
-                let independent = formula.independent.assemble(data.height(), &terms)?;
+                let dependent = formula.left.assemble(data.height(), &terms)?;
+                let independent = formula.right.assemble(data.height(), &terms)?;
                 Ok((formula.clone(), Model::new(dependent, independent)))
             })
             .collect::<Result<Vec<_>, MaterializationError>>()?;
@@ -372,6 +375,32 @@ pub enum ValidationError {
 struct EvaluatedFactor {
     factor: Arc<Factor>,
     columns: Vec<Series>,
+}
+
+pub(crate) struct EvaluatedTerm {
+    term: Term,
+    columns: Vec<Series>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvaluatedExpression {
+    expression: Expression,
+    frame: DataFrame,
+}
+
+impl EvaluatedExpression {
+    fn new(expression: Expression, frame: DataFrame) -> Self {
+        Self { expression, frame }
+    }
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+        self.expression.evaluate(data)
+    }
+    pub fn expression(&self) -> &Expression {
+        &self.expression
+    }
+    pub fn frame(&self) -> &DataFrame {
+        &self.frame
+    }
 }
 
 fn fit_and_evaluate_factors(
@@ -485,11 +514,6 @@ fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
     scheduled
 }
 
-struct EvaluatedTerm {
-    term: Term,
-    columns: Vec<Series>,
-}
-
 fn assemble_terms(
     expressions: &[&Expression],
     height: usize,
@@ -510,7 +534,7 @@ fn assemble_terms(
     Ok(evaluated)
 }
 
-fn evaluate_terms(
+pub(crate) fn evaluate_terms(
     expressions: &[&Expression],
     data: &DataFrame,
 ) -> Result<Vec<EvaluatedTerm>, TransformError> {
@@ -543,18 +567,6 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
         .iter()
         .find(|entry| &entry.term == term)
         .expect("every term must have an evaluated entry")
-}
-
-pub(crate) fn apply_model(
-    dependent: &Expression,
-    independent: &Expression,
-    data: &DataFrame,
-) -> Result<Model, MaterializationError> {
-    let terms = evaluate_terms(&[dependent, independent], data)?;
-    let dependent = dependent.assemble(data.height(), &terms)?;
-    let independent = independent.assemble(data.height(), &terms)?;
-
-    Ok(Model::new(dependent, independent))
 }
 
 #[cfg(test)]
@@ -656,11 +668,9 @@ mod tests {
             for ((formula, model), &(source, response, names)) in collection.iter().zip(cases) {
                 let expected_formula = crate::parse(source).unwrap();
                 assert_eq!(formula, &expected_formula.formulas()[0], "{source}");
-                assert_eq!(model.dependent().frame().get_column_names(), [response]);
-                assert!(
-                    model.dependent().frame()[0].equals_missing(data.column(response).unwrap())
-                );
-                let frame = model.independent().frame();
+                assert_eq!(model.left().frame().get_column_names(), [response]);
+                assert!(model.left().frame()[0].equals_missing(data.column(response).unwrap()));
+                let frame = model.right().frame();
                 assert_eq!(frame.get_column_names(), names);
                 for name in names {
                     assert!(
@@ -710,17 +720,17 @@ mod tests {
             };
             for name in ["Intercept", "x:z"] {
                 assert_eq!(
-                    values_ptr(first.independent().frame().column(name).unwrap()),
-                    values_ptr(second.independent().frame().column(name).unwrap()),
+                    values_ptr(first.right().frame().column(name).unwrap()),
+                    values_ptr(second.right().frame().column(name).unwrap()),
                     "{name}",
                 );
             }
             assert_eq!(
-                values_ptr(&first.dependent().frame()[0]),
-                values_ptr(&second.dependent().frame()[0])
+                values_ptr(&first.left().frame()[0]),
+                values_ptr(&second.left().frame()[0])
             );
             assert_eq!(
-                values_ptr(second.independent().frame().column("x").unwrap()),
+                values_ptr(second.right().frame().column("x").unwrap()),
                 values_ptr(data.column("x").unwrap())
             );
         }
@@ -742,8 +752,8 @@ mod tests {
             assert_eq!(collection.len(), 2);
 
             let mut models = collection.iter().map(|(_, model)| model);
-            let first = models.next().unwrap().independent().frame();
-            let second = models.next().unwrap().independent().frame();
+            let first = models.next().unwrap().right().frame();
+            let second = models.next().unwrap().right().frame();
             let b = "C(g, reference=\"a\")[T.b]";
             let c = "C(g, reference=\"a\")[T.c]";
             // C preserves the order in which levels first appear.
@@ -792,13 +802,7 @@ mod tests {
             .unwrap();
             let specification = crate::parse("y ~ sqrt(exp(F(g))):x + sw0(x)").unwrap();
             let collection = specification.materialize(&data).unwrap();
-            let retained = (&collection)
-                .into_iter()
-                .next()
-                .unwrap()
-                .1
-                .independent()
-                .clone();
+            let retained = (&collection).into_iter().next().unwrap().1.right().clone();
             drop(specification);
             drop(collection);
             drop(data);
@@ -865,7 +869,7 @@ mod tests {
             .map(|expression| expression.assemble(training.height(), &terms).unwrap())
             .collect::<Vec<_>>();
 
-        let assert_shared = |designs: &[Design], expected: &[Option<f64>]| {
+        let assert_shared = |designs: &[EvaluatedExpression], expected: &[Option<f64>]| {
             let name = "sqrt(exp(F(g))):x";
             assert_eq!(designs[0].frame().get_column_names(), [name, "w"]);
             assert_eq!(designs[1].frame().get_column_names(), [name, "v"]);
@@ -927,8 +931,8 @@ mod tests {
         // F(g) and exp(F(g)) each fit and transform once, across both sides.
         assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
 
-        let encoding = &model.dependent().expression().terms[0].factors[0];
-        let independent = model.independent().expression();
+        let encoding = &model.left().expression().terms[0].factors[0];
+        let independent = model.right().expression();
         assert!(Arc::ptr_eq(encoding, &independent.terms[0].factors[0]));
         let Factor::Call { arguments, .. } = independent.terms[1].factors[0].as_ref() else {
             panic!("expected exp call");
@@ -941,15 +945,15 @@ mod tests {
         assert_eq!(TRANSFORM_CALLS.get(), (0, 2));
         assert!(Arc::ptr_eq(
             encoding,
-            &applied.dependent().expression().terms[0].factors[0],
+            &applied.left().expression().terms[0].factors[0],
         ));
         assert!(Arc::ptr_eq(
             &independent.terms[1].factors[0],
-            &applied.independent().expression().terms[1].factors[0],
+            &applied.right().expression().terms[1].factors[0],
         ));
         assert!(Arc::ptr_eq(
             encoding,
-            &applied.independent().expression().terms[0].factors[0],
+            &applied.right().expression().terms[0].factors[0],
         ));
 
         let expected_dependent = polars::df!("F(g)" => [Some(1_u32), Some(0), None]).unwrap();
@@ -958,15 +962,10 @@ mod tests {
             "exp(F(g))" => [Some(std::f64::consts::E), Some(1.0), None],
         )
         .unwrap();
+        assert!(applied.left().frame().equals_missing(&expected_dependent));
         assert!(
             applied
-                .dependent()
-                .frame()
-                .equals_missing(&expected_dependent)
-        );
-        assert!(
-            applied
-                .independent()
+                .right()
                 .frame()
                 .equals_missing(&expected_independent)
         );
@@ -1067,7 +1066,7 @@ mod tests {
             .clone()
             .materialize(&training)
             .unwrap();
-        let independent = model.independent().clone();
+        let independent = model.right().clone();
         drop(model);
 
         let input = polars::df!("g" => ["b", "unseen", "a"]).unwrap();
@@ -1088,19 +1087,19 @@ mod tests {
 
         assert_send_sync::<Expression>();
         assert_send_sync::<Formula>();
-        assert_send_sync::<Design>();
+        assert_send_sync::<EvaluatedExpression>();
         assert_send_sync::<Model>();
     }
 
     #[test]
     fn planning_deduplicates_factors_across_formula_sides() {
         let formula = crate::parse("log(x) ~ log(x) - 1").unwrap().formulas()[0].clone();
-        let scheduled = schedule_factors(&[&formula.dependent, &formula.independent]);
+        let scheduled = schedule_factors(&[&formula.left, &formula.right]);
 
         assert_eq!(scheduled.len(), 2);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
-        assert_eq!(scheduled[1], formula.dependent.terms[0].factors[0]);
-        assert_eq!(scheduled[1], formula.independent.terms[0].factors[0]);
+        assert_eq!(scheduled[1], formula.left.terms[0].factors[0]);
+        assert_eq!(scheduled[1], formula.right.terms[0].factors[0]);
     }
 
     #[test]
@@ -1161,11 +1160,11 @@ mod tests {
             .unwrap()
             .formulas()[0]
             .clone();
-        let scheduled = schedule_factors(&[&formula.dependent, &formula.independent]);
+        let scheduled = schedule_factors(&[&formula.left, &formula.right]);
 
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
-        assert!(schedule_factors(&[&formula.independent]).is_empty());
+        assert!(schedule_factors(&[&formula.right]).is_empty());
     }
 
     #[test]
@@ -1176,13 +1175,13 @@ mod tests {
                 .clone()
                 .materialize(&data)
                 .unwrap();
-            let frame = model.independent().frame();
+            let frame = model.right().frame();
             assert_eq!(frame.get_column_names(), ["Intercept", "x"]);
             assert_eq!(
                 frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
                 vec![Some(1.0), Some(1.0)]
             );
-            assert_eq!(model.dependent().frame().get_column_names(), ["y"]);
+            assert_eq!(model.left().frame().get_column_names(), ["y"]);
         }
     }
 
@@ -1194,11 +1193,7 @@ mod tests {
                 .clone()
                 .materialize(&data)
                 .unwrap();
-            assert_eq!(
-                model.independent().frame().get_column_names(),
-                ["x"],
-                "{source}"
-            );
+            assert_eq!(model.right().frame().get_column_names(), ["x"], "{source}");
         }
     }
 
@@ -1210,11 +1205,7 @@ mod tests {
                 .clone()
                 .materialize(&data)
                 .unwrap();
-            assert_eq!(
-                model.independent().frame().get_column_names(),
-                ["x"],
-                "{source}"
-            );
+            assert_eq!(model.right().frame().get_column_names(), ["x"], "{source}");
         }
     }
 
@@ -1233,10 +1224,7 @@ mod tests {
             .clone()
             .materialize(&data)
             .unwrap();
-        assert_eq!(
-            model.independent().frame(),
-            &data.select(["Intercept"]).unwrap()
-        );
+        assert_eq!(model.right().frame(), &data.select(["Intercept"]).unwrap());
     }
 
     #[test]
@@ -1250,7 +1238,7 @@ mod tests {
             let height = values.len();
             let input = polars::df!("y" => values).unwrap();
             let output = model.evaluate(&input).unwrap();
-            let frame = output.independent().frame();
+            let frame = output.right().frame();
             assert_eq!(frame.shape(), (height, 1));
             assert_eq!(
                 frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
@@ -1266,8 +1254,8 @@ mod tests {
             let height = values.len();
             let data = polars::df!("y" => values.clone(), "x" => values).unwrap();
             let model = specification.materialize(&data).unwrap();
-            assert_eq!(model.dependent().frame().shape(), (height, 1));
-            assert_eq!(model.independent().frame().shape(), (height, 0));
+            assert_eq!(model.left().frame().shape(), (height, 1));
+            assert_eq!(model.right().frame().shape(), (height, 0));
         }
     }
 
@@ -1418,7 +1406,7 @@ mod tests {
         let specification = crate::parse("y ~ F(f1, f2) - 1").unwrap().formulas()[0].clone();
         let model = specification.materialize(&training).unwrap();
         let rematerialized = model.evaluate(&input).unwrap();
-        let output = rematerialized.independent().frame();
+        let output = rematerialized.right().frame();
 
         assert_eq!(output.width(), 1);
         assert_eq!(output[0].name().as_str(), "F(f1, f2)");
@@ -1427,17 +1415,17 @@ mod tests {
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),
             vec![Some(2), Some(1), Some(0), None]
         );
-        assert_eq!(rematerialized.dependent().frame()[0].len(), 4);
+        assert_eq!(rematerialized.left().frame()[0].len(), 4);
 
-        let original = model.independent().frame()[0]
+        let original = model.right().frame()[0]
             .u32()
             .unwrap()
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(original, vec![Some(0), Some(1), Some(2)]);
         assert_eq!(
-            model.independent().expression(),
-            rematerialized.independent().expression()
+            model.right().expression(),
+            rematerialized.right().expression()
         );
     }
 
@@ -1475,10 +1463,7 @@ mod tests {
         let inner = definition.fit(&training_inputs).unwrap();
         let outer = ExpressionTransform::EXP.fit();
 
-        for (data, design) in [
-            (&training, model.independent()),
-            (&input, rematerialized.independent()),
-        ] {
+        for (data, design) in [(&training, model.right()), (&input, rematerialized.right())] {
             let inputs = [
                 data.column("f1").unwrap().as_materialized_series().clone(),
                 data.column("f2").unwrap().as_materialized_series().clone(),

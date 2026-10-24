@@ -28,7 +28,7 @@ fn main() {
 
     for (formula, model) in &models {
         println!("Model {formula:?}");
-        println!("Dependent design:\n{}", model.dependent().frame());
-        println!("Independent design:\n{}", model.independent().frame());
+        println!("Dependent design:\n{}", model.left().frame());
+        println!("Independent design:\n{}", model.right().frame());
     }
 }
