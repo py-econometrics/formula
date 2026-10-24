@@ -3,7 +3,8 @@
 `formula` is a Rust implementation of Wilkinson formulas.
 
 > [!NOTE]
-> `formula` is in early development and its scope, syntax, API is subject to change.
+> `formula` is in early development and its scope, syntax, API is subject to change. It is
+not ready for production use.
 
 ## Scope
 
@@ -15,16 +16,19 @@ matrix for regression analysis.
 ```rust
 use formula::parse;
 use polars::df;
-use polars::prelude::{DataFrame, PolarsResult};
+use polars::prelude::{DataFrame, Float64Chunked, NamedFrom, PolarsResult, Series};
 
-fn sample_data() -> PolarsResult<DataFrame> {
+fn sample_data(n: usize) -> PolarsResult<DataFrame> {
     df!(
-        "y" => [1.0, 2.0, 3.0],
-        "x1" => [2.0, 4.0, 6.0],
-        "x2" => [12.0, 2.0, 1.0],
-        "category" => ["a", "b", "a"],
-        "f1" => [13, 1, 1],
-        "f2" => ["x", "y", "z"],
+        "y" => Float64Chunked::rand_standard_normal("y".into(), n),
+        "x1" => Float64Chunked::rand_uniform("x1".into(), n, 1.0, 10.0),
+        "x2" => Float64Chunked::rand_uniform("x2".into(), n, 1.0, 10.0),
+        "category" => Series::new("category".into(), ["a", "b"])
+            .sample_n(n, true, None, Some(1))?,
+        "f1" => Series::new("f1".into(), [1, 2, 3])
+            .sample_n(n, true, None, Some(2))?,
+        "f2" => Series::new("f2".into(), ["x", "y", "z"])
+            .sample_n(n, true, None, Some(3))?,
     )
 }
 
@@ -36,7 +40,7 @@ fn main() {
 
     // Materializing a specification on data creates a collection of `Model`s
     // Transformations and data are shared across models, so no work is duplicated
-    let data = sample_data().expect("valid sample data");
+    let data = sample_data(1_000_000).expect("valid sample data");
     let models = specification
         .materialize(&data)
         .expect("successful materialization");
