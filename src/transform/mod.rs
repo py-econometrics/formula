@@ -6,6 +6,7 @@ mod integer;
 pub(crate) use categorical::CategoricalDefinition;
 pub(crate) use expression::ExpressionTransform;
 pub use input::ArgumentCount;
+pub(crate) use input::validate_numeric_input;
 pub(crate) use integer::IntegerEncodingDefinition;
 
 use crate::fit::{Fit, Fitted};
@@ -130,6 +131,7 @@ pub enum TransformError {
     InvalidParameter(String),
     Polars(PolarsError),
     DtypeMismatch(String),
+    NonNumericInput(String),
 }
 
 impl From<PolarsError> for TransformError {

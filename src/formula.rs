@@ -1,6 +1,6 @@
 use crate::fit::{Fit, Fitted};
 use crate::model::{MaterializationError, Model, Models};
-use crate::transform::{ArgumentCount, Transform, TransformError};
+use crate::transform::{ArgumentCount, Transform, TransformError, validate_numeric_input};
 use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
 use std::sync::Arc;
 
@@ -190,6 +190,15 @@ impl Term {
         let mut factor_columns = Vec::with_capacity(self.factors.len());
         for factor in &self.factors {
             let result = lookup_factor(evaluated, factor);
+            match factor.as_ref() {
+                Factor::Variable(_) => {
+                    let [column] = result.columns.as_slice() else {
+                        unreachable!("a variable evaluates to exactly one column");
+                    };
+                    validate_numeric_input(column)?;
+                }
+                Factor::Call { .. } => {}
+            }
             factors.push(Arc::clone(&result.factor));
             factor_columns.push(result.columns.clone());
         }
@@ -616,6 +625,135 @@ mod tests {
         CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
     };
     use polars::prelude::Scalar;
+
+    #[test]
+    fn bare_nonnumeric_columns_are_rejected_before_interaction_casting() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0],
+            "x" => [2.0, 3.0, 4.0],
+            "group" => ["a", "b", "a"],
+            "numeric_text" => ["2", "3", "2"],
+            "flag" => [true, false, true],
+        )
+        .unwrap();
+
+        for (source, column) in [
+            ("y ~ group", "group"),
+            ("group ~ x", "group"),
+            ("y ~ numeric_text:x", "numeric_text"),
+            ("y ~ x:numeric_text", "numeric_text"),
+            ("y ~ flag", "flag"),
+            ("flag ~ x", "flag"),
+            ("y ~ flag:x", "flag"),
+            ("y ~ x:flag", "flag"),
+        ] {
+            let specification = crate::parse(source).unwrap();
+            let Err(MaterializationError::Transform(TransformError::NonNumericInput(message))) =
+                specification.materialize(&data)
+            else {
+                panic!("expected NonNumericInput for `{source}`");
+            };
+
+            assert!(message.contains(&format!("`{column}`")), "{message}");
+        }
+    }
+
+    #[test]
+    fn explicit_encodings_accept_string_and_boolean_inputs() {
+        let training = polars::df!(
+            "group" => ["a", "b", "a"],
+            "flag" => [true, false, true],
+        )
+        .unwrap();
+        let input = polars::df!(
+            "group" => ["b", "a", "unseen"],
+            "flag" => [false, true, false],
+        )
+        .unwrap();
+
+        for (source, expected) in [
+            (
+                "C(group)",
+                polars::df!(
+                    "C(group)[a]" => [Some(false), Some(true), None],
+                    "C(group)[b]" => [Some(true), Some(false), None],
+                )
+                .unwrap(),
+            ),
+            (
+                "F(group)",
+                polars::df!("F(group)" => [Some(1_u32), Some(0), None]).unwrap(),
+            ),
+            (
+                "C(flag)",
+                polars::df!(
+                    "C(flag)[True]" => [false, true, false],
+                    "C(flag)[False]" => [true, false, true],
+                )
+                .unwrap(),
+            ),
+            ("F(flag)", polars::df!("F(flag)" => [1_u32, 0, 1]).unwrap()),
+        ] {
+            let fitted = crate::parse_one_expression(source)
+                .unwrap()
+                .materialize(&training)
+                .unwrap();
+            let evaluated = fitted.evaluate(&input).unwrap();
+
+            assert!(evaluated.frame().equals_missing(&expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn evaluation_requires_exact_dtypes_for_bare_and_transformed_inputs() {
+        let training = polars::df!("y" => [1.0, 2.0], "x" => [2_i32, 3]).unwrap();
+        let changed = [
+            polars::df!("y" => [1.0, 2.0], "x" => [2_i64, 3]).unwrap(),
+            polars::df!("y" => [1.0, 2.0], "x" => [2.0_f64, 3.0]).unwrap(),
+            polars::df!("y" => [1.0, 2.0], "x" => ["2", "3"]).unwrap(),
+            polars::df!("y" => [1.0, 2.0], "x" => [true, false]).unwrap(),
+        ];
+
+        for (source, output_dtype) in [
+            ("y ~ x - 1", DataType::Int32),
+            ("y ~ log(x) - 1", DataType::Float64),
+        ] {
+            let models = crate::parse(source)
+                .unwrap()
+                .materialize(&training)
+                .unwrap();
+            let (_, model) = models.iter().next().unwrap();
+            assert_eq!(model.right().frame()[0].dtype(), &output_dtype);
+            assert!(models.evaluate(&training).is_ok());
+
+            for input in &changed {
+                // Every evaluation entry point must use the original fitted dtype.
+                for result in [
+                    models.evaluate(input).map(|_| ()),
+                    model.evaluate(input).map(|_| ()),
+                    model.right().evaluate(input).map(|_| ()),
+                ] {
+                    let Err(MaterializationError::Transform(TransformError::DtypeMismatch(
+                        message,
+                    ))) = result
+                    else {
+                        panic!("expected DtypeMismatch for `{source}`");
+                    };
+
+                    assert!(message.contains("`x`"), "{message}");
+                    assert!(
+                        message.contains(&format!("expected {}", DataType::Int32)),
+                        "{message}",
+                    );
+                    assert!(
+                        message
+                            .contains(&format!("received {}", input.column("x").unwrap().dtype())),
+                        "{message}",
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn empty_batch_materializes_without_models() {

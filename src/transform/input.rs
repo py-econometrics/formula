@@ -49,3 +49,15 @@ pub(super) fn validate_single_input(inputs: &[Series]) -> Result<&Series, Transf
     };
     Ok(input)
 }
+
+pub(crate) fn validate_numeric_input(input: &Series) -> Result<(), TransformError> {
+    if !input.dtype().is_primitive_numeric() {
+        return Err(TransformError::NonNumericInput(format!(
+            "column `{}`: expected a primitive numeric dtype, received {}",
+            input.name(),
+            input.dtype(),
+        )));
+    }
+
+    Ok(())
+}
