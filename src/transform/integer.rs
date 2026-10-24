@@ -1,8 +1,9 @@
-use super::input::input_frame;
+use super::input::{argument_column_name, input_frame};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
-    DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, Series, col,
+    DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, Series, all_horizontal,
+    col,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -33,13 +34,26 @@ impl TransformDefinition for IntegerEncodingDefinition {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
-            .unique_stable(None, UniqueKeepStrategy::First)
-            .with_row_index(Self::CODE_COLUMN, None)
-            .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
-            .collect()?;
+            .unique_stable(None, UniqueKeepStrategy::First);
+        // Prevent encoding nonfinite floats as a category
+        let finite = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.dtype().is_float())
+            .map(|(index, _)| col(argument_column_name(index)).is_finite())
+            .collect::<Vec<_>>();
+        let mapping = if finite.is_empty() {
+            mapping
+        } else {
+            mapping.filter(all_horizontal(finite)?)
+        };
+
         Ok(IntegerEncodingState {
             names: inputs.iter().map(|input| input.name().clone()).collect(),
-            mapping,
+            mapping: mapping
+                .with_row_index(Self::CODE_COLUMN, None)
+                .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
+                .collect()?,
         })
     }
 
@@ -219,6 +233,120 @@ mod tests {
             &definition.transform(&transform, &input)?,
             &[Some(0), Some(1), None, None, None, None],
         );
+        Ok(())
+    }
+
+    #[test]
+    fn integer_encoding_excludes_nonfinite_keys() -> Result<(), TransformError> {
+        let input = Series::new(
+            "group".into(),
+            [
+                Some(2.0_f64),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(1.0),
+                Some(f64::NEG_INFINITY),
+                Some(2.0),
+                None,
+            ],
+        );
+        for dtype in [DataType::Float32, DataType::Float64] {
+            let inputs = [input.cast(&dtype)?];
+            let definition = IntegerEncodingDefinition;
+            let state = definition.fit(&inputs)?;
+            assert_integer_output(
+                &definition.transform(&state, &inputs)?,
+                &[Some(0), None, None, Some(1), None, Some(0), None],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn integer_encoding_excludes_tuples_with_any_nonfinite_component() -> Result<(), TransformError>
+    {
+        for dtype in [DataType::Float32, DataType::Float64] {
+            let inputs = [
+                Series::new(
+                    "first".into(),
+                    [
+                        2.0,
+                        f64::NAN,
+                        2.0,
+                        f64::INFINITY,
+                        1.0,
+                        f64::NEG_INFINITY,
+                        2.0,
+                        2.0,
+                        2.0,
+                        2.0,
+                    ],
+                )
+                .cast(&dtype)?,
+                Series::new(
+                    "second".into(),
+                    [
+                        3.0,
+                        3.0,
+                        f64::NAN,
+                        3.0,
+                        4.0,
+                        3.0,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        3.0,
+                        4.0,
+                    ],
+                )
+                .cast(&dtype)?,
+            ];
+            let definition = IntegerEncodingDefinition;
+            let state = definition.fit(&inputs)?;
+            assert_integer_output(
+                &definition.transform(&state, &inputs)?,
+                &[
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    Some(1),
+                    None,
+                    None,
+                    None,
+                    Some(0),
+                    Some(2),
+                ],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn integer_encoding_handles_all_nonfinite_training_data() -> Result<(), TransformError> {
+        for dtype in [DataType::Float32, DataType::Float64] {
+            let training =
+                [
+                    Series::new("group".into(), [f64::NAN, f64::INFINITY, f64::NEG_INFINITY])
+                        .cast(&dtype)?,
+                ];
+            let inputs = [Series::new(
+                "group".into(),
+                [
+                    Some(1.0),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                    None,
+                ],
+            )
+            .cast(&dtype)?];
+            let definition = IntegerEncodingDefinition;
+            let state = definition.fit(&training)?;
+            assert_integer_output(
+                &definition.transform(&state, &inputs)?,
+                &[None, None, None, None, None],
+            );
+        }
         Ok(())
     }
 
