@@ -1,6 +1,7 @@
+use crate::fit::Fit;
 use crate::formula::{Expression, Factor, Formula, Specification, Term, push_unique};
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, Fit, IntegerEncodingDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;

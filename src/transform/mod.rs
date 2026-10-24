@@ -8,9 +8,11 @@ pub(crate) use expression::ExpressionTransform;
 pub use input::ArgumentCount;
 pub(crate) use integer::IntegerEncodingDefinition;
 
+use crate::fit::{Fit, Fitted};
+use crate::transform::categorical::CategoricalState;
+use crate::transform::integer::IntegerEncodingState;
 use polars::error::PolarsError;
 use polars::prelude::{DataFrame, PlSmallStr, Series};
-use std::fmt;
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -20,8 +22,41 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
 #[derive(Debug, PartialEq)]
 pub enum Transform {
     Expression(ExpressionTransform),
-    C(Fit<CategoricalDefinition>),
-    F(Fit<IntegerEncodingDefinition>),
+    C(Fit<CategoricalDefinition, CategoricalState>),
+    F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
+}
+
+impl<D: TransformDefinition> Fitted<D, D::State> {
+    pub(crate) fn fit(definition: D, inputs: &[Series]) -> Result<Self, TransformError> {
+        let state = definition.fit(inputs)?;
+        Ok(Self::new(definition, state))
+    }
+
+    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        self.definition.transform(&self.state, inputs)
+    }
+}
+
+impl<D: TransformDefinition + Clone> Fit<D, D::State> {
+    pub(crate) fn expands(&self) -> bool {
+        self.definition().expands()
+    }
+
+    pub(crate) fn argument_count(&self) -> ArgumentCount {
+        self.definition().argument_count()
+    }
+
+    pub(crate) fn fit(&self, inputs: &[Series]) -> Result<Self, TransformError> {
+        let fitted = Fitted::fit(self.definition().clone(), inputs)?;
+        Ok(Self::Fitted(fitted))
+    }
+
+    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+        match self {
+            Self::Unfitted(_) => Err(TransformError::NotFitted),
+            Self::Fitted(operation) => operation.transform(inputs),
+        }
+    }
 }
 
 pub(crate) trait TransformDefinition {
@@ -39,95 +74,6 @@ pub(crate) trait TransformDefinition {
         state: &Self::State,
         inputs: &[Series],
     ) -> Result<DataFrame, TransformError>;
-}
-
-pub(crate) enum Fit<D: TransformDefinition> {
-    Unfitted(D),
-    Fitted(Fitted<D>),
-}
-
-/// A transform definition and its fitted state.
-pub(crate) struct Fitted<D: TransformDefinition> {
-    definition: D,
-    state: D::State,
-}
-
-impl<D: TransformDefinition> Fitted<D> {
-    pub(crate) fn new(definition: D, inputs: &[Series]) -> Result<Self, TransformError> {
-        let state = definition.fit(inputs)?;
-        Ok(Self { definition, state })
-    }
-
-    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        self.definition.transform(&self.state, inputs)
-    }
-}
-
-impl<D> fmt::Debug for Fitted<D>
-where
-    D: TransformDefinition + fmt::Debug,
-    D::State: fmt::Debug,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Fitted")
-            .field("definition", &self.definition)
-            .field("fit", &self.state)
-            .finish()
-    }
-}
-
-impl<D: TransformDefinition> Fit<D> {
-    pub(crate) fn definition(&self) -> &D {
-        match self {
-            Self::Unfitted(definition) => definition,
-            Self::Fitted(operation) => &operation.definition,
-        }
-    }
-}
-
-impl<D> fmt::Debug for Fit<D>
-where
-    D: TransformDefinition + fmt::Debug,
-    D::State: fmt::Debug,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unfitted(definition) => {
-                formatter.debug_tuple("Unfitted").field(definition).finish()
-            }
-            Self::Fitted(operation) => formatter.debug_tuple("Fitted").field(operation).finish(),
-        }
-    }
-}
-
-// Factor identity describes the definition, not the data used for fitting.
-impl<D: TransformDefinition + PartialEq> PartialEq for Fit<D> {
-    fn eq(&self, other: &Self) -> bool {
-        self.definition() == other.definition()
-    }
-}
-
-impl<D: TransformDefinition + Clone> Fit<D> {
-    pub(crate) fn expands(&self) -> bool {
-        self.definition().expands()
-    }
-
-    pub(crate) fn argument_count(&self) -> ArgumentCount {
-        self.definition().argument_count()
-    }
-
-    pub(crate) fn fit(&self, inputs: &[Series]) -> Result<Self, TransformError> {
-        let fitted = Fitted::new(self.definition().clone(), inputs)?;
-        Ok(Self::Fitted(fitted))
-    }
-
-    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        match self {
-            Self::Unfitted(_) => Err(TransformError::NotFitted),
-            Self::Fitted(operation) => operation.transform(inputs),
-        }
-    }
 }
 
 impl Transform {
@@ -194,6 +140,7 @@ impl From<PolarsError> for TransformError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fit::Fitted;
     use polars::prelude::{NamedFrom, PlSmallStr, Scalar};
 
     #[test]
@@ -202,16 +149,16 @@ mod tests {
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
         let first_input = [Series::new("group".into(), ["a", "b"])];
         let second_input = [Series::new("group".into(), ["a", "c"])];
-        let first = Fit::Fitted(Fitted::new(definition.clone(), &first_input)?);
-        let second = Fit::Fitted(Fitted::new(definition.clone(), &second_input)?);
+        let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
+        let second = Fit::Fitted(Fitted::fit(definition.clone(), &second_input)?);
 
         assert_eq!(first, second);
         assert_eq!(first, Fit::Unfitted(definition));
         assert_ne!(first, Fit::Unfitted(CategoricalDefinition::new(None)));
 
         let definition = IntegerEncodingDefinition;
-        let first = Fit::Fitted(Fitted::new(definition.clone(), &first_input)?);
-        let second = Fit::Fitted(Fitted::new(definition.clone(), &second_input)?);
+        let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
+        let second = Fit::Fitted(Fitted::fit(definition.clone(), &second_input)?);
         assert_eq!(first, second);
         assert_eq!(first, Fit::Unfitted(definition));
         Ok(())
