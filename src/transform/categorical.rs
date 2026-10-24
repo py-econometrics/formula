@@ -87,6 +87,13 @@ impl TransformDefinition for CategoricalDefinition {
         let levels = validate_single_input(inputs)?
             .drop_nulls()
             .unique_stable()?;
+        // Prevent encoding nonfinite floats as a category
+        let levels = if levels.dtype().is_float() {
+            levels.filter(&levels.is_finite()?)?
+        } else {
+            levels
+        };
+
         if let Some(reference) = self.reference_for_dtype(levels.dtype())?
             && !levels
                 .equal(&reference.into_series("reference".into()))?
@@ -96,6 +103,7 @@ impl TransformDefinition for CategoricalDefinition {
                 "`reference` value is not among the fitted levels".into(),
             ));
         }
+
         Ok(CategoricalState { levels })
     }
 
@@ -176,10 +184,51 @@ mod tests {
         for training in [
             Series::new("group".into(), Vec::<i32>::new()),
             Series::new("group".into(), [None::<i32>, None]),
+            Series::new("group".into(), [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]),
+            Series::new("group".into(), [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]),
         ] {
+            let inputs = [inputs[0].cast(training.dtype())?];
             let definition = CategoricalDefinition::new(None);
             let transform = definition.fit(&[training])?;
             assert_eq!(definition.transform(&transform, &inputs)?.shape(), (2, 0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn categorical_excludes_nonfinite_levels() -> Result<(), TransformError> {
+        let input = Series::new(
+            "group".into(),
+            [
+                Some(2.0_f64),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(1.0),
+                Some(f64::NEG_INFINITY),
+                Some(2.0),
+                None,
+            ],
+        );
+        for dtype in [DataType::Float32, DataType::Float64] {
+            let inputs = [input.cast(&dtype)?];
+            let definition = CategoricalDefinition::new(None);
+            let state = definition.fit(&inputs)?;
+            let levels = state.levels.cast(&DataType::Float64)?;
+            assert_eq!(
+                levels.f64()?.iter().collect::<Vec<_>>(),
+                vec![Some(2.0), Some(1.0)]
+            );
+            assert_eq!(state.levels.dtype(), &dtype);
+            assert_output(
+                &definition,
+                &state,
+                &inputs,
+                &definition.transform(&state, &inputs)?,
+                &[
+                    &[Some(true), None, None, Some(false), None, Some(true), None],
+                    &[Some(false), None, None, Some(true), None, Some(false), None],
+                ],
+            );
         }
         Ok(())
     }
