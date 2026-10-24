@@ -562,16 +562,6 @@ fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
     scheduled
 }
 
-fn normalize_nonfinite(column: Series) -> PolarsResult<Series> {
-    if !column.dtype().is_float() {
-        return Ok(column);
-    }
-    let finite = column.is_finite()?;
-    // Polars broadcasts series of length 1
-    let null = Series::full_null(column.name().clone(), 1, column.dtype());
-    column.zip_with(&finite, &null)
-}
-
 fn assemble_terms(
     expressions: &[&Expression],
     height: usize,
@@ -585,10 +575,6 @@ fn assemble_terms(
                 continue;
             }
             let (term, columns) = term.assemble(height, factors)?;
-            let columns = columns
-                .into_iter()
-                .map(normalize_nonfinite)
-                .collect::<PolarsResult<Vec<_>>>()?;
             evaluated.push(EvaluatedTerm { term, columns });
         }
     }
@@ -639,166 +625,6 @@ mod tests {
         CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
     };
     use polars::prelude::Scalar;
-
-    #[test]
-    fn nonfinite_bare_columns_are_normalized_on_fit_and_evaluation() {
-        for dtype in [DataType::Float32, DataType::Float64] {
-            let input = Series::new(
-                "x".into(),
-                [
-                    Some(2.0),
-                    Some(f64::NAN),
-                    Some(f64::INFINITY),
-                    Some(f64::NEG_INFINITY),
-                    None,
-                    Some(-1.0),
-                ],
-            )
-            .cast(&dtype)
-            .unwrap();
-            let data = DataFrame::new(input.len(), vec![input.into()]).unwrap();
-            let fitted = crate::parse_one_expression("x")
-                .unwrap()
-                .materialize(&data)
-                .unwrap();
-            let evaluated = fitted.evaluate(&data).unwrap();
-            for output in [&fitted, &evaluated] {
-                let column = &output.frame()[0];
-                assert_eq!(column.dtype(), &dtype);
-                let values = column.cast(&DataType::Float64).unwrap();
-                assert_eq!(
-                    values.f64().unwrap().iter().collect::<Vec<_>>(),
-                    vec![Some(2.0), None, None, None, None, Some(-1.0)]
-                );
-            }
-            assert_eq!(data.column("x").unwrap().null_count(), 1);
-        }
-    }
-
-    #[test]
-    fn final_terms_normalize_transform_and_interaction_results() {
-        let data = polars::df!(
-            "x" => [Some(0.0), Some(-1.0), Some(1000.0), None],
-            "large" => [Some(f64::MAX), Some(2.0), Some(f64::INFINITY), None],
-            "scale" => [2.0, 3.0, 0.0, 1.0],
-        )
-        .unwrap();
-        for (source, expected) in [
-            ("log(x)", vec![None, None, Some(1000.0_f64.ln()), None]),
-            (
-                "exp(x)",
-                vec![Some(1.0), Some((-1.0_f64).exp()), None, None],
-            ),
-            ("large:scale", vec![None, Some(6.0), None, None]),
-            ("exp(log(x))", vec![Some(0.0), None, Some(1000.0), None]),
-        ] {
-            let fitted = crate::parse_one_expression(source)
-                .unwrap()
-                .materialize(&data)
-                .unwrap();
-            let evaluated = fitted.evaluate(&data).unwrap();
-            for output in [&fitted, &evaluated] {
-                for (actual, expected) in output.frame()[0].f64().unwrap().iter().zip(&expected) {
-                    match (actual, expected) {
-                        (None, None) => {}
-                        (Some(actual), Some(expected)) => assert!(
-                            (actual - expected).abs() <= 1e-12 * expected.abs().max(1.0),
-                            "{source}: actual {actual}, expected {expected}",
-                        ),
-                        values => panic!("{source}: {values:?}"),
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn normalization_preserves_f32_buffers_and_existing_nulls() {
-        let mut input = Series::new("x".into(), [Some(9.0_f32), Some(1.0), None]);
-        let tail = Series::new(
-            "x".into(),
-            [
-                Some(f32::NAN),
-                Some(f32::INFINITY),
-                Some(f32::NEG_INFINITY),
-                Some(2.0),
-            ],
-        );
-        input.append(&tail).unwrap();
-        for input in [input.clone(), input.rechunk(), input.slice(1, 5)] {
-            let output = normalize_nonfinite(input.clone()).unwrap();
-            assert_eq!(output.name(), input.name());
-            assert_eq!(output.dtype(), input.dtype());
-            assert_eq!(output.len(), input.len());
-            assert_eq!(output.n_chunks(), input.n_chunks());
-            for (original, normalized) in input
-                .f32()
-                .unwrap()
-                .downcast_iter()
-                .zip(output.f32().unwrap().downcast_iter())
-            {
-                assert_eq!(original.values().as_ptr(), normalized.values().as_ptr());
-            }
-            assert_eq!(output.null_count(), 4);
-            assert_eq!(input.null_count(), 1);
-        }
-        for (values, null_count) in [
-            (vec![], 0),
-            (vec![None, None], 2),
-            (vec![Some(1.0_f32), None], 1),
-            (vec![Some(f32::NAN)], 1),
-            (vec![Some(f32::INFINITY)], 1),
-        ] {
-            let input = Series::new("x".into(), values);
-            let output = normalize_nonfinite(input.clone()).unwrap();
-            assert_eq!(output.len(), input.len());
-            assert_eq!(output.null_count(), null_count);
-        }
-    }
-
-    #[test]
-    fn normalization_preserves_f64_buffers_and_existing_nulls() {
-        let mut input = Series::new("x".into(), [Some(9.0_f64), Some(1.0), None]);
-        let tail = Series::new(
-            "x".into(),
-            [
-                Some(f64::NAN),
-                Some(f64::INFINITY),
-                Some(f64::NEG_INFINITY),
-                Some(2.0),
-            ],
-        );
-        input.append(&tail).unwrap();
-        for input in [input.clone(), input.rechunk(), input.slice(1, 5)] {
-            let output = normalize_nonfinite(input.clone()).unwrap();
-            assert_eq!(output.name(), input.name());
-            assert_eq!(output.dtype(), input.dtype());
-            assert_eq!(output.len(), input.len());
-            assert_eq!(output.n_chunks(), input.n_chunks());
-            for (original, normalized) in input
-                .f64()
-                .unwrap()
-                .downcast_iter()
-                .zip(output.f64().unwrap().downcast_iter())
-            {
-                assert_eq!(original.values().as_ptr(), normalized.values().as_ptr());
-            }
-            assert_eq!(output.null_count(), 4);
-            assert_eq!(input.null_count(), 1);
-        }
-        for (values, null_count) in [
-            (vec![], 0),
-            (vec![None, None], 2),
-            (vec![Some(1.0_f64), None], 1),
-            (vec![Some(f64::NAN)], 1),
-            (vec![Some(f64::INFINITY)], 1),
-        ] {
-            let input = Series::new("x".into(), values);
-            let output = normalize_nonfinite(input.clone()).unwrap();
-            assert_eq!(output.len(), input.len());
-            assert_eq!(output.null_count(), null_count);
-        }
-    }
 
     #[test]
     fn bare_nonnumeric_columns_are_rejected_before_interaction_casting() {
