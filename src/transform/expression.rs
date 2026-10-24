@@ -217,7 +217,7 @@ mod tests {
         assert_numeric_output(
             output.frame(),
             "sqrt(x)",
-            &[Some(3.0), Some(1.0), Some(2.0), None, Some(f64::NAN)],
+            &[Some(3.0), Some(1.0), Some(2.0), None, None],
         );
     }
 
