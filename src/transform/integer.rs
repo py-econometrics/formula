@@ -9,7 +9,7 @@ use polars::prelude::{
 pub(crate) struct IntegerEncodingDefinition;
 
 #[derive(Debug)]
-pub(crate) struct IntegerEncodingFit {
+pub(crate) struct IntegerEncodingState {
     names: Vec<PlSmallStr>,
     mapping: DataFrame,
 }
@@ -19,7 +19,7 @@ impl IntegerEncodingDefinition {
 }
 
 impl TransformDefinition for IntegerEncodingDefinition {
-    type Fit = IntegerEncodingFit;
+    type State = IntegerEncodingState;
 
     fn expands(&self) -> bool {
         false
@@ -29,7 +29,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
         ArgumentCount::AtLeast(1)
     }
 
-    fn fit(&self, inputs: &[Series]) -> Result<Self::Fit, TransformError> {
+    fn fit(&self, inputs: &[Series]) -> Result<Self::State, TransformError> {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -37,13 +37,13 @@ impl TransformDefinition for IntegerEncodingDefinition {
             .with_row_index(Self::CODE_COLUMN, None)
             .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
             .collect()?;
-        Ok(IntegerEncodingFit {
+        Ok(IntegerEncodingState {
             names: inputs.iter().map(|input| input.name().clone()).collect(),
             mapping,
         })
     }
 
-    fn transform(&self, fit: &Self::Fit, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    fn transform(&self, fit: &Self::State, inputs: &[Series]) -> Result<DataFrame, TransformError> {
         let mapping = &fit.mapping;
         if !inputs.iter().map(|input| input.name()).eq(fit.names.iter()) {
             return Err(TransformError::InvalidParameter(

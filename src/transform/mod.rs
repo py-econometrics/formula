@@ -26,15 +26,19 @@ pub enum Transform {
 
 pub(crate) trait TransformDefinition {
     /// Data learned during fitting.
-    type Fit;
+    type State;
 
     fn expands(&self) -> bool;
 
     fn argument_count(&self) -> ArgumentCount;
 
-    fn fit(&self, inputs: &[Series]) -> Result<Self::Fit, TransformError>;
+    fn fit(&self, inputs: &[Series]) -> Result<Self::State, TransformError>;
 
-    fn transform(&self, fit: &Self::Fit, inputs: &[Series]) -> Result<DataFrame, TransformError>;
+    fn transform(
+        &self,
+        state: &Self::State,
+        inputs: &[Series],
+    ) -> Result<DataFrame, TransformError>;
 }
 
 pub(crate) enum Fit<D: TransformDefinition> {
@@ -45,30 +49,30 @@ pub(crate) enum Fit<D: TransformDefinition> {
 /// A transform definition and its fitted state.
 pub(crate) struct Fitted<D: TransformDefinition> {
     definition: D,
-    fit: D::Fit,
+    state: D::State,
 }
 
 impl<D: TransformDefinition> Fitted<D> {
     pub(crate) fn new(definition: D, inputs: &[Series]) -> Result<Self, TransformError> {
-        let fit = definition.fit(inputs)?;
-        Ok(Self { definition, fit })
+        let state = definition.fit(inputs)?;
+        Ok(Self { definition, state })
     }
 
     pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        self.definition.transform(&self.fit, inputs)
+        self.definition.transform(&self.state, inputs)
     }
 }
 
 impl<D> fmt::Debug for Fitted<D>
 where
     D: TransformDefinition + fmt::Debug,
-    D::Fit: fmt::Debug,
+    D::State: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Fitted")
             .field("definition", &self.definition)
-            .field("fit", &self.fit)
+            .field("fit", &self.state)
             .finish()
     }
 }
@@ -85,7 +89,7 @@ impl<D: TransformDefinition> Fit<D> {
 impl<D> fmt::Debug for Fit<D>
 where
     D: TransformDefinition + fmt::Debug,
-    D::Fit: fmt::Debug,
+    D::State: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
