@@ -129,6 +129,7 @@ pub enum TransformError {
     InputTypeMismatch,
     InvalidParameter(String),
     Polars(PolarsError),
+    DtypeMismatch(String),
 }
 
 impl From<PolarsError> for TransformError {
