@@ -99,9 +99,13 @@ impl TransformDefinition for CategoricalDefinition {
         Ok(CategoricalState { levels })
     }
 
-    fn transform(&self, fit: &Self::State, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    fn transform(
+        &self,
+        state: &Self::State,
+        inputs: &[Series],
+    ) -> Result<DataFrame, TransformError> {
         let input = validate_single_input(inputs)?;
-        let levels = &fit.levels;
+        let levels = &state.levels;
         if input.dtype() != levels.dtype() {
             return Err(TransformError::InputTypeMismatch);
         }

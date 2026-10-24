@@ -43,9 +43,17 @@ impl TransformDefinition for IntegerEncodingDefinition {
         })
     }
 
-    fn transform(&self, fit: &Self::State, inputs: &[Series]) -> Result<DataFrame, TransformError> {
-        let mapping = &fit.mapping;
-        if !inputs.iter().map(|input| input.name()).eq(fit.names.iter()) {
+    fn transform(
+        &self,
+        state: &Self::State,
+        inputs: &[Series],
+    ) -> Result<DataFrame, TransformError> {
+        let mapping = &state.mapping;
+        if !inputs
+            .iter()
+            .map(|input| input.name())
+            .eq(state.names.iter())
+        {
             return Err(TransformError::InvalidParameter(
                 "input column names differ from the fitted encoding".into(),
             ));
@@ -63,7 +71,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
             .map(|column| col(column.name().clone()))
             .collect::<Vec<_>>();
 
-        let output_name = call_name("F", fit.names.iter().map(|name| name.as_str()));
+        let output_name = call_name("F", state.names.iter().map(|name| name.as_str()));
 
         Ok(input_frame
             .lazy()
