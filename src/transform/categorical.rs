@@ -73,7 +73,7 @@ impl CategoricalDefinition {
 }
 
 impl TransformDefinition for CategoricalDefinition {
-    type Fit = CategoricalFit;
+    type State = CategoricalState;
 
     fn expands(&self) -> bool {
         true
@@ -83,7 +83,7 @@ impl TransformDefinition for CategoricalDefinition {
         ArgumentCount::Exactly(1)
     }
 
-    fn fit(&self, inputs: &[Series]) -> Result<Self::Fit, TransformError> {
+    fn fit(&self, inputs: &[Series]) -> Result<Self::State, TransformError> {
         let levels = validate_single_input(inputs)?
             .drop_nulls()
             .unique_stable()?;
@@ -96,10 +96,10 @@ impl TransformDefinition for CategoricalDefinition {
                 "`reference` value is not among the fitted levels".into(),
             ));
         }
-        Ok(CategoricalFit { levels })
+        Ok(CategoricalState { levels })
     }
 
-    fn transform(&self, fit: &Self::Fit, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    fn transform(&self, fit: &Self::State, inputs: &[Series]) -> Result<DataFrame, TransformError> {
         let input = validate_single_input(inputs)?;
         let levels = &fit.levels;
         if input.dtype() != levels.dtype() {
@@ -146,14 +146,15 @@ impl TransformDefinition for CategoricalDefinition {
 }
 
 #[derive(Debug)]
-pub(crate) struct CategoricalFit {
+pub(crate) struct CategoricalState {
     levels: Series,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{Fit, Fitted, Transform};
+    use crate::fit::{Fit, Fitted};
+    use crate::transform::Transform;
     use polars::prelude::NamedFrom;
 
     #[test]
@@ -197,7 +198,7 @@ mod tests {
         };
         assert_output(
             &categorical.definition,
-            &categorical.fit,
+            &categorical.state,
             &input,
             &output,
             &[&[Some(false), Some(true)]],
@@ -207,7 +208,7 @@ mod tests {
 
     fn assert_output(
         definition: &CategoricalDefinition,
-        transform: &CategoricalFit,
+        transform: &CategoricalState,
         input: &[Series],
         actual: &DataFrame,
         expected: &[&[Option<bool>]],
@@ -300,7 +301,7 @@ mod tests {
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
         let training = [Series::new("group".into(), ["a", "b"])];
         let invalid = [Series::new("group".into(), ["b", "c"])];
-        let transform = Fit::Fitted(Fitted::new(definition.clone(), &training)?);
+        let transform = Fit::Fitted(Fitted::fit(definition.clone(), &training)?);
         let original = transform.transform(&training)?;
 
         assert!(matches!(
@@ -520,7 +521,7 @@ mod tests {
         let second = [Series::new("group".into(), ["b", "c"])];
         let input = [Series::new("group".into(), ["a", "b", "c"])];
         let definition = CategoricalDefinition::new(None);
-        let original = Fit::Fitted(Fitted::new(definition, &first)?);
+        let original = Fit::Fitted(Fitted::fit(definition, &first)?);
         let original_output = original.transform(&input)?;
         let transform = original.fit(&second)?;
         assert!(original.transform(&input)?.equals_missing(&original_output));
@@ -531,7 +532,7 @@ mod tests {
 
         assert_output(
             &transform.definition,
-            &transform.fit,
+            &transform.state,
             &input,
             &transform.transform(&input)?,
             &[

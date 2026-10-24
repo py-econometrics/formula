@@ -9,7 +9,7 @@ use polars::prelude::{
 pub(crate) struct IntegerEncodingDefinition;
 
 #[derive(Debug)]
-pub(crate) struct IntegerEncodingFit {
+pub(crate) struct IntegerEncodingState {
     names: Vec<PlSmallStr>,
     mapping: DataFrame,
 }
@@ -19,7 +19,7 @@ impl IntegerEncodingDefinition {
 }
 
 impl TransformDefinition for IntegerEncodingDefinition {
-    type Fit = IntegerEncodingFit;
+    type State = IntegerEncodingState;
 
     fn expands(&self) -> bool {
         false
@@ -29,7 +29,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
         ArgumentCount::AtLeast(1)
     }
 
-    fn fit(&self, inputs: &[Series]) -> Result<Self::Fit, TransformError> {
+    fn fit(&self, inputs: &[Series]) -> Result<Self::State, TransformError> {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -37,13 +37,13 @@ impl TransformDefinition for IntegerEncodingDefinition {
             .with_row_index(Self::CODE_COLUMN, None)
             .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
             .collect()?;
-        Ok(IntegerEncodingFit {
+        Ok(IntegerEncodingState {
             names: inputs.iter().map(|input| input.name().clone()).collect(),
             mapping,
         })
     }
 
-    fn transform(&self, fit: &Self::Fit, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    fn transform(&self, fit: &Self::State, inputs: &[Series]) -> Result<DataFrame, TransformError> {
         let mapping = &fit.mapping;
         if !inputs.iter().map(|input| input.name()).eq(fit.names.iter()) {
             return Err(TransformError::InvalidParameter(
@@ -83,7 +83,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
 mod tests {
     use super::super::input::argument_column_name;
     use super::*;
-    use crate::transform::{Fit, Fitted};
+    use crate::fit::{Fit, Fitted};
     use polars::error::PolarsError;
     use polars::prelude::NamedFrom;
 
@@ -320,7 +320,7 @@ mod tests {
         let first = [Series::new("f1".into(), ["a", "b"])];
         let second = [Series::new("other".into(), ["c", "a"])];
         let input = [Series::new("other".into(), ["b", "c", "a"])];
-        let transform = Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &first)?);
+        let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &first)?);
         let transform = transform.fit(&second)?;
 
         assert_integer_output(&transform.transform(&input)?, &[None, Some(0), Some(1)]);
@@ -335,7 +335,7 @@ mod tests {
     fn integer_encoding_rejects_invalid_fit_inputs_without_replacing_state()
     -> Result<(), TransformError> {
         let training = [Series::new("f1".into(), ["a", "b"])];
-        let transform = Fit::Fitted(Fitted::new(IntegerEncodingDefinition, &training)?);
+        let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &training)?);
         let original = transform.transform(&training)?;
         assert!(matches!(
             transform.fit(&[]),

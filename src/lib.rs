@@ -1,3 +1,4 @@
+mod fit;
 mod formula;
 mod model;
 mod parse;
