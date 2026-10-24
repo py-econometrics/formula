@@ -1,4 +1,4 @@
-use crate::fit::Fit;
+use crate::fit::{Fit, Fitted};
 use crate::model::{MaterializationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError};
 use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
@@ -424,14 +424,19 @@ fn fit_and_evaluate_factors(
 
     for factor in scheduled {
         let result = match factor.as_ref() {
-            Factor::Variable(variable) => EvaluatedFactor {
-                factor: Arc::clone(factor),
-                columns: vec![
-                    data.column(&variable.definition().name)?
-                        .as_materialized_series()
-                        .clone(),
-                ],
-            },
+            Factor::Variable(variable) => {
+                let definition = variable.definition();
+                let column = data.column(&definition.name)?.as_materialized_series();
+                let state = VariableState {
+                    dtype: column.dtype().clone(),
+                };
+                let fitted = Fitted::new(definition.clone(), state);
+
+                EvaluatedFactor {
+                    factor: Arc::new(Factor::Variable(Fit::Fitted(fitted))),
+                    columns: vec![column.clone()],
+                }
+            }
             Factor::Call {
                 transform,
                 arguments,
@@ -475,11 +480,24 @@ fn evaluate_factors(
     for factor in scheduled {
         let columns = match factor.as_ref() {
             Factor::Variable(variable) => {
-                vec![
-                    data.column(&variable.definition().name)?
-                        .as_materialized_series()
-                        .clone(),
-                ]
+                let Fit::Fitted(fitted) = variable else {
+                    return Err(TransformError::NotFitted);
+                };
+
+                let column = data
+                    .column(&fitted.definition.name)?
+                    .as_materialized_series();
+
+                if column.dtype() != &fitted.state.dtype {
+                    return Err(TransformError::DtypeMismatch(format!(
+                        "column `{}`: expected {}, received {}",
+                        fitted.definition.name,
+                        fitted.state.dtype,
+                        column.dtype(),
+                    )));
+                }
+
+                vec![column.clone()]
             }
             Factor::Call {
                 transform,
