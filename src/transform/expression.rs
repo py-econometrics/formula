@@ -1,14 +1,7 @@
-use super::input::input_frame;
+use super::input::{input_frame, validate_numeric_input};
 use super::{ArgumentCount, TransformError, call_name};
 use polars::error::PolarsError;
 use polars::prelude::{DataFrame, DataType, Expr, IntoLazy, PlSmallStr, Series, col, lit};
-
-fn validate_numeric_input(input: &Series) -> Result<(), TransformError> {
-    if !input.dtype().is_primitive_numeric() {
-        return Err(TransformError::InputTypeMismatch);
-    }
-    Ok(())
-}
 
 type ExpressionBuilder = fn(&[Expr]) -> Result<Expr, TransformError>;
 
@@ -393,7 +386,7 @@ mod tests {
                 let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
-                    Err(TransformError::InputTypeMismatch)
+                    Err(TransformError::NonNumericInput(_))
                 ));
             }
         }
