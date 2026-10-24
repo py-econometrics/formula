@@ -1,3 +1,4 @@
+use crate::fit::Fit;
 use crate::model::{MaterializationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError};
 use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
@@ -17,9 +18,19 @@ fn collect_unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
     unique
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VariableDefinition {
+    name: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct VariableState {
+    dtype: DataType,
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Factor {
-    Variable(String),
+    Variable(Fit<VariableDefinition, VariableState>),
     Call {
         transform: Transform,
         arguments: Vec<Arc<Factor>>,
@@ -28,7 +39,9 @@ pub(crate) enum Factor {
 
 impl From<&str> for Factor {
     fn from(value: &str) -> Self {
-        Self::Variable(value.to_owned())
+        Self::Variable(Fit::Unfitted(VariableDefinition {
+            name: value.to_owned(),
+        }))
     }
 }
 
@@ -411,9 +424,13 @@ fn fit_and_evaluate_factors(
 
     for factor in scheduled {
         let result = match factor.as_ref() {
-            Factor::Variable(name) => EvaluatedFactor {
+            Factor::Variable(variable) => EvaluatedFactor {
                 factor: Arc::clone(factor),
-                columns: vec![data.column(name)?.as_materialized_series().clone()],
+                columns: vec![
+                    data.column(&variable.definition().name)?
+                        .as_materialized_series()
+                        .clone(),
+                ],
             },
             Factor::Call {
                 transform,
@@ -457,8 +474,12 @@ fn evaluate_factors(
 
     for factor in scheduled {
         let columns = match factor.as_ref() {
-            Factor::Variable(name) => {
-                vec![data.column(name)?.as_materialized_series().clone()]
+            Factor::Variable(variable) => {
+                vec![
+                    data.column(&variable.definition().name)?
+                        .as_materialized_series()
+                        .clone(),
+                ]
             }
             Factor::Call {
                 transform,
@@ -1295,7 +1316,7 @@ mod tests {
     fn assert_requires_one_argument(make_transform: impl Fn() -> Transform) {
         for count in [0, 1, 2, 3] {
             let arguments = (0..count)
-                .map(|index| Arc::new(Factor::Variable(format!("x{index}"))))
+                .map(|index| Arc::new(Factor::from(format!("x{index}").as_str())))
                 .collect();
 
             let factor = Factor::Call {
