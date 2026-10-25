@@ -6,14 +6,14 @@ use crate::transform::{
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use winnow::Parser;
-use winnow::Result;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    alt, delimited, eof, expression, peek, preceded, repeat, separated, separated_pair, terminated,
+    alt, cut_err, delimited, eof, expression, fail, peek, preceded, repeat, separated, terminated,
 };
+use winnow::error::{StrContext, StrContextValue};
 use winnow::token::{one_of, take_while};
+use winnow::{ModalResult, Parser};
 
 #[derive(Debug)]
 struct TransformCall {
@@ -77,30 +77,57 @@ fn is_argument_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, ',' | ')')
 }
 
-fn parse_bare_token<'i>(cursor: &mut &'i str) -> Result<&'i str> {
+fn parse_bare_token<'i>(cursor: &mut &'i str) -> ModalResult<&'i str> {
     take_while(1.., |c: char| !is_argument_boundary(c)).parse_next(cursor)
 }
 
-fn parse_scalar(cursor: &mut &str) -> Result<Scalar> {
+fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
     terminated(
         alt((
             parse_literal_string,
             Caseless("true").value(Scalar::from(true)),
             Caseless("false").value(Scalar::from(false)),
             parse_literal_number,
+            fail.context(StrContext::Expected(StrContextValue::Description(
+                "a scalar value",
+            ))),
         )),
         parse_argument_boundary,
     )
     .parse_next(cursor)
 }
 
-fn parse_literal_string(cursor: &mut &str) -> Result<Scalar> {
-    delimited('\'', take_while(0.., |c: char| c != '\''), '\'')
-        .map(|text: &str| Scalar::from(PlSmallStr::from(text)))
-        .parse_next(cursor)
+fn parse_literal_string(cursor: &mut &str) -> ModalResult<Scalar> {
+    preceded(
+        '\'',
+        cut_err(terminated(
+            take_while(0.., |c: char| c != '\''),
+            '\''.context(StrContext::Expected(StrContextValue::Description(
+                "a closing single quote",
+            ))),
+        )),
+    )
+    .map(|text: &str| Scalar::from(PlSmallStr::from(text)))
+    .parse_next(cursor)
 }
 
-fn parse_intercept(cursor: &mut &str) -> Result<Expression> {
+fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
+    preceded(
+        '`',
+        cut_err(terminated(
+            repeat(
+                0..,
+                alt(("``".value("`"), take_while(1.., |c: char| c != '`'))),
+            ),
+            '`'.context(StrContext::Expected(StrContextValue::Description(
+                "a closing backtick",
+            ))),
+        )),
+    )
+    .parse_next(cursor)
+}
+
+fn parse_intercept(cursor: &mut &str) -> ModalResult<Expression> {
     take_while(1.., is_identifier_character)
         .verify(|name: &str| name == "1")
         .value(Expression::from(Term::intercept()))
@@ -108,7 +135,7 @@ fn parse_intercept(cursor: &mut &str) -> Result<Expression> {
 }
 
 // Support a leading suppressed intercept, e.g., `y ~ -1 + x`
-fn parse_suppressed_intercept(cursor: &mut &str) -> Result<Expression> {
+fn parse_suppressed_intercept(cursor: &mut &str) -> ModalResult<Expression> {
     preceded(('-', multispace0), parse_intercept)
         .map(|intercept| Expression::from_iter([]).subtract(intercept))
         .parse_next(cursor)
@@ -118,7 +145,7 @@ fn has_float_marker(token: &str) -> bool {
     token.contains('.') || token.contains('e') || token.contains('E')
 }
 
-fn parse_literal_number(cursor: &mut &str) -> Result<Scalar> {
+fn parse_literal_number(cursor: &mut &str) -> ModalResult<Scalar> {
     alt((
         parse_bare_token
             .verify(|token: &str| !has_float_marker(token))
@@ -132,15 +159,15 @@ fn parse_literal_number(cursor: &mut &str) -> Result<Scalar> {
     .parse_next(cursor)
 }
 
-fn parse_argument_boundary(cursor: &mut &str) -> Result<()> {
+fn parse_argument_boundary(cursor: &mut &str) -> ModalResult<()> {
     peek(alt((one_of(is_argument_boundary).void(), eof.void()))).parse_next(cursor)
 }
 
-fn parse_factor(cursor: &mut &str) -> Result<Factor> {
-    alt((parse_transform, parse_column)).parse_next(cursor)
+fn parse_factor(cursor: &mut &str) -> ModalResult<Factor> {
+    alt((parse_transform_call, parse_column)).parse_next(cursor)
 }
 
-fn parse_column(cursor: &mut &str) -> Result<Factor> {
+fn parse_column(cursor: &mut &str) -> ModalResult<Factor> {
     alt((
         parse_quoted,
         take_while(1.., is_identifier_character).map(str::to_owned),
@@ -149,56 +176,57 @@ fn parse_column(cursor: &mut &str) -> Result<Factor> {
     .parse_next(cursor)
 }
 
-fn parse_quoted(cursor: &mut &str) -> Result<String> {
-    delimited(
-        '`',
-        repeat(
-            0.., // Allow the empty string as a column name
-            // Allow backtick-escaped backticks
-            alt(("``".value("`"), take_while(1.., |c: char| c != '`'))),
-        ),
-        '`',
+fn parse_transform_call(cursor: &mut &str) -> ModalResult<Factor> {
+    let name = terminated(take_while(1.., is_identifier_character), '(').parse_next(cursor)?;
+
+    cut_err(
+        parse_transform_arguments
+            .map(|arguments| TransformCall {
+                name: name.to_owned(),
+                arguments,
+            })
+            .try_map(Factor::try_from),
     )
     .parse_next(cursor)
 }
 
-fn parse_transform(cursor: &mut &str) -> Result<Factor> {
-    parse_transform_call
-        .try_map(Factor::try_from)
-        .parse_next(cursor)
-}
+fn parse_transform_arguments(cursor: &mut &str) -> ModalResult<Vec<TransformCallArgument>> {
+    multispace0.parse_next(cursor)?;
 
-fn parse_transform_call(cursor: &mut &str) -> Result<TransformCall> {
-    (
-        take_while(1.., is_identifier_character),
-        delimited(
-            ('(', multispace0),
-            separated(
-                0..,
-                parse_transform_call_arguments,
-                (multispace0, ',', multispace0),
-            ),
-            (multispace0, ')'),
-        ),
+    if cursor.starts_with(')') {
+        ')'.parse_next(cursor)?;
+        return Ok(Vec::new());
+    }
+
+    let arguments = separated(
+        1..,
+        cut_err(parse_transform_argument),
+        (multispace0, ',', multispace0),
     )
-        .map(
-            |(name, arguments): (&str, Vec<TransformCallArgument>)| TransformCall {
-                name: name.to_owned(),
-                arguments,
-            },
-        )
-        .parse_next(cursor)
+    .parse_next(cursor)?;
+
+    multispace0.parse_next(cursor)?;
+
+    ')'.context(StrContext::Expected(StrContextValue::Description(
+        "',' or ')' after an argument",
+    )))
+    .parse_next(cursor)?;
+
+    Ok(arguments)
 }
 
-fn parse_transform_call_arguments(cursor: &mut &str) -> Result<TransformCallArgument> {
+fn parse_transform_argument(cursor: &mut &str) -> ModalResult<TransformCallArgument> {
     alt((
-        parse_transform_call_keyword_arguments,
-        parse_positional_argument.map(TransformCallArgument::Positional),
+        parse_transform_argument_keyword,
+        parse_transform_argument_positional.map(TransformCallArgument::Positional),
+        fail.context(StrContext::Expected(StrContextValue::Description(
+            "a transform argument",
+        ))),
     ))
     .parse_next(cursor)
 }
 
-fn parse_positional_argument(cursor: &mut &str) -> Result<Factor> {
+fn parse_transform_argument_positional(cursor: &mut &str) -> ModalResult<Factor> {
     alt((
         terminated(parse_literal_number, parse_argument_boundary).map(Factor::Literal),
         parse_factor,
@@ -206,19 +234,20 @@ fn parse_positional_argument(cursor: &mut &str) -> Result<Factor> {
     .parse_next(cursor)
 }
 
-fn parse_transform_call_keyword_arguments(cursor: &mut &str) -> Result<TransformCallArgument> {
-    separated_pair(
+fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformCallArgument> {
+    let name = terminated(
         take_while(1.., is_identifier_character),
         (multispace0, '=', multispace0),
-        parse_scalar,
     )
-    .map(
-        |(name, value): (&str, Scalar)| TransformCallArgument::Keyword {
-            name: name.to_owned(),
-            value,
-        },
-    )
-    .parse_next(cursor)
+    .parse_next(cursor)?;
+
+    let value =
+        cut_err(parse_scalar.context(StrContext::Label("keyword value"))).parse_next(cursor)?;
+
+    Ok(TransformCallArgument::Keyword {
+        name: name.to_owned(),
+        value,
+    })
 }
 
 fn combine_expressions(
@@ -235,7 +264,7 @@ fn combine_expressions(
     expressions
 }
 
-fn parse_expression_inner(cursor: &mut &str) -> Result<Vec<Expression>> {
+pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
     expression(parse_operand)
         .infix(alt((
             '+'.value(Left(
@@ -282,13 +311,24 @@ fn parse_expression_inner(cursor: &mut &str) -> Result<Vec<Expression>> {
         .parse_next(cursor)
 }
 
-fn parse_stepwise_arguments(cursor: &mut &str) -> Result<Vec<Vec<Expression>>> {
-    delimited(
-        '(',
-        separated(1.., parse_expression_inner, (multispace0, ',', multispace0)),
-        (multispace0, ')'),
+fn parse_stepwise_arguments(cursor: &mut &str) -> ModalResult<Vec<Vec<Expression>>> {
+    multispace0.parse_next(cursor)?;
+
+    let arguments = separated(
+        1..,
+        cut_err(parse_expression),
+        (multispace0, ',', multispace0),
     )
-    .parse_next(cursor)
+    .parse_next(cursor)?;
+
+    multispace0.parse_next(cursor)?;
+
+    ')'.context(StrContext::Expected(StrContextValue::Description(
+        "',' or ')' after an expression",
+    )))
+    .parse_next(cursor)?;
+
+    Ok(arguments)
 }
 
 fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
@@ -311,15 +351,19 @@ enum Stepwise {
     Csw0,
 }
 
-fn parse_stepwise(cursor: &mut &str) -> Result<Vec<Expression>> {
-    let operator = alt((
-        "sw0".value(Stepwise::Sw0),
-        "sw".value(Stepwise::Sw),
-        "csw0".value(Stepwise::Csw0),
-        "csw".value(Stepwise::Csw),
-    ))
+fn parse_stepwise(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
+    let operator = terminated(
+        alt((
+            "sw0".value(Stepwise::Sw0),
+            "sw".value(Stepwise::Sw),
+            "csw0".value(Stepwise::Csw0),
+            "csw".value(Stepwise::Csw),
+        )),
+        '(',
+    )
     .parse_next(cursor)?;
-    let arguments = parse_stepwise_arguments.parse_next(cursor)?;
+
+    let arguments = cut_err(parse_stepwise_arguments).parse_next(cursor)?;
 
     let mut expressions = match operator {
         Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
@@ -333,11 +377,26 @@ fn parse_stepwise(cursor: &mut &str) -> Result<Vec<Expression>> {
     Ok(expressions)
 }
 
-fn parse_operand(cursor: &mut &str) -> Result<Vec<Expression>> {
+fn parse_expression_parenthesized(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
+    '('.parse_next(cursor)?;
+
+    let expressions = cut_err(parse_expression).parse_next(cursor)?;
+
+    cut_err(
+        ')'.context(StrContext::Expected(StrContextValue::Description(
+            "')' to close the parenthesized expression",
+        ))),
+    )
+    .parse_next(cursor)?;
+
+    Ok(expressions)
+}
+
+fn parse_operand(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
     delimited(
         multispace0,
         alt((
-            delimited('(', parse_expression_inner, ')'),
+            parse_expression_parenthesized,
             parse_stepwise,
             alt((
                 parse_suppressed_intercept,
@@ -345,38 +404,55 @@ fn parse_operand(cursor: &mut &str) -> Result<Vec<Expression>> {
                 parse_factor.map(Term::from).map(Expression::from),
             ))
             .map(|expression| vec![expression]),
+            cut_err(
+                fail.context(StrContext::Expected(StrContextValue::Description(
+                    "an expression",
+                ))),
+            ),
         )),
         multispace0,
     )
     .parse_next(cursor)
 }
 
-fn parse_formula(cursor: &mut &str) -> Result<Vec<Formula>> {
-    separated_pair(parse_expression_inner, '~', parse_expression_inner)
-        .map(|(dependent, independent)| {
-            let dependent = dependent
-                .into_iter()
-                // The left-hand side of a formula doesn't attract an intercept by default
-                .map(|expression| expression.resolve_intercept(false))
-                .collect::<Vec<_>>();
-            let independent = independent
-                .into_iter()
-                // The right-hand side of a formula attracts an intercept by default
-                .map(|expression| expression.resolve_intercept(true))
-                .collect::<Vec<_>>();
+fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
+    multispace0.parse_next(cursor)?;
 
-            let mut formulas: Vec<Formula> = Vec::new();
-            for dependent in &dependent {
-                for independent in &independent {
-                    formulas.push(Formula {
-                        left: dependent.clone(),
-                        right: independent.clone(),
-                    });
-                }
-            }
-            formulas
-        })
-        .parse_next(cursor)
+    let left = parse_expression
+        .context(StrContext::Label("left-hand expression"))
+        .parse_next(cursor)?;
+
+    '~'.context(StrContext::Expected(StrContextValue::CharLiteral('~')))
+        .parse_next(cursor)?;
+
+    multispace0.parse_next(cursor)?;
+
+    let right = cut_err(parse_expression.context(StrContext::Label("right-hand expression")))
+        .parse_next(cursor)?;
+
+    let left = left
+        .into_iter()
+        // By default no intercept on the left-hand expression of a formula
+        .map(|expression| expression.resolve_intercept(false))
+        .collect::<Vec<_>>();
+
+    let right = right
+        .into_iter()
+        // By default add intercept on the right-hand expression of a formula
+        .map(|expression| expression.resolve_intercept(true))
+        .collect::<Vec<_>>();
+
+    let mut formulas = Vec::new();
+    for left in &left {
+        for right in &right {
+            formulas.push(Formula {
+                left: left.clone(),
+                right: right.clone(),
+            });
+        }
+    }
+
+    Ok(formulas)
 }
 
 pub(crate) type ParseResult<'i, T> =
@@ -390,28 +466,20 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
     let mut formulas: Vec<Formula> = Vec::new();
 
     for source in input {
-        let expanded = terminated(parse_formula, eof).parse(source)?;
+        let expanded = terminated(
+            parse_formula,
+            eof.context(StrContext::Expected(StrContextValue::Description(
+                "a formula operator or end of input",
+            ))),
+        )
+        .parse(source)?;
+
         for formula in expanded {
             push_unique(&mut formulas, formula);
         }
     }
 
     Ok(Specification::new(formulas))
-}
-
-#[cfg(test)]
-pub(crate) fn parse_expression(source: &str) -> ParseResult<'_, Vec<Expression>> {
-    terminated(parse_expression_inner, eof).parse(source)
-}
-
-#[cfg(test)]
-pub(crate) fn parse_one_expression(source: &str) -> ParseResult<'_, Expression> {
-    parse_expression(source).map(|expressions| {
-        let [expression]: [Expression; 1] = expressions
-            .try_into()
-            .expect("expected exactly one expression");
-        expression
-    })
 }
 
 impl TryFrom<TransformCall> for Factor {
@@ -526,7 +594,7 @@ mod tests {
             ("1.2E-3", Scalar::from(0.0012_f64)),
         ] {
             assert_eq!(
-                parse_positional_argument.parse(source).unwrap(),
+                parse_transform_argument_positional.parse(source).unwrap(),
                 Factor::Literal(value),
                 "{source}"
             );
@@ -557,28 +625,25 @@ mod tests {
     #[test]
     fn positional_numbers_remain_distinct_from_columns_and_intercepts() {
         assert_eq!(
-            parse_positional_argument.parse("`2`").unwrap(),
+            parse_transform_argument_positional.parse("`2`").unwrap(),
             Factor::from("2"),
         );
         assert_eq!(
-            parse_positional_argument.parse("2x").unwrap(),
+            parse_transform_argument_positional.parse("2x").unwrap(),
             Factor::from("2x"),
         );
         assert_ne!(
-            parse_one_expression("mul(x, 2)").unwrap(),
-            parse_one_expression("mul(x, `2`)").unwrap(),
+            parse_expression.parse("mul(x, 2)").unwrap(),
+            parse_expression.parse("mul(x, `2`)").unwrap(),
         );
         assert_eq!(
-            parse_one_expression("1").unwrap(),
-            Expression::from(Term::intercept()),
+            parse_expression.parse("1").unwrap(),
+            vec![Expression::from(Term::intercept())],
         );
         assert_eq!(
-            parse_one_expression("-1").unwrap(),
-            Expression::from_iter([]).subtract(Expression::from(Term::intercept())),
+            parse_expression.parse("-1").unwrap(),
+            vec![Expression::from_iter([]).subtract(Expression::from(Term::intercept()))],
         );
-        for source in ["mul(x, 2.0x)", "mul(x, -)", "mul(x, 1.2.3)"] {
-            assert!(parse_one_expression(source).is_err(), "{source}");
-        }
     }
 
     #[test]
@@ -680,21 +745,13 @@ mod tests {
 
     #[test]
     fn quoted_numbers_are_columns_not_intercepts_or_literals() {
-        let column = parse_one_expression("`1`").unwrap();
-        assert_eq!(column, expression(&[&["1"]]));
-        assert_ne!(column, parse_one_expression("1").unwrap());
+        let column = parse_expression.parse("`1`").unwrap();
+        assert_eq!(column, vec![expression(&[&["1"]])]);
+        assert_ne!(column, parse_expression.parse("1").unwrap());
         assert_ne!(
-            parse_one_expression("log(`1`)").unwrap(),
-            parse_one_expression("log(1)").unwrap(),
+            parse_expression.parse("log(`1`)").unwrap(),
+            parse_expression.parse("log(1)").unwrap(),
         );
-    }
-
-    #[test]
-    fn unterminated_quoted_columns_are_rejected() {
-        for source in ["`", "`income", "`a``", "```", "log(`income)", "x + `income"] {
-            assert!(parse_one_expression(source).is_err(), "{source}");
-        }
-        assert!(parse("y ~ `income").is_err());
     }
 
     #[test]
@@ -714,13 +771,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_many_handles_empty_input_and_later_errors() {
+    fn parse_many_handles_empty_input() {
         let specification = parse_many(std::iter::empty()).unwrap();
         assert!(specification.formulas().is_empty());
-
-        let sources = ["y ~ x", "y ~"];
-        let error = parse_many(sources).unwrap_err();
-        assert_eq!(*error.input(), sources[1]);
     }
 
     #[test]
@@ -744,10 +797,17 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| parse_one_expression(source).unwrap())
+                .map(|source| {
+                    let [expected]: [_; 1] = parse_expression
+                        .parse(source)
+                        .unwrap()
+                        .try_into()
+                        .expect("expected one expression");
+                    expected
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
-                super::parse_expression(source).unwrap(),
+                parse_expression.parse(source).unwrap(),
                 expected,
                 "{source}"
             );
@@ -771,10 +831,17 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| parse_one_expression(source).unwrap())
+                .map(|source| {
+                    let [expected]: [_; 1] = parse_expression
+                        .parse(source)
+                        .unwrap()
+                        .try_into()
+                        .expect("expected one expression");
+                    expected
+                })
                 .collect::<Vec<_>>();
             assert_eq!(
-                super::parse_expression(source).unwrap(),
+                parse_expression.parse(source).unwrap(),
                 expected,
                 "{source}"
             );
@@ -833,32 +900,6 @@ mod tests {
     }
 
     #[test]
-    fn stepwise_calls_reject_malformed_arguments_and_name_spacing() {
-        for name in ["sw", "sw0", "csw", "csw0"] {
-            for arguments in [
-                "()", "( )", "(,x)", "(x,)", "(x,,y)", "(x", "(x))", "(x +)", "(x y)", " (x)",
-            ] {
-                let source = format!("y ~ {name}{arguments}");
-                assert!(super::parse(&source).is_err(), "{source}");
-            }
-        }
-        for source in [
-            "y ~ sw(x, sw())",
-            "y ~ log(sw(x, z))",
-            "y ~ sw(x, reference=1)",
-        ] {
-            assert!(super::parse(source).is_err(), "{source}");
-        }
-        // Names are special only when immediately followed by their argument list.
-        assert_eq!(
-            super::parse("sw ~ csw0 + sw0x").unwrap(),
-            Specification::new(vec![
-                parse("sw ~ csw0 + sw0x").unwrap().formulas()[0].clone()
-            ]),
-        );
-    }
-
-    #[test]
     fn scalars_preserve_types_and_values() {
         let cases = [
             ("'a'", Scalar::from(PlSmallStr::from_static("a"))),
@@ -894,18 +935,6 @@ mod tests {
             let mut cursor = source;
             assert_eq!(parse_scalar.parse_next(&mut cursor).unwrap(), expected);
             assert_eq!(cursor, remainder, "{source}");
-        }
-
-        for source in [
-            "truex",
-            "'a'x",
-            "12abc",
-            "'unterminated",
-            "9223372036854775808",
-            "1 2",
-            "tr ue",
-        ] {
-            assert!(parse_scalar.parse(source).is_err(), "{source}");
         }
     }
 
@@ -963,54 +992,29 @@ mod tests {
             " \n C(\tx,\nreference\t=\t1\n) \t",
         ] {
             assert_eq!(
-                parse_one_expression(source).expect(source),
-                expected,
+                parse_expression.parse(source).expect(source),
+                vec![expected.clone()],
                 "{source}"
             );
         }
-
-        assert!(parse_one_expression("C (x)").is_err());
     }
 
     #[test]
-    fn invalid_transform_calls_are_rejected() {
-        for source in [
-            "unknown(x)",
-            "log(x, reference=1)",
-            "C(reference=1, x)",
-            "C(x, reference=1, reference=2)",
-            "C(x, unknown=1)",
-            "C(x, reference=1 2)",
-            "C(x, reference=tr ue)",
-            "F(x, unknown=1)",
-        ] {
-            assert!(parse_one_expression(source).is_err(), "{source}");
+    fn stepwise_name_prefixes_remain_valid_column_names() {
+        for name in ["sw", "sw_value", "sw0_value", "csw_value", "csw0_value"] {
+            assert_eq!(
+                parse_expression.parse(name).unwrap(),
+                vec![expression(&[&[name]])],
+                "{name}"
+            );
         }
-    }
-
-    #[test]
-    fn duplicate_keywords_identify_the_keyword() {
-        let call = parse_transform_call
-            .parse("C(x, reference='a', reference='b')")
-            .unwrap();
-
-        assert!(matches!(
-            Factor::try_from(call),
-            Err(TransformCallError::DuplicateKeyword { name })
-                if name == "reference"
-        ));
-    }
-
-    #[test]
-    fn positional_arguments_after_keywords_identify_the_position() {
-        let call = parse_transform_call
-            .parse("C(x, reference='a', y)")
-            .unwrap();
-
-        assert!(matches!(
-            Factor::try_from(call),
-            Err(TransformCallError::PositionalAfterKeyword { position: 3 })
-        ));
+        assert_eq!(
+            parse("sw ~ csw0 + sw0x").unwrap(),
+            Specification::new(vec![Formula {
+                left: expression(&[&["sw"]]),
+                right: expression(&[&["csw0"], &["sw0x"]]).resolve_intercept(true),
+            }]),
+        );
     }
 
     #[test]
@@ -1088,8 +1092,8 @@ mod tests {
 
         for (source, expected) in cases {
             assert_eq!(
-                parse_one_expression(source).expect(source),
-                expected,
+                parse_expression.parse(source).expect(source),
+                vec![expected],
                 "{source}"
             );
         }
@@ -1107,9 +1111,14 @@ mod tests {
             ("a/b:c", "a + a:b:c"),
             ("a+b/c", "a + b + b:c"),
         ] {
+            let [expected]: [_; 1] = parse_expression
+                .parse(expanded)
+                .unwrap()
+                .try_into()
+                .expect("expected one expression");
             assert_eq!(
-                parse_one_expression(source).unwrap(),
-                parse_one_expression(expanded).unwrap(),
+                parse_expression.parse(source).unwrap(),
+                vec![expected],
                 "{source}"
             );
         }
@@ -1117,10 +1126,13 @@ mod tests {
 
     #[test]
     fn nesting_with_empty_operands_does_not_add_terms() {
-        assert_eq!(parse_one_expression("(a-a)/b").unwrap(), expression(&[]));
         assert_eq!(
-            parse_one_expression("a/(b-b)").unwrap(),
-            expression(&[&["a"]])
+            parse_expression.parse("(a-a)/b").unwrap(),
+            vec![expression(&[])]
+        );
+        assert_eq!(
+            parse_expression.parse("a/(b-b)").unwrap(),
+            vec![expression(&[&["a"]])]
         );
     }
 
@@ -1148,7 +1160,11 @@ mod tests {
             ("`a/b`/c", expression(&[&["a/b"], &["a/b", "c"]])),
             ("a/`b/c`", expression(&[&["a"], &["a", "b/c"]])),
         ] {
-            assert_eq!(parse_one_expression(source).unwrap(), expected, "{source}");
+            assert_eq!(
+                parse_expression.parse(source).unwrap(),
+                vec![expected],
+                "{source}"
+            );
         }
     }
 
@@ -1168,55 +1184,9 @@ mod tests {
         }
 
         assert_eq!(
-            parse_one_expression("x + z").unwrap(),
-            expression(&[&["x"], &["z"]])
+            parse_expression.parse("x + z").unwrap(),
+            vec![expression(&[&["x"], &["z"]])]
         );
-    }
-
-    #[test]
-    fn formula_parser_rejects_incomplete_or_trailing_input() {
-        for source in [
-            "",
-            " ",
-            "x",
-            "y ~",
-            "~ x",
-            "y ~ x ~ z",
-            "y ~ x C(group)",
-            "y ~ (x + z",
-            "y ~ x)",
-            "y ~ x +",
-            "y ~ x ?",
-            "y ~ a/",
-            "y ~ /a",
-        ] {
-            assert!(parse(source).is_err(), "{source:?}");
-        }
-    }
-
-    #[test]
-    fn expression_parser_rejects_incomplete_or_trailing_input() {
-        for source in [
-            "",
-            " ",
-            "y ~ x",
-            "x C(group)",
-            "(x + z",
-            "x)",
-            "x +",
-            "x ?",
-            "a/",
-            "/a",
-        ] {
-            assert!(parse_one_expression(source).is_err(), "{source:?}");
-        }
-    }
-
-    #[test]
-    fn leading_minus_only_accepts_intercept() {
-        for source in ["y ~ -x + x*z", "y ~ -(x + 1)", "y ~ -1x"] {
-            assert!(parse(source).is_err(), "{source}");
-        }
     }
 
     #[test]
@@ -1257,10 +1227,412 @@ mod tests {
         for (source, factor) in cases {
             let expected = Expression::from(Term::from(factor));
             assert_eq!(
-                parse_one_expression(source).expect(source),
-                expected,
+                parse_expression.parse(source).expect(source),
+                vec![expected],
                 "{source}"
             );
+        }
+    }
+
+    mod errors {
+        use super::*;
+
+        #[test]
+        fn formula_boundaries_report_context_and_offsets() {
+            for (source, expected, offset) in [
+                ("~ x", StrContext::Label("left-hand expression"), 0),
+                (
+                    "y x",
+                    StrContext::Expected(StrContextValue::CharLiteral('~')),
+                    2,
+                ),
+                ("y ~", StrContext::Label("right-hand expression"), 3),
+                ("y ~   ", StrContext::Label("right-hand expression"), 6),
+                (
+                    "y ~ x C(group)",
+                    StrContext::Expected(StrContextValue::Description(
+                        "a formula operator or end of input",
+                    )),
+                    6,
+                ),
+                (
+                    "y ~ x)",
+                    StrContext::Expected(StrContextValue::Description(
+                        "a formula operator or end of input",
+                    )),
+                    5,
+                ),
+            ] {
+                let error = parse(source).unwrap_err();
+                assert_eq!(error.offset(), offset, "{source}");
+                assert!(
+                    error.inner().context().any(|context| context == &expected),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn missing_operands_and_parentheses_report_specific_expectations() {
+            for (source, expected, offset) in [
+                ("y ~ x +", "an expression", 7),
+                ("y ~ ()", "an expression", 5),
+                ("y ~ (x + )", "an expression", 9),
+                ("y ~ (x", "')' to close the parenthesized expression", 6),
+                (
+                    "y ~ (x + z",
+                    "')' to close the parenthesized expression",
+                    10,
+                ),
+                ("y ~ (C(x", "',' or ')' after an argument", 8),
+                ("y ~ sw(C(x", "',' or ')' after an argument", 10),
+            ] {
+                let error = parse(source).unwrap_err();
+                assert_eq!(error.offset(), offset, "{source}");
+                let expectations = error
+                    .inner()
+                    .context()
+                    .filter_map(|context| match context {
+                        StrContext::Expected(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    expectations,
+                    vec![&StrContextValue::Description(expected)],
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn unsupported_keywords_preserve_the_transform_and_keyword_names() {
+            for (source, transform, keyword) in [
+                ("y ~ C(x, unknown=1)", "C", "unknown"),
+                ("y ~ F(x, reference=1)", "F", "reference"),
+                ("y ~ C(log(x, base=2))", "log", "base"),
+            ] {
+                let error = parse(source).unwrap_err();
+                let cause = error
+                    .inner()
+                    .cause()
+                    .and_then(|cause| cause.downcast_ref::<TransformCallError>());
+                assert!(
+                    matches!(
+                        cause,
+                        Some(TransformCallError::UnexpectedKeywords {
+                            transform: actual_transform,
+                            keywords,
+                        }) if *actual_transform == transform && keywords == &[keyword]
+                    ),
+                    "{source}"
+                );
+                assert!(
+                    !error
+                        .inner()
+                        .context()
+                        .any(|context| matches!(context, StrContext::Expected(_))),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_many_preserves_the_failing_source_and_diagnostic() {
+            for failing in ["y ~", "y ~ sw(x,)", "y ~ unknown(x)"] {
+                let sources = ["y ~ x", failing, "y ~ z"];
+                let error = parse_many(sources).unwrap_err();
+                let standalone = parse(failing).unwrap_err();
+
+                assert_eq!(*error.input(), failing);
+                assert_eq!(error.offset(), standalone.offset(), "{failing}");
+                assert_eq!(error.inner(), standalone.inner(), "{failing}");
+            }
+        }
+
+        #[test]
+        fn diagnostics_use_byte_offsets_with_unicode_and_newlines() {
+            let source = "y ~ (\n `収入` + )";
+            let error = parse(source).unwrap_err();
+            let offset = source.find(')').unwrap();
+
+            assert_eq!(error.offset(), offset);
+            assert!(offset > source[..offset].chars().count());
+            assert!(error.inner().context().any(|context| {
+                context == &StrContext::Expected(StrContextValue::Description("an expression"))
+            }));
+        }
+
+        #[test]
+        fn call_syntax_errors_precede_call_construction_errors() {
+            let source = "y ~ unknown(x";
+            let error = parse(source).unwrap_err();
+
+            assert_eq!(error.offset(), source.len());
+            assert!(error.inner().cause().is_none());
+            assert!(error.inner().context().any(|context| {
+                context
+                    == &StrContext::Expected(StrContextValue::Description(
+                        "',' or ')' after an argument",
+                    ))
+            }));
+        }
+
+        #[test]
+        fn unterminated_quoted_columns_are_rejected() {
+            for source in ["`", "`income", "`a``", "```", "log(`income)", "x + `income"] {
+                assert!(parse_expression.parse(source).is_err(), "{source}");
+            }
+            assert!(parse("y ~ `income").is_err());
+        }
+
+        #[test]
+        fn stepwise_calls_reject_malformed_arguments_and_name_spacing() {
+            for name in ["sw", "sw0", "csw", "csw0"] {
+                for arguments in [
+                    "()", "( )", "(,x)", "(x,)", "(x,,y)", "(x", "(x))", "(x +)", "(x y)", " (x)",
+                ] {
+                    let source = format!("y ~ {name}{arguments}");
+                    assert!(super::parse(&source).is_err(), "{source}");
+                }
+            }
+            for source in [
+                "y ~ sw(x, sw())",
+                "y ~ log(sw(x, z))",
+                "y ~ sw(x, reference=1)",
+            ] {
+                assert!(super::parse(source).is_err(), "{source}");
+            }
+        }
+
+        #[test]
+        fn invalid_transform_calls_are_rejected() {
+            for source in [
+                "unknown(x)",
+                "C (x)",
+                "log(x, reference=1)",
+                "C(reference=1, x)",
+                "C(x, reference=1, reference=2)",
+                "C(x, unknown=1)",
+                "C(x, reference=1 2)",
+                "C(x, reference=tr ue)",
+                "F(x, unknown=1)",
+            ] {
+                assert!(parse_expression.parse(source).is_err(), "{source}");
+            }
+        }
+
+        #[test]
+        fn duplicate_keywords_identify_the_keyword() {
+            let error = parse("y ~ C(x, reference='a', reference='b')").unwrap_err();
+            let cause = error
+                .inner()
+                .cause()
+                .and_then(|cause| cause.downcast_ref::<TransformCallError>());
+
+            assert!(matches!(
+                cause,
+                Some(TransformCallError::DuplicateKeyword { name })
+                    if name == "reference"
+            ));
+        }
+
+        #[test]
+        fn positional_arguments_after_keywords_identify_the_position() {
+            let error = parse("y ~ C(x, reference='a', y)").unwrap_err();
+            let cause = error
+                .inner()
+                .cause()
+                .and_then(|cause| cause.downcast_ref::<TransformCallError>());
+
+            assert!(matches!(
+                cause,
+                Some(TransformCallError::PositionalAfterKeyword { position: 3 })
+            ));
+        }
+
+        #[test]
+        fn unknown_transforms_identify_the_name() {
+            for source in [
+                "y ~ unknown(x)",
+                "y ~ C(unknown(x))",
+                "y ~ sw(unknown(x))",
+                "y ~ (unknown(x))",
+            ] {
+                let error = parse(source).unwrap_err();
+                let cause = error
+                    .inner()
+                    .cause()
+                    .and_then(|cause| cause.downcast_ref::<TransformCallError>());
+
+                assert!(
+                    matches!(
+                        cause,
+                        Some(TransformCallError::UnknownTransform(name))
+                            if name == "unknown"
+                    ),
+                    "{source}"
+                );
+                assert!(
+                    !error
+                        .inner()
+                        .context()
+                        .any(|context| matches!(context, StrContext::Expected(_))),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn missing_keyword_value_reports_its_context_and_offset() {
+            let source = "y ~ C(x, reference=)";
+            let error = parse(source).unwrap_err();
+
+            assert_eq!(error.offset(), source.find(')').unwrap());
+            assert!(
+                error
+                    .inner()
+                    .context()
+                    .any(|context| context == &StrContext::Label("keyword value"))
+            );
+            assert!(error.inner().context().any(|context| {
+                context == &StrContext::Expected(StrContextValue::Description("a scalar value"))
+            }));
+        }
+
+        #[test]
+        fn unterminated_quotes_report_the_expected_delimiter() {
+            for (source, expected) in [
+                ("y ~ C(x, reference='a)", "a closing single quote"),
+                ("y ~ `household income", "a closing backtick"),
+                ("y ~ C(`household income)", "a closing backtick"),
+            ] {
+                let error = parse(source).unwrap_err();
+
+                assert_eq!(error.offset(), source.len(), "{source}");
+                assert!(
+                    error.inner().context().any(|context| {
+                        context == &StrContext::Expected(StrContextValue::Description(expected))
+                    }),
+                    "{source}"
+                );
+                for generic in ["a scalar value", "a transform argument"] {
+                    assert!(
+                        !error.inner().context().any(|context| {
+                            context == &StrContext::Expected(StrContextValue::Description(generic))
+                        }),
+                        "{source}: unexpected generic expectation {generic}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn malformed_argument_lists_report_expectations_and_offsets() {
+            for (source, expected, offset) in [
+                ("y ~ C(x,)", "a transform argument", 8),
+                ("y ~ C(x,,y)", "a transform argument", 8),
+                ("y ~ C(x y)", "',' or ')' after an argument", 8),
+                ("y ~ C(x", "',' or ')' after an argument", 7),
+            ] {
+                let error = parse(source).unwrap_err();
+
+                assert_eq!(error.offset(), offset, "{source}");
+                assert!(
+                    error.inner().context().any(|context| {
+                        context == &StrContext::Expected(StrContextValue::Description(expected))
+                    }),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_stepwise_arguments_report_expectations_and_offsets() {
+            for (source, expected, offset) in [
+                ("y ~ sw()", "an expression", 7),
+                ("y ~ sw(x,)", "an expression", 9),
+                ("y ~ sw(x y)", "',' or ')' after an expression", 9),
+                ("y ~ sw(x", "',' or ')' after an expression", 8),
+            ] {
+                let error = parse(source).unwrap_err();
+
+                assert_eq!(error.offset(), offset, "{source}");
+                assert!(
+                    error.inner().context().any(|context| {
+                        context == &StrContext::Expected(StrContextValue::Description(expected))
+                    }),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn formula_parser_rejects_incomplete_or_trailing_input() {
+            for source in [
+                "",
+                " ",
+                "x",
+                "y ~",
+                "~ x",
+                "y ~ x ~ z",
+                "y ~ x C(group)",
+                "y ~ (x + z",
+                "y ~ x)",
+                "y ~ x +",
+                "y ~ x ?",
+                "y ~ a/",
+                "y ~ /a",
+            ] {
+                assert!(parse(source).is_err(), "{source:?}");
+            }
+        }
+
+        #[test]
+        fn expression_parser_rejects_incomplete_or_trailing_input() {
+            for source in [
+                "",
+                " ",
+                "y ~ x",
+                "x C(group)",
+                "(x + z",
+                "x)",
+                "x +",
+                "x ?",
+                "a/",
+                "/a",
+            ] {
+                assert!(parse_expression.parse(source).is_err(), "{source:?}");
+            }
+        }
+
+        #[test]
+        fn leading_minus_only_accepts_intercept() {
+            for source in ["y ~ -x + x*z", "y ~ -(x + 1)", "y ~ -1x"] {
+                assert!(parse(source).is_err(), "{source}");
+            }
+        }
+
+        #[test]
+        fn malformed_numeric_arguments_are_rejected() {
+            for source in ["mul(x, 2.0x)", "mul(x, -)", "mul(x, 1.2.3)"] {
+                assert!(parse_expression.parse(source).is_err(), "{source}");
+            }
+        }
+
+        #[test]
+        fn malformed_scalars_are_rejected() {
+            for source in [
+                "truex",
+                "'a'x",
+                "12abc",
+                "'unterminated",
+                "9223372036854775808",
+                "1 2",
+                "tr ue",
+            ] {
+                assert!(parse_scalar.parse(source).is_err(), "{source}");
+            }
         }
     }
 }

@@ -177,7 +177,9 @@ impl ExpressionTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::parse_expression;
     use crate::transform::Transform;
+    use winnow::Parser;
 
     fn assert_numeric_output(actual: &DataFrame, name: &str, expected: &[Option<f64>]) {
         assert_eq!(actual.shape(), (expected.len(), 1));
@@ -216,10 +218,12 @@ mod tests {
             ("add(x, -2)", [Some(4.0), None, Some(-5.0)]),
             ("mul(add(x, -2), 3)", [Some(12.0), None, Some(-15.0)]),
         ] {
-            let output = crate::parse_one_expression(source)
+            let [expression]: [_; 1] = parse_expression
+                .parse(source)
                 .unwrap()
-                .materialize(&data)
-                .unwrap();
+                .try_into()
+                .expect("expected one expression");
+            let output = expression.materialize(&data).unwrap();
             assert_numeric_output(output.frame(), source, &expected);
         }
     }
@@ -234,7 +238,11 @@ mod tests {
             ("add(2, 3)", 5.0),
             ("mul(add(2, -1), 3)", 3.0),
         ] {
-            let expression = crate::parse_one_expression(source).unwrap();
+            let [expression]: [_; 1] = parse_expression
+                .parse(source)
+                .unwrap()
+                .try_into()
+                .expect("expected one expression");
             let fitted = expression.materialize(&training).unwrap();
             for height in [0, 1, 4] {
                 let input = polars::df!("x" => vec![4.0; height]).unwrap();
@@ -250,7 +258,11 @@ mod tests {
 
     #[test]
     fn scalar_only_calls_use_height_without_input_columns() {
-        let expression = crate::parse_one_expression("add(2, 3)").unwrap();
+        let [expression]: [_; 1] = parse_expression
+            .parse("add(2, 3)")
+            .unwrap()
+            .try_into()
+            .expect("expected one expression");
         for height in [0, 3] {
             let data = DataFrame::empty_with_height(height);
             let output = expression.materialize(&data).unwrap();
@@ -265,10 +277,12 @@ mod tests {
             ("mul(x, 2)", [Some(6.0), Some(8.0)]),
             ("mul(x, `2`)", [Some(30.0), Some(80.0)]),
         ] {
-            let output = crate::parse_one_expression(source)
+            let [expression]: [_; 1] = parse_expression
+                .parse(source)
                 .unwrap()
-                .materialize(&data)
-                .unwrap();
+                .try_into()
+                .expect("expected one expression");
+            let output = expression.materialize(&data).unwrap();
             assert_numeric_output(output.frame(), "mul(x, 2)", &expected);
         }
     }
@@ -276,10 +290,12 @@ mod tests {
     #[test]
     fn sqrt_preserves_row_order_nulls_and_domain_behavior() {
         let data = polars::df!("x" => [Some(9.0), Some(1.0), Some(4.0), None, Some(-1.0)]).unwrap();
-        let output = crate::parse_one_expression("sqrt(x)")
+        let [expression]: [_; 1] = parse_expression
+            .parse("sqrt(x)")
             .unwrap()
-            .materialize(&data)
-            .unwrap();
+            .try_into()
+            .expect("expected one expression");
+        let output = expression.materialize(&data).unwrap();
         assert_numeric_output(
             output.frame(),
             "sqrt(x)",
@@ -290,40 +306,48 @@ mod tests {
     #[test]
     fn add_accepts_repeated_arguments_and_mixed_numeric_types() {
         let data = polars::df!("x" => [3_i32, 1], "y" => [Some(0.5_f32), None]).unwrap();
-        let output = crate::parse_one_expression("add(x, y, x)")
+        let [expression]: [_; 1] = parse_expression
+            .parse("add(x, y, x)")
             .unwrap()
-            .materialize(&data)
-            .unwrap();
+            .try_into()
+            .expect("expected one expression");
+        let output = expression.materialize(&data).unwrap();
         assert_numeric_output(output.frame(), "add(x, y, x)", &[Some(6.5), None]);
     }
 
     #[test]
     fn sub_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [10, 3], "y" => [3, 10], "z" => [2, 1]).unwrap();
-        let output = crate::parse_one_expression("sub(x, y, z)")
+        let [expression]: [_; 1] = parse_expression
+            .parse("sub(x, y, z)")
             .unwrap()
-            .materialize(&data)
-            .unwrap();
+            .try_into()
+            .expect("expected one expression");
+        let output = expression.materialize(&data).unwrap();
         assert_numeric_output(output.frame(), "sub(x, y, z)", &[Some(5.0), Some(-8.0)]);
     }
 
     #[test]
     fn mul_multiplies_all_arguments() {
         let data = polars::df!("x" => [2, 3], "y" => [3, 4], "z" => [4, 5]).unwrap();
-        let output = crate::parse_one_expression("mul(x, y, z)")
+        let [expression]: [_; 1] = parse_expression
+            .parse("mul(x, y, z)")
             .unwrap()
-            .materialize(&data)
-            .unwrap();
+            .try_into()
+            .expect("expected one expression");
+        let output = expression.materialize(&data).unwrap();
         assert_numeric_output(output.frame(), "mul(x, y, z)", &[Some(24.0), Some(60.0)]);
     }
 
     #[test]
     fn div_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [24, 3], "y" => [3, 24], "z" => [2, 2]).unwrap();
-        let output = crate::parse_one_expression("div(x, y, z)")
+        let [expression]: [_; 1] = parse_expression
+            .parse("div(x, y, z)")
             .unwrap()
-            .materialize(&data)
-            .unwrap();
+            .try_into()
+            .expect("expected one expression");
+        let output = expression.materialize(&data).unwrap();
         assert_numeric_output(output.frame(), "div(x, y, z)", &[Some(4.0), Some(0.0625)]);
     }
 
@@ -331,11 +355,14 @@ mod tests {
     fn expression_functions_validate_arity_and_reject_keywords() {
         let data = polars::df!("x" => [1.0]).unwrap();
         for source in ["sqrt()", "sqrt(x, x)", "add()", "add(x)", "sub()", "sub(x)"] {
+            let [expression]: [_; 1] = parse_expression
+                .parse(source)
+                .unwrap()
+                .try_into()
+                .expect("expected one expression");
             assert!(
                 matches!(
-                    crate::parse_one_expression(source)
-                        .unwrap()
-                        .materialize(&data),
+                    expression.materialize(&data),
                     Err(crate::MaterializationError::Validation(
                         crate::ValidationError::InvalidArgumentCount { .. }
                     ))
@@ -344,15 +371,20 @@ mod tests {
             );
         }
         for source in ["sqrt(x, base=2)", "add(x, x, base=2)", "sub(x, x, base=2)"] {
-            assert!(crate::parse_one_expression(source).is_err(), "{source}");
+            assert!(parse_expression.parse(source).is_err(), "{source}");
         }
     }
 
     #[test]
     fn repeated_expression_factors_are_deduplicated() {
+        let [expected]: [_; 1] = parse_expression
+            .parse("log(x)")
+            .unwrap()
+            .try_into()
+            .expect("expected one expression");
         assert_eq!(
-            crate::parse_one_expression("log(x) + log(x)").unwrap(),
-            crate::parse_one_expression("log(x)").unwrap(),
+            parse_expression.parse("log(x) + log(x)").unwrap(),
+            vec![expected],
         );
     }
 

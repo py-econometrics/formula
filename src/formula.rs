@@ -640,10 +640,12 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
 mod tests {
     use super::*;
     use crate::fit::Fit;
+    use crate::parse::parse_expression;
     use crate::transform::{
         CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
     };
     use polars::prelude::Scalar;
+    use winnow::Parser;
 
     #[test]
     fn multiplicative_operators_preserve_column_order() {
@@ -655,10 +657,9 @@ mod tests {
             ("a*(b/c)", &["a", "b", "b:c", "a:b", "a:b:c"]),
         ];
         for &(source, names) in cases {
-            let output = crate::parse_one_expression(source)
-                .unwrap()
-                .materialize(&data)
-                .unwrap();
+            let expressions = parse_expression.parse(source).unwrap();
+            let expression = expressions.first().unwrap();
+            let output = expression.materialize(&data).unwrap();
             assert_eq!(output.frame().get_column_names(), names, "{source}");
         }
     }
@@ -726,8 +727,9 @@ mod tests {
 
     #[test]
     fn literal_factors_retain_scalar_storage_at_current_input_height() {
-        let expression = crate::parse_one_expression("mul(add(x, -2), 3.0)").unwrap();
-        let scheduled = schedule_factors(&[&expression]);
+        let expressions = parse_expression.parse("mul(add(x, -2), 3.0)").unwrap();
+        let expression = expressions.first().unwrap();
+        let scheduled = schedule_factors(&[expression]);
         let training = polars::df!("x" => [1.0, 2.0]).unwrap();
         let fitted = fit_and_evaluate_factors(&scheduled, &training).unwrap();
         let fitted_factors = fitted
@@ -786,10 +788,9 @@ mod tests {
                 polars::df!("household income:income-growth" => [8.0, 27.0]).unwrap(),
             ),
         ] {
-            let fitted = crate::parse_one_expression(source)
-                .unwrap()
-                .materialize(&training)
-                .unwrap();
+            let expressions = parse_expression.parse(source).unwrap();
+            let expression = expressions.first().unwrap();
+            let fitted = expression.materialize(&training).unwrap();
             assert!(fitted.frame().equals_missing(&expected), "{source}");
 
             let evaluated = fitted.evaluate(&input).unwrap();
@@ -868,10 +869,9 @@ mod tests {
             ),
             ("F(flag)", polars::df!("F(flag)" => [1_u32, 0, 1]).unwrap()),
         ] {
-            let fitted = crate::parse_one_expression(source)
-                .unwrap()
-                .materialize(&training)
-                .unwrap();
+            let expressions = parse_expression.parse(source).unwrap();
+            let expression = expressions.first().unwrap();
+            let fitted = expression.materialize(&training).unwrap();
             let evaluated = fitted.evaluate(&input).unwrap();
 
             assert!(evaluated.frame().equals_missing(&expected), "{source}");
@@ -1189,10 +1189,11 @@ mod tests {
     fn expressions_share_equivalent_interaction_buffers() {
         use crate::transform::TRANSFORM_CALLS;
 
-        let expressions = [
-            &crate::parse_one_expression("sqrt(exp(F(g))):x + w").unwrap(),
-            &crate::parse_one_expression("x:sqrt(exp(F(g))) + v").unwrap(),
-        ];
+        let first_expressions = parse_expression.parse("sqrt(exp(F(g))):x + w").unwrap();
+        let first = first_expressions.first().unwrap();
+        let second_expressions = parse_expression.parse("x:sqrt(exp(F(g))) + v").unwrap();
+        let second = second_expressions.first().unwrap();
+        let expressions = [first, second];
         let training = polars::df!(
             "g" => ["a", "b"], "x" => [2.0, 3.0],
             "w" => [6.0, 7.0], "v" => [8.0, 9.0],
@@ -1313,8 +1314,10 @@ mod tests {
     fn repeated_nested_stateless_factors_execute_once_per_call() {
         use crate::transform::TRANSFORM_CALLS;
 
-        let specification =
-            crate::parse_one_expression("log(x) + sqrt(log(x)) + log(x):z").unwrap();
+        let expressions = parse_expression
+            .parse("log(x) + sqrt(log(x)) + log(x):z")
+            .unwrap();
+        let specification = expressions.first().unwrap();
         let training = polars::df!("x" => [1.0, 4.0], "z" => [2.0, 3.0]).unwrap();
 
         TRANSFORM_CALLS.set((0, 0));
@@ -1339,7 +1342,8 @@ mod tests {
 
     #[test]
     fn separate_materializations_learn_independent_state() {
-        let specification = crate::parse_one_expression("C(g)").unwrap();
+        let expressions = parse_expression.parse("C(g)").unwrap();
+        let specification = expressions.first().unwrap();
         let first_training = polars::df!("g" => ["a", "b"]).unwrap();
         let second_training = polars::df!("g" => ["b", "c"]).unwrap();
         let first = specification.materialize(&first_training).unwrap();
@@ -1442,8 +1446,9 @@ mod tests {
 
     #[test]
     fn planning_orders_dependencies_before_parents() {
-        let expression = crate::parse_one_expression("log(x) + sqrt(log(x))").unwrap();
-        let scheduled = schedule_factors(&[&expression]);
+        let expressions = parse_expression.parse("log(x) + sqrt(log(x))").unwrap();
+        let expression = expressions.first().unwrap();
+        let scheduled = schedule_factors(&[expression]);
 
         assert_eq!(scheduled.len(), 3);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -1453,8 +1458,9 @@ mod tests {
 
     #[test]
     fn planning_preserves_repeated_arguments() {
-        let expression = crate::parse_one_expression("sub(x, x)").unwrap();
-        let scheduled = schedule_factors(&[&expression]);
+        let expressions = parse_expression.parse("sub(x, x)").unwrap();
+        let expression = expressions.first().unwrap();
+        let scheduled = schedule_factors(&[expression]);
 
         assert_eq!(scheduled.len(), 2);
         let Factor::Call { arguments, .. } = scheduled[1].as_ref() else {
@@ -1468,8 +1474,9 @@ mod tests {
 
     #[test]
     fn planning_distinguishes_argument_order() {
-        let expression = crate::parse_one_expression("sub(x, y) + sub(y, x)").unwrap();
-        let scheduled = schedule_factors(&[&expression]);
+        let expressions = parse_expression.parse("sub(x, y) + sub(y, x)").unwrap();
+        let expression = expressions.first().unwrap();
+        let scheduled = schedule_factors(&[expression]);
 
         assert_eq!(scheduled.len(), 4);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -1481,9 +1488,11 @@ mod tests {
 
     #[test]
     fn planning_distinguishes_transform_parameters() {
-        let expression =
-            crate::parse_one_expression("C(g, reference='a') + C(g, reference='b')").unwrap();
-        let scheduled = schedule_factors(&[&expression]);
+        let expressions = parse_expression
+            .parse("C(g, reference='a') + C(g, reference='b')")
+            .unwrap();
+        let expression = expressions.first().unwrap();
+        let scheduled = schedule_factors(&[expression]);
 
         assert_eq!(scheduled.len(), 3);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("g"));
@@ -1507,8 +1516,9 @@ mod tests {
 
     #[test]
     fn intercepts_use_scalar_columns() {
-        let fitted = crate::parse_one_expression("1")
-            .unwrap()
+        let expressions = parse_expression.parse("1").unwrap();
+        let expression = expressions.first().unwrap();
+        let fitted = expression
             .materialize(&DataFrame::empty_with_height(2))
             .unwrap();
 
@@ -1624,10 +1634,9 @@ mod tests {
     #[test]
     fn empty_design_uses_new_input_height_on_rematerialization() {
         let training = polars::df!("x" => [1.0, 2.0, 3.0]).unwrap();
-        let design = crate::parse_one_expression("x-x")
-            .unwrap()
-            .materialize(&training)
-            .unwrap();
+        let expressions = parse_expression.parse("x-x").unwrap();
+        let expression = expressions.first().unwrap();
+        let design = expression.materialize(&training).unwrap();
         for values in [vec![4.0, 5.0], vec![]] {
             let height = values.len();
             let input = polars::df!("x" => values).unwrap();
@@ -1638,17 +1647,17 @@ mod tests {
 
     #[test]
     fn interaction_identity_preserves_function_argument_order() {
-        let expression = crate::parse_one_expression("sub(a,b):x + x:sub(b,a)").unwrap();
+        let expressions = parse_expression.parse("sub(a,b):x + x:sub(b,a)").unwrap();
+        let expression = expressions.first().unwrap();
         assert_eq!(expression.terms.len(), 2);
     }
 
     #[test]
     fn interaction_deduplication_preserves_first_output_name() {
         let data = polars::df!("a" => [2.0, 4.0], "b" => [3.0, 5.0]).unwrap();
-        let design = crate::parse_one_expression("b:a + a:b")
-            .unwrap()
-            .materialize(&data)
-            .unwrap();
+        let expressions = parse_expression.parse("b:a + a:b").unwrap();
+        let expression = expressions.first().unwrap();
+        let design = expression.materialize(&data).unwrap();
         let output = design.frame();
         assert_eq!(output.shape(), (2, 1));
         assert_eq!(output.columns()[0].name().as_str(), "b:a");
