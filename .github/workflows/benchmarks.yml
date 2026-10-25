@@ -1,0 +1,124 @@
+name: Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Baseline revision (use the same revision for a control run)
+        required: true
+        default: main
+      candidate:
+        description: Candidate revision
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmarks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      POLARS_MAX_THREADS: "1"
+      BENCH_ROWS: "1000000"
+      BENCH_SAMPLES: "10"
+      BENCH_PARSE_BATCH: "1000"
+      BENCH_ROUNDS: "4"
+      BENCH_REGRESSION_PERCENT: "10"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate || github.sha }}
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Resolve baseline
+        id: baseline
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ inputs.base }}
+        run: |
+          if [[ "$EVENT_NAME" != workflow_dispatch ]]; then
+            BASE_REF=$(git -C candidate rev-parse HEAD^1)
+          fi
+          echo "ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.baseline.outputs.ref }}
+          path: base
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            base
+            candidate
+      - name: Build
+        shell: bash
+        run: |
+          revisions="candidate"
+          if [[ -f base/benches/benchmark.rs ]]; then
+            revisions="base candidate"
+          fi
+          echo "BENCH_REVISIONS=$revisions" >> "$GITHUB_ENV"
+          for revision in $revisions; do
+            cargo bench --locked --manifest-path "$revision/Cargo.toml" --bench benchmark --no-run
+          done
+          cargo build --release --locked --manifest-path candidate/Cargo.toml --example compare_benchmarks
+      - name: Benchmark
+        shell: bash
+        run: |
+          for revision in $BENCH_REVISIONS; do
+            mkdir -p "benchmark-results/$revision"
+          done
+          for ((round = 0; round < BENCH_ROUNDS; round++)); do
+            order="$BENCH_REVISIONS"
+            if [[ "$order" == "base candidate" ]] && ((round % 2)); then
+              order="candidate base"
+            fi
+            for revision in $order; do
+              echo "Round $round: $revision"
+              result="benchmark-results/$revision/round-$round.json"
+              cargo bench --locked --manifest-path "$revision/Cargo.toml" --bench benchmark -- \
+                "$BENCH_ROWS" "$BENCH_SAMPLES" "$BENCH_PARSE_BATCH" \
+                > "$result"
+              jq empty "$result"
+            done
+          done
+      - name: Compare and publish summary
+        shell: bash
+        run: |
+          {
+            echo '# Benchmark comparison'
+            echo
+            echo "Base: $(git -C base rev-parse HEAD)"
+            echo "Candidate: $(git -C candidate rev-parse HEAD)"
+            echo
+            echo "$BENCH_ROWS rows; $POLARS_MAX_THREADS thread(s); $BENCH_ROUNDS rounds; $BENCH_SAMPLES samples per round; $BENCH_PARSE_BATCH parses per sample."
+            echo
+            rustc --version
+            echo
+            echo "Release builds, default features. Mean runtime regressions greater than $BENCH_REGRESSION_PERCENT% fail the job."
+            echo
+            if [[ -d benchmark-results/base ]]; then
+              candidate/target/release/examples/compare_benchmarks benchmark-results/base benchmark-results/candidate
+            else
+              echo 'Baseline unavailable: this revision predates the benchmark harness.'
+              echo
+              candidate/target/release/examples/compare_benchmarks - benchmark-results/candidate
+            fi
+          } | tee benchmark-results/summary.md "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-results
+          path: benchmark-results/
+          if-no-files-found: warn
