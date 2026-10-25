@@ -2,7 +2,7 @@ use super::input::{argument_column_name, input_frame};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
-    DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, Series, all_horizontal,
+    Column, DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, all_horizontal,
     col,
 };
 
@@ -30,7 +30,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
         ArgumentCount::AtLeast(1)
     }
 
-    fn fit(&self, inputs: &[Series]) -> Result<Self::State, TransformError> {
+    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError> {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -60,7 +60,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
     fn transform(
         &self,
         state: &Self::State,
-        inputs: &[Series],
+        inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
         let mapping = &state.mapping;
         if !inputs
@@ -107,7 +107,6 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use polars::error::PolarsError;
-    use polars::prelude::NamedFrom;
 
     fn assert_integer_output(actual: &DataFrame, expected: &[Option<u32>]) {
         assert_eq!(actual.shape(), (expected.len(), 1));
@@ -124,7 +123,7 @@ mod tests {
     #[test]
     fn integer_encoding_requires_fit() {
         let transform = Fit::Unfitted(IntegerEncodingDefinition);
-        let input = [Series::new("f1".into(), ["a", "b"])];
+        let input = [Column::new("f1".into(), ["a", "b"])];
         assert!(matches!(
             transform.transform(&input),
             Err(TransformError::NotFitted)
@@ -134,8 +133,8 @@ mod tests {
     #[test]
     fn integer_definition_produces_independent_fits() -> Result<(), TransformError> {
         let definition = IntegerEncodingDefinition;
-        let first_input = [Series::new("group".into(), ["a", "b"])];
-        let second_input = [Series::new("group".into(), ["b", "a"])];
+        let first_input = [Column::new("group".into(), ["a", "b"])];
+        let second_input = [Column::new("group".into(), ["b", "a"])];
         let first = definition.fit(&first_input)?;
         let second = definition.fit(&second_input)?;
 
@@ -158,9 +157,9 @@ mod tests {
     #[test]
     fn integer_encoding_suorts_multiple_inputs() -> Result<(), TransformError> {
         let input = [
-            Series::new("f1".into(), ["a", "a", "a", "b", "a"]),
-            Series::new("f2".into(), [1_i32, 1, 2, 1, 1]),
-            Series::new("f3".into(), [true, false, true, true, true]),
+            Column::new("f1".into(), ["a", "a", "a", "b", "a"]),
+            Column::new("f2".into(), [1_i32, 1, 2, 1, 1]),
+            Column::new("f3".into(), [true, false, true, true, true]),
         ];
         let cases = [
             (1, [Some(0), Some(0), Some(0), Some(1), Some(0)]),
@@ -184,12 +183,12 @@ mod tests {
     #[test]
     fn integer_encoding_reuses_tuple_codes_and_preserves_row_order() -> Result<(), TransformError> {
         let training = [
-            Series::new("f1".into(), ["b", "a", "b", "c", "a"]),
-            Series::new("f2".into(), [1_i32, 1, 2, 1, 1]),
+            Column::new("f1".into(), ["b", "a", "b", "c", "a"]),
+            Column::new("f2".into(), [1_i32, 1, 2, 1, 1]),
         ];
         let input = [
-            Series::new("f1".into(), ["c", "b", "a", "b", "a"]),
-            Series::new("f2".into(), [1_i32, 2, 1, 1, 2]),
+            Column::new("f1".into(), ["c", "b", "a", "b", "a"]),
+            Column::new("f2".into(), [1_i32, 2, 1, 1, 2]),
         ];
         let definition = IntegerEncodingDefinition;
         let transform = definition.fit(&training)?;
@@ -211,18 +210,18 @@ mod tests {
     fn integer_encoding_preserves_nulls_and_marks_unseen_tuples_null() -> Result<(), TransformError>
     {
         let training = [
-            Series::new(
+            Column::new(
                 "f1".into(),
                 [Some("a"), None, Some("b"), Some("a"), Some("b")],
             ),
-            Series::new("f2".into(), [Some(1_i32), Some(1), None, None, Some(2)]),
+            Column::new("f2".into(), [Some(1_i32), Some(1), None, None, Some(2)]),
         ];
         let input = [
-            Series::new(
+            Column::new(
                 "f1".into(),
                 [Some("a"), Some("b"), Some("c"), None, Some("a"), Some("b")],
             ),
-            Series::new(
+            Column::new(
                 "f2".into(),
                 [Some(1_i32), Some(2), Some(1), Some(1), None, None],
             ),
@@ -238,7 +237,7 @@ mod tests {
 
     #[test]
     fn integer_encoding_excludes_nonfinite_keys() -> Result<(), TransformError> {
-        let input = Series::new(
+        let input = Column::new(
             "group".into(),
             [
                 Some(2.0_f64),
@@ -267,7 +266,7 @@ mod tests {
     {
         for dtype in [DataType::Float32, DataType::Float64] {
             let inputs = [
-                Series::new(
+                Column::new(
                     "first".into(),
                     [
                         2.0,
@@ -283,7 +282,7 @@ mod tests {
                     ],
                 )
                 .cast(&dtype)?,
-                Series::new(
+                Column::new(
                     "second".into(),
                     [
                         3.0,
@@ -326,10 +325,10 @@ mod tests {
         for dtype in [DataType::Float32, DataType::Float64] {
             let training =
                 [
-                    Series::new("group".into(), [f64::NAN, f64::INFINITY, f64::NEG_INFINITY])
+                    Column::new("group".into(), [f64::NAN, f64::INFINITY, f64::NEG_INFINITY])
                         .cast(&dtype)?,
                 ];
-            let inputs = [Series::new(
+            let inputs = [Column::new(
                 "group".into(),
                 [
                     Some(1.0),
@@ -353,20 +352,20 @@ mod tests {
     #[test]
     fn integer_encoding_rejects_changed_names_order_or_count() -> Result<(), TransformError> {
         let training = [
-            Series::new("f1".into(), ["a", "b"]),
-            Series::new("f2".into(), [1_i32, 2]),
+            Column::new("f1".into(), ["a", "b"]),
+            Column::new("f2".into(), [1_i32, 2]),
         ];
         let definition = IntegerEncodingDefinition;
         let transform = definition.fit(&training)?;
         let cases = [
-            vec![Series::new("other".into(), ["a", "b"]), training[1].clone()],
+            vec![Column::new("other".into(), ["a", "b"]), training[1].clone()],
             vec![training[1].clone(), training[0].clone()],
             vec![training[0].clone()],
             vec![],
             vec![
                 training[0].clone(),
                 training[1].clone(),
-                Series::new("f3".into(), [true, false]),
+                Column::new("f3".into(), [true, false]),
             ],
         ];
 
@@ -385,14 +384,14 @@ mod tests {
     #[test]
     fn integer_encoding_rejects_changed_input_dtypes() -> Result<(), TransformError> {
         let training = [
-            Series::new("f1".into(), [1_i32, 2]),
-            Series::new("f2".into(), ["a", "b"]),
+            Column::new("f1".into(), [1_i32, 2]),
+            Column::new("f2".into(), ["a", "b"]),
         ];
         let definition = IntegerEncodingDefinition;
         let transform = definition.fit(&training)?;
         let cases = [
-            [Series::new("f1".into(), [1_i64, 2]), training[1].clone()],
-            [training[0].clone(), Series::new("f2".into(), [1_i32, 2])],
+            [Column::new("f1".into(), [1_i64, 2]), training[1].clone()],
+            [training[0].clone(), Column::new("f2".into(), [1_i32, 2])],
         ];
 
         for input in cases {
@@ -407,7 +406,7 @@ mod tests {
     #[test]
     fn integer_encoding_accepts_repeated_arguments_and_reserved_input_names()
     -> Result<(), TransformError> {
-        let column = Series::new(
+        let column = Column::new(
             IntegerEncodingDefinition::CODE_COLUMN.into(),
             ["a", "b", "a"],
         );
@@ -417,7 +416,7 @@ mod tests {
                 [Some(0), Some(1), Some(0)],
             ),
             (
-                [column, Series::new(argument_column_name(0), [1_i32, 1, 2])],
+                [column, Column::new(argument_column_name(0), [1_i32, 1, 2])],
                 [Some(0), Some(1), Some(2)],
             ),
         ];
@@ -432,9 +431,9 @@ mod tests {
 
     #[test]
     fn integer_encoding_handles_empty_and_all_null_training_data() -> Result<(), TransformError> {
-        let empty = [Series::new("f1".into(), Vec::<i32>::new())];
-        let all_null = [Series::new("f1".into(), [None::<i32>, None])];
-        let known_dtype = [Series::new("f1".into(), [1_i32, 2])];
+        let empty = [Column::new("f1".into(), Vec::<i32>::new())];
+        let all_null = [Column::new("f1".into(), [None::<i32>, None])];
+        let known_dtype = [Column::new("f1".into(), [1_i32, 2])];
 
         for training in [empty, all_null] {
             let definition = IntegerEncodingDefinition;
@@ -453,9 +452,9 @@ mod tests {
 
     #[test]
     fn integer_encoding_refit_replaces_mapping_and_input_names() -> Result<(), TransformError> {
-        let first = [Series::new("f1".into(), ["a", "b"])];
-        let second = [Series::new("other".into(), ["c", "a"])];
-        let input = [Series::new("other".into(), ["b", "c", "a"])];
+        let first = [Column::new("f1".into(), ["a", "b"])];
+        let second = [Column::new("other".into(), ["c", "a"])];
+        let input = [Column::new("other".into(), ["b", "c", "a"])];
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &first)?);
         let transform = transform.fit(&second)?;
 
@@ -470,7 +469,7 @@ mod tests {
     #[test]
     fn integer_encoding_rejects_invalid_fit_inputs_without_replacing_state()
     -> Result<(), TransformError> {
-        let training = [Series::new("f1".into(), ["a", "b"])];
+        let training = [Column::new("f1".into(), ["a", "b"])];
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &training)?);
         let original = transform.transform(&training)?;
         assert!(matches!(
@@ -478,7 +477,7 @@ mod tests {
             Err(TransformError::InvalidParameter(_))
         ));
 
-        let unequal_lengths = [training[0].clone(), Series::new("f2".into(), [1_i32])];
+        let unequal_lengths = [training[0].clone(), Column::new("f2".into(), [1_i32])];
         assert!(matches!(
             transform.fit(&unequal_lengths),
             Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))

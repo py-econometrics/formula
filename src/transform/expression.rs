@@ -1,7 +1,7 @@
 use super::input::{input_frame, validate_numeric_input};
 use super::{ArgumentCount, TransformError, call_name};
 use polars::error::PolarsError;
-use polars::prelude::{DataFrame, DataType, Expr, IntoLazy, PlSmallStr, Series, col, lit};
+use polars::prelude::{Column, DataFrame, DataType, Expr, IntoLazy, PlSmallStr, col, lit};
 
 type ExpressionBuilder = fn(&[Expr]) -> Result<Expr, TransformError>;
 
@@ -11,7 +11,7 @@ enum InputPolicy {
 }
 
 impl InputPolicy {
-    fn validate(self, input: &Series) -> Result<(), TransformError> {
+    fn validate(self, input: &Column) -> Result<(), TransformError> {
         match self {
             Self::NumericFloat64 => validate_numeric_input(input),
         }
@@ -115,11 +115,11 @@ impl ExpressionTransform {
         },
     };
 
-    fn output_name(&self, inputs: &[Series]) -> PlSmallStr {
+    fn output_name(&self, inputs: &[Column]) -> PlSmallStr {
         call_name(self.name, inputs.iter().map(|input| input.name().as_str()))
     }
 
-    fn validate_inputs(&self, inputs: &[Series]) -> Result<(), TransformError> {
+    fn validate_inputs(&self, inputs: &[Column]) -> Result<(), TransformError> {
         if !self.argument_count.accepts(inputs.len()) {
             return Err(TransformError::InvalidParameter(format!(
                 "{} expects {:?} arguments, got {}",
@@ -148,7 +148,7 @@ impl ExpressionTransform {
         self.clone()
     }
 
-    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
         self.validate_inputs(inputs)?;
         let frame = input_frame(inputs)?;
         let height = frame.height();
@@ -178,7 +178,6 @@ impl ExpressionTransform {
 mod tests {
     use super::*;
     use crate::transform::Transform;
-    use polars::prelude::NamedFrom;
 
     fn assert_numeric_output(actual: &DataFrame, name: &str, expected: &[Option<f64>]) {
         assert_eq!(actual.shape(), (expected.len(), 1));
@@ -297,7 +296,7 @@ mod tests {
             build: |inputs| Ok(inputs[0].clone().first()),
             ..ExpressionTransform::LOG
         };
-        let inputs = [Series::new("x".into(), [1.0, 2.0])];
+        let inputs = [Column::new("x".into(), [1.0, 2.0])];
         assert!(matches!(
             transform.transform(&inputs),
             Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
@@ -306,7 +305,7 @@ mod tests {
 
     #[test]
     fn log_computes_natural_log_and_preserves_nulls() -> Result<(), TransformError> {
-        let input = [Series::new(
+        let input = [Column::new(
             "x".into(),
             [Some(1.0), Some(std::f64::consts::E), None],
         )];
@@ -324,7 +323,7 @@ mod tests {
 
     #[test]
     fn exp_computes_exponential_and_preserves_nulls() -> Result<(), TransformError> {
-        let input = [Series::new(
+        let input = [Column::new(
             "x".into(),
             [Some(0.0), Some(1.0), Some(-1.0), None],
         )];
@@ -348,12 +347,12 @@ mod tests {
     #[test]
     fn numeric_transforms_accept_numeric_widths_without_fit() -> Result<(), TransformError> {
         let cases = [
-            [Series::new("x".into(), [1_i32, 2])],
-            [Series::new("x".into(), [1_i64, 2])],
-            [Series::new("x".into(), [1_u32, 2])],
-            [Series::new("x".into(), [1_u64, 2])],
-            [Series::new("x".into(), [1.0_f32, 2.0])],
-            [Series::new("x".into(), [1.0_f64, 2.0])],
+            [Column::new("x".into(), [1_i32, 2])],
+            [Column::new("x".into(), [1_i64, 2])],
+            [Column::new("x".into(), [1_u32, 2])],
+            [Column::new("x".into(), [1_u64, 2])],
+            [Column::new("x".into(), [1.0_f32, 2.0])],
+            [Column::new("x".into(), [1.0_f64, 2.0])],
         ];
 
         for input in cases {
@@ -374,8 +373,8 @@ mod tests {
     #[test]
     fn numeric_transforms_reject_strings_and_booleans() {
         let cases = [
-            [Series::new("x".into(), ["1", "2"])],
-            [Series::new("x".into(), [true, false])],
+            [Column::new("x".into(), ["1", "2"])],
+            [Column::new("x".into(), [true, false])],
         ];
 
         for input in cases {
@@ -394,8 +393,8 @@ mod tests {
 
     #[test]
     fn numeric_transforms_preserve_empty_and_all_null_inputs() -> Result<(), TransformError> {
-        let empty = [Series::new("x".into(), Vec::<f64>::new())];
-        let all_null = [Series::new("x".into(), [None::<f64>, None])];
+        let empty = [Column::new("x".into(), Vec::<f64>::new())];
+        let all_null = [Column::new("x".into(), [None::<f64>, None])];
 
         for (transform, name) in [
             (Transform::Expression(ExpressionTransform::LOG), "log(x)"),
@@ -410,14 +409,14 @@ mod tests {
     #[test]
     fn numeric_transforms_follow_float_domain_and_overflow_behavior() -> Result<(), TransformError>
     {
-        let input = [Series::new("x".into(), [-1.0_f64, 0.0, 1.0])];
+        let input = [Column::new("x".into(), [-1.0_f64, 0.0, 1.0])];
         assert_numeric_output(
             &Transform::Expression(ExpressionTransform::LOG).transform(&input)?,
             "log(x)",
             &[Some(f64::NAN), Some(f64::NEG_INFINITY), Some(0.0)],
         );
 
-        let input = [Series::new("x".into(), [1000.0_f64])];
+        let input = [Column::new("x".into(), [1000.0_f64])];
         assert_numeric_output(
             &Transform::Expression(ExpressionTransform::EXP).transform(&input)?,
             "exp(x)",

@@ -13,7 +13,7 @@ use crate::fit::{Fit, Fitted};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use polars::error::PolarsError;
-use polars::prelude::{DataFrame, PlSmallStr, Series};
+use polars::prelude::{Column, DataFrame, PlSmallStr};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -28,12 +28,12 @@ pub enum Transform {
 }
 
 impl<D: TransformDefinition> Fitted<D, D::State> {
-    pub(crate) fn fit(definition: D, inputs: &[Series]) -> Result<Self, TransformError> {
+    pub(crate) fn fit(definition: D, inputs: &[Column]) -> Result<Self, TransformError> {
         let state = definition.fit(inputs)?;
         Ok(Self::new(definition, state))
     }
 
-    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
         self.definition.transform(&self.state, inputs)
     }
 }
@@ -47,12 +47,12 @@ impl<D: TransformDefinition + Clone> Fit<D, D::State> {
         self.definition().argument_count()
     }
 
-    pub(crate) fn fit(&self, inputs: &[Series]) -> Result<Self, TransformError> {
+    pub(crate) fn fit(&self, inputs: &[Column]) -> Result<Self, TransformError> {
         let fitted = Fitted::fit(self.definition().clone(), inputs)?;
         Ok(Self::Fitted(fitted))
     }
 
-    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
         match self {
             Self::Unfitted(_) => Err(TransformError::NotFitted),
             Self::Fitted(operation) => operation.transform(inputs),
@@ -68,12 +68,12 @@ pub(crate) trait TransformDefinition {
 
     fn argument_count(&self) -> ArgumentCount;
 
-    fn fit(&self, inputs: &[Series]) -> Result<Self::State, TransformError>;
+    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError>;
 
     fn transform(
         &self,
         state: &Self::State,
-        inputs: &[Series],
+        inputs: &[Column],
     ) -> Result<DataFrame, TransformError>;
 }
 
@@ -94,7 +94,7 @@ impl Transform {
         }
     }
 
-    pub(crate) fn fit(&self, inputs: &[Series]) -> Result<Self, TransformError> {
+    pub(crate) fn fit(&self, inputs: &[Column]) -> Result<Self, TransformError> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits + 1, transforms));
 
@@ -105,7 +105,7 @@ impl Transform {
         }
     }
 
-    pub(crate) fn transform(&self, inputs: &[Series]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 
@@ -144,14 +144,14 @@ impl From<PolarsError> for TransformError {
 mod tests {
     use super::*;
     use crate::fit::Fitted;
-    use polars::prelude::{NamedFrom, PlSmallStr, Scalar};
+    use polars::prelude::{PlSmallStr, Scalar};
 
     #[test]
     fn fit_identity_depends_on_definition_not_fitted_state() -> Result<(), TransformError> {
         let definition =
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
-        let first_input = [Series::new("group".into(), ["a", "b"])];
-        let second_input = [Series::new("group".into(), ["a", "c"])];
+        let first_input = [Column::new("group".into(), ["a", "b"])];
+        let second_input = [Column::new("group".into(), ["a", "c"])];
         let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
         let second = Fit::Fitted(Fitted::fit(definition.clone(), &second_input)?);
 
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn transform_enum_delegates_integer_operations() -> Result<(), TransformError> {
-        let inputs = [Series::new("group".into(), ["a", "b", "a"])];
+        let inputs = [Column::new("group".into(), ["a", "b", "a"])];
         let transform = Transform::F(Fit::Unfitted(IntegerEncodingDefinition));
 
         assert!(!transform.expands());
