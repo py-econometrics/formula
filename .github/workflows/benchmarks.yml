@@ -2,6 +2,8 @@ name: Benchmarks
 
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       base:
@@ -43,7 +45,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ inputs.base }}
         run: |
-          if [[ "$EVENT_NAME" == pull_request ]]; then
+          if [[ "$EVENT_NAME" != workflow_dispatch ]]; then
             BASE_REF=$(git -C candidate rev-parse HEAD^1)
           fi
           echo "ref=$BASE_REF" >> "$GITHUB_OUTPUT"
@@ -112,7 +114,7 @@ jobs:
               echo
               candidate/target/release/examples/compare_benchmarks - benchmark-results/candidate
             fi
-          } | tee benchmark-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          } | tee benchmark-results/summary.md "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
