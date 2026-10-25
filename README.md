@@ -67,7 +67,8 @@ is included by default; use `-1` to omit it.
 ```text
 y ~ x + z       # response y, predictors x and z, with an intercept
 y ~ x:z         # interaction between x and z
-y ~ x*z         # x, z, and their interaction
+y ~ x*z         # equivalent to x + z + x:z
+y ~ x/z         # equivalent to x + x:z
 y ~ log(x) - 1  # transform x and omit the intercept
 ```
 

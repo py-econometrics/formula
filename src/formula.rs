@@ -321,6 +321,25 @@ impl Expression {
         let interactions = self.interact(&other);
         self.add(other).add(interactions)
     }
+
+    pub(crate) fn nest(self, other: Self) -> Self {
+        let factors = self
+            .terms
+            .iter()
+            .flat_map(|term| term.factors.iter().cloned())
+            .collect::<Term>();
+
+        let combined = Self {
+            terms: if self.terms.is_empty() {
+                vec![]
+            } else {
+                vec![factors]
+            },
+            suppress_intercept: self.suppress_intercept,
+        };
+        let interactions = combined.interact(&other);
+        self.add(interactions)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -625,6 +644,85 @@ mod tests {
         CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
     };
     use polars::prelude::Scalar;
+
+    #[test]
+    fn multiplicative_operators_preserve_column_order() {
+        let data = polars::df!("a" => [2.0], "b" => [3.0], "c" => [4.0]).unwrap();
+        let cases: &[(&str, &[&str])] = &[
+            ("a*b*c", &["a", "b", "a:b", "c", "a:c", "b:c", "a:b:c"]),
+            ("a*b/c", &["a", "b", "a:b", "a:b:c"]),
+            ("a/b*c", &["a", "a:b", "c", "a:c", "a:b:c"]),
+            ("a*(b/c)", &["a", "b", "b:c", "a:b", "a:b:c"]),
+        ];
+        for &(source, names) in cases {
+            let output = crate::parse_one_expression(source)
+                .unwrap()
+                .materialize(&data)
+                .unwrap();
+            assert_eq!(output.frame().get_column_names(), names, "{source}");
+        }
+    }
+
+    #[test]
+    fn nesting_materializes_like_explicit_interactions() {
+        let training = polars::df!(
+            "y" => [1.0, 2.0],
+            "a" => [2.0, 3.0],
+            "b" => [Some(4.0), None],
+            "c" => [5.0, 7.0],
+        )
+        .unwrap();
+        let input = polars::df!(
+            "y" => [3.0], "a" => [4.0], "b" => [6.0], "c" => [8.0],
+        )
+        .unwrap();
+        let nested = crate::parse("y ~ (a+b)/c")
+            .unwrap()
+            .materialize(&training)
+            .unwrap();
+        let expanded = crate::parse("y ~ a+b+a:b:c")
+            .unwrap()
+            .materialize(&training)
+            .unwrap();
+        let evaluated_nested = nested.evaluate(&input).unwrap();
+        let evaluated_expanded = expanded.evaluate(&input).unwrap();
+
+        for (actual, expected, interactions) in [
+            (&nested, &expanded, vec![Some(40.0), None]),
+            (&evaluated_nested, &evaluated_expanded, vec![Some(192.0)]),
+        ] {
+            let actual = &actual.iter().next().unwrap().1;
+            let expected = &expected.iter().next().unwrap().1;
+            assert!(
+                actual
+                    .left()
+                    .frame()
+                    .equals_missing(expected.left().frame())
+            );
+            assert!(
+                actual
+                    .right()
+                    .frame()
+                    .equals_missing(expected.right().frame())
+            );
+            assert_eq!(
+                actual.right().frame().get_column_names(),
+                ["Intercept", "a", "b", "a:b:c"]
+            );
+            assert_eq!(
+                actual
+                    .right()
+                    .frame()
+                    .column("a:b:c")
+                    .unwrap()
+                    .f64()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                interactions
+            );
+        }
+    }
 
     #[test]
     fn literal_factors_retain_scalar_storage_at_current_input_height() {

@@ -241,11 +241,19 @@ fn parse_expression_inner(cursor: &mut &str) -> Result<Vec<Expression>> {
                     }))
                 },
             )),
-            '*'.value(Right(
+            '*'.value(Left(
                 20,
                 |_, left: Vec<Expression>, right: Vec<Expression>| {
                     Ok(combine_expressions(&left, &right, |left, right| {
                         left.interact_fully(right)
+                    }))
+                },
+            )),
+            '/'.value(Left(
+                20,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.nest(right)
                     }))
                 },
             )),
@@ -561,6 +569,7 @@ mod tests {
     fn quoted_columns_decode_literal_names() {
         for (source, name) in [
             ("`household income`", "household income"),
+            ("`a/b`", "a/b"),
             ("`a+b-c*d:e~f,(g)=h`", "a+b-c*d:e~f,(g)=h"),
             ("`收入 €`", "收入 €"),
             ("` leading and trailing `", " leading and trailing "),
@@ -738,6 +747,7 @@ mod tests {
             ("a - sw(x, a)", &["a", "a-a"]),
             ("sw(x, y)*z", &["x*z", "y*z"]),
             ("sw0(x)*z", &["z", "x*z"]),
+            ("sw(a, b)/c", &["a+a:c", "b+b:c"]),
             ("(a + sw(x, y)):z", &["a:z+x:z", "a:z+y:z"]),
             ("a + sw(x, y)*z", &["a+x+z+x:z", "a+y+z+y:z"]),
         ];
@@ -766,6 +776,7 @@ mod tests {
             ("y ~ sw0(x, z)", &["y~1", "y~x", "y~z"]),
             ("y ~ csw0(x, z) - 1", &["y~1-1", "y~x-1", "y~x+z-1"]),
             ("y ~ sw0(x, z):w", &["y~1", "y~x:w", "y~z:w"]),
+            ("y ~ sw(a, b)/c", &["y~a+a:c", "y~b+b:c"]),
             ("y ~ sw(1, x - 1)", &["y~1", "y~x-1"]),
         ];
 
@@ -1017,6 +1028,18 @@ mod tests {
             ("a:b + b:a", expression(&[&["a", "b"]])),
             ("a:b - b:a", expression(&[])),
             ("a*b*a", expression(&[&["a"], &["b"], &["a", "b"]])),
+            (
+                "a*b/c",
+                expression(&[&["a"], &["b"], &["a", "b"], &["a", "b", "c"]]),
+            ),
+            (
+                "a/b*c",
+                expression(&[&["a"], &["a", "b"], &["c"], &["a", "c"], &["a", "b", "c"]]),
+            ),
+            (
+                "a*(b/c)",
+                expression(&[&["a"], &["b"], &["b", "c"], &["a", "b"], &["a", "b", "c"]]),
+            ),
             ("1", expression(&[&[]])),
             ("1 + x + 1", expression(&[&[], &["x"]])),
             ("1:x", expression(&[&["x"]])),
@@ -1028,6 +1051,63 @@ mod tests {
                 expected,
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn nesting_expands_grouped_operands() {
+        for (source, expanded) in [
+            ("a/b", "a + a:b"),
+            ("(a+b)/c", "a + b + a:b:c"),
+            ("a/(b+c)", "a + a:b + a:c"),
+            ("(a+b)/(c+d)", "a + b + a:b:c + a:b:d"),
+            ("a/b/c", "a + a:b + a:b:c"),
+            ("a/a", "a"),
+            ("a/b:c", "a + a:b:c"),
+            ("a+b/c", "a + b + b:c"),
+        ] {
+            assert_eq!(
+                parse_one_expression(source).unwrap(),
+                parse_one_expression(expanded).unwrap(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn nesting_with_empty_operands_does_not_add_terms() {
+        assert_eq!(parse_one_expression("(a-a)/b").unwrap(), expression(&[]));
+        assert_eq!(
+            parse_one_expression("a/(b-b)").unwrap(),
+            expression(&[&["a"]])
+        );
+    }
+
+    #[test]
+    fn nesting_preserves_intercept_suppression() {
+        for (source, expanded) in [
+            ("y ~ a/b - 1", "y ~ a + a:b - 1"),
+            ("y ~ (a - 1)/b", "y ~ a + a:b - 1"),
+            ("y ~ a/(b - 1)", "y ~ a + a:b - 1"),
+        ] {
+            let actual = parse(source).unwrap();
+            assert_eq!(actual, parse(expanded).unwrap(), "{source}");
+            assert_eq!(
+                actual.formulas()[0].right,
+                expression(&[&["a"], &["a", "b"]]).subtract(Expression::from(Term::intercept())),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_slashes_remain_part_of_column_names() {
+        for (source, expected) in [
+            ("`a/b`", expression(&[&["a/b"]])),
+            ("`a/b`/c", expression(&[&["a/b"], &["a/b", "c"]])),
+            ("a/`b/c`", expression(&[&["a"], &["a", "b/c"]])),
+        ] {
+            assert_eq!(parse_one_expression(source).unwrap(), expected, "{source}");
         }
     }
 
@@ -1066,6 +1146,8 @@ mod tests {
             "y ~ x)",
             "y ~ x +",
             "y ~ x ?",
+            "y ~ a/",
+            "y ~ /a",
         ] {
             assert!(parse(source).is_err(), "{source:?}");
         }
@@ -1073,7 +1155,18 @@ mod tests {
 
     #[test]
     fn expression_parser_rejects_incomplete_or_trailing_input() {
-        for source in ["", " ", "y ~ x", "x C(group)", "(x + z", "x)", "x +", "x ?"] {
+        for source in [
+            "",
+            " ",
+            "y ~ x",
+            "x C(group)",
+            "(x + z",
+            "x)",
+            "x +",
+            "x ?",
+            "a/",
+            "/a",
+        ] {
             assert!(parse_one_expression(source).is_err(), "{source:?}");
         }
     }
