@@ -11,7 +11,7 @@ use winnow::Result;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    alt, delimited, eof, expression, peek, preceded, separated, separated_pair, terminated,
+    alt, delimited, eof, expression, peek, preceded, repeat, separated, separated_pair, terminated,
 };
 use winnow::token::{one_of, take_while};
 
@@ -124,10 +124,28 @@ fn parse_argument_boundary(cursor: &mut &str) -> Result<()> {
 }
 
 fn parse_factor(cursor: &mut &str) -> Result<Factor> {
+    alt((parse_transform, parse_column)).parse_next(cursor)
+}
+
+fn parse_column(cursor: &mut &str) -> Result<Factor> {
     alt((
-        parse_transform,
-        take_while(1.., is_identifier_character).map(Factor::from),
+        parse_quoted,
+        take_while(1.., is_identifier_character).map(str::to_owned),
     ))
+    .map(|name: String| Factor::from(name.as_str()))
+    .parse_next(cursor)
+}
+
+fn parse_quoted(cursor: &mut &str) -> Result<String> {
+    delimited(
+        '`',
+        repeat(
+            0.., // Allow the empty string as a column name
+            // Allow backtick-escaped backticks
+            alt(("``".value("`"), take_while(1.., |c: char| c != '`'))),
+        ),
+        '`',
+    )
     .parse_next(cursor)
 }
 
@@ -463,6 +481,121 @@ mod tests {
             .iter()
             .map(|factors| factors.iter().copied().map(Factor::from).collect::<Term>())
             .collect()
+    }
+
+    #[test]
+    fn quoted_columns_decode_literal_names() {
+        for (source, name) in [
+            ("`household income`", "household income"),
+            ("`a+b-c*d:e~f,(g)=h`", "a+b-c*d:e~f,(g)=h"),
+            ("`收入 €`", "收入 €"),
+            ("` leading and trailing `", " leading and trailing "),
+            ("``", ""),
+            ("`a``b`", "a`b"),
+            ("````", "`"),
+            ("`1`", "1"),
+        ] {
+            assert_eq!(
+                parse_column.parse(source).unwrap(),
+                Factor::from(name),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_columns_work_throughout_formulas() {
+        let call = |transform, arguments: Vec<Factor>| Factor::Call {
+            transform,
+            arguments: arguments.into_iter().map(Arc::new).collect(),
+        };
+        let nested = call(
+            Transform::Expression(ExpressionTransform::LOG),
+            vec![call(
+                Transform::Expression(ExpressionTransform::SQRT),
+                vec![Factor::from("household income")],
+            )],
+        );
+        let categorical = call(
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
+                Scalar::from(PlSmallStr::from_static("a")),
+            )))),
+            vec![Factor::from("group name")],
+        );
+        let integer = call(
+            Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+            vec![Factor::from("income-growth"), Factor::from("tax.rate")],
+        );
+
+        for (source, right) in [
+            (
+                "`outcome value` ~ `household income`",
+                vec![expression(&[&["household income"]])],
+            ),
+            (
+                "`outcome value` ~ log(sqrt(`household income`))",
+                vec![Expression::from(Term::from(nested))],
+            ),
+            (
+                "`outcome value` ~ C(`group name`, reference='a')",
+                vec![Expression::from(Term::from(categorical))],
+            ),
+            (
+                "`outcome value` ~ F(`income-growth`, `tax.rate`)",
+                vec![Expression::from(Term::from(integer))],
+            ),
+            (
+                "`outcome value` ~ `income-growth`:`tax.rate` + `income-growth`*`a+b`",
+                vec![expression(&[
+                    &["income-growth", "tax.rate"],
+                    &["income-growth"],
+                    &["a+b"],
+                    &["income-growth", "a+b"],
+                ])],
+            ),
+            (
+                "`outcome value` ~ sw(`household income`, `a``b`)",
+                vec![
+                    expression(&[&["household income"]]),
+                    expression(&[&["a`b"]]),
+                ],
+            ),
+        ] {
+            let expected = Specification::new(
+                right
+                    .into_iter()
+                    .map(|right| Formula {
+                        left: expression(&[&["outcome value"]]),
+                        right: right.resolve_intercept(true),
+                    })
+                    .collect(),
+            );
+            assert_eq!(parse(source).unwrap(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn quoted_and_unquoted_columns_share_identity() {
+        assert_eq!(parse("y ~ x + `x`").unwrap(), parse("y ~ x").unwrap());
+    }
+
+    #[test]
+    fn quoted_one_is_a_column_not_an_intercept() {
+        let column = parse_one_expression("`1`").unwrap();
+        assert_eq!(column, expression(&[&["1"]]));
+        assert_ne!(column, parse_one_expression("1").unwrap());
+        assert_eq!(
+            parse_one_expression("log(`1`)").unwrap(),
+            parse_one_expression("log(1)").unwrap(),
+        );
+    }
+
+    #[test]
+    fn unterminated_quoted_columns_are_rejected() {
+        for source in ["`", "`income", "`a``", "```", "log(`income)", "x + `income"] {
+            assert!(parse_one_expression(source).is_err(), "{source}");
+        }
+        assert!(parse("y ~ `income").is_err());
     }
 
     #[test]

@@ -627,6 +627,51 @@ mod tests {
     use polars::prelude::Scalar;
 
     #[test]
+    fn quoted_columns_preserve_names_and_values_on_materialization_and_evaluation() {
+        let training = polars::df!(
+            "household income" => [4.0, 9.0],
+            "income-growth" => [2.0, 3.0],
+            "a+b" => [5.0, 6.0],
+            "a`b" => [7.0, 8.0],
+            "" => [10.0, 11.0],
+            "1" => [12.0, 13.0],
+        )
+        .unwrap();
+        let input = training.slice(1, 1);
+
+        for (source, expected) in [
+            (
+                "`household income`",
+                polars::df!("household income" => [4.0, 9.0]).unwrap(),
+            ),
+            ("`a+b`", polars::df!("a+b" => [5.0, 6.0]).unwrap()),
+            ("`a``b`", polars::df!("a`b" => [7.0, 8.0]).unwrap()),
+            ("``", polars::df!("" => [10.0, 11.0]).unwrap()),
+            ("`1`", polars::df!("1" => [12.0, 13.0]).unwrap()),
+            (
+                "sqrt(`household income`)",
+                polars::df!("sqrt(household income)" => [2.0, 3.0]).unwrap(),
+            ),
+            (
+                "`household income`:`income-growth`",
+                polars::df!("household income:income-growth" => [8.0, 27.0]).unwrap(),
+            ),
+        ] {
+            let fitted = crate::parse_one_expression(source)
+                .unwrap()
+                .materialize(&training)
+                .unwrap();
+            assert!(fitted.frame().equals_missing(&expected), "{source}");
+
+            let evaluated = fitted.evaluate(&input).unwrap();
+            assert!(
+                evaluated.frame().equals_missing(&expected.slice(1, 1)),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn bare_nonnumeric_columns_are_rejected_before_interaction_casting() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0],
