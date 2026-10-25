@@ -6,8 +6,6 @@
 > `formula` is in early development and its scope, syntax, API is subject to change. It is
 not ready for production use.
 
-## Scope
-
 `formula` provides an interface to parse formula strings and materialize data as a design
 matrix for regression analysis.
 
@@ -74,9 +72,13 @@ y ~ x*z         # x, z, and their interaction
 y ~ log(x) - 1  # transform x and omit the intercept
 ```
 
+Use backticks `` ` `` to escape column names containing spaces, punctuation or special
+characters, for example ``y ~ `household income` ``.
+
 ### Transformations
 
-Function calls apply transformations:
+`formula` supports symbolic transformations that will be applied to the data provided
+during formula materialization:
 
 | Function                                                                     | Description                                                                                                            |
 |------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
@@ -87,7 +89,11 @@ Function calls apply transformations:
 
 ### Multiple estimation
 
-Expansion operators generate multiple formulas in a `Specification`:
+`formula` supports the [`fixest`](https://lrberge.github.io/fixest/index.html)-style
+[multiple estimation syntax](https://lrberge.github.io/fixest/reference/index.html#multiple-estimations)
+which enables generating
+multiple model specifications from a single formula. For example, the formula
+`y ~ sw(x1, x2)` expands to the formulas `y ~ x1` and `y ~ x2`.
 
 | Operator             | Models generated                                                                        |
 |----------------------|-----------------------------------------------------------------------------------------|
