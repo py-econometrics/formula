@@ -1,7 +1,7 @@
 use crate::fit::{Fit, Fitted};
 use crate::model::{MaterializationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError, validate_numeric_input};
-use polars::prelude::{DataFrame, DataType, NamedFrom, PolarsResult, Series};
+use polars::prelude::{Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::sync::Arc;
 
 pub(crate) fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
@@ -142,12 +142,13 @@ impl Term {
     fn assemble_columns(
         &self,
         height: usize,
-        factor_columns: Vec<Vec<Series>>,
-    ) -> Result<Vec<Series>, TransformError> {
+        factor_columns: Vec<Vec<Column>>,
+    ) -> Result<Vec<Column>, TransformError> {
         if self.is_intercept() {
-            return Ok(vec![Series::new(
+            return Ok(vec![Column::new_scalar(
                 Self::INTERCEPT_COLUMN_NAME.into(),
-                vec![1.0_f64; height],
+                Scalar::from(1.0_f64),
+                height,
             )]);
         }
         let mut column_groups = factor_columns.into_iter();
@@ -185,7 +186,7 @@ impl Term {
         &self,
         height: usize,
         evaluated: &[EvaluatedFactor],
-    ) -> Result<(Self, Vec<Series>), TransformError> {
+    ) -> Result<(Self, Vec<Column>), TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
         for factor in &self.factors {
@@ -273,8 +274,7 @@ impl Expression {
             suppress_intercept: self.suppress_intercept,
         };
 
-        let frame = DataFrame::new(height, columns.into_iter().map(Into::into).collect())
-            .map_err(TransformError::from)?;
+        let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
 
         Ok(EvaluatedExpression::new(expression, frame))
     }
@@ -396,12 +396,12 @@ pub enum ValidationError {
 
 struct EvaluatedFactor {
     factor: Arc<Factor>,
-    columns: Vec<Series>,
+    columns: Vec<Column>,
 }
 
 pub(crate) struct EvaluatedTerm {
     term: Term,
-    columns: Vec<Series>,
+    columns: Vec<Column>,
 }
 
 #[derive(Clone, Debug)]
@@ -435,7 +435,7 @@ fn fit_and_evaluate_factors(
         let result = match factor.as_ref() {
             Factor::Variable(variable) => {
                 let definition = variable.definition();
-                let column = data.column(&definition.name)?.as_materialized_series();
+                let column = data.column(&definition.name)?;
                 let state = VariableState {
                     dtype: column.dtype().clone(),
                 };
@@ -461,17 +461,12 @@ fn fit_and_evaluate_factors(
                 let transform = transform.fit(&inputs)?;
                 let output = transform.transform(&inputs)?;
 
-                let columns = output
-                    .columns()
-                    .iter()
-                    .map(|column| column.as_materialized_series().clone())
-                    .collect();
                 EvaluatedFactor {
                     factor: Arc::new(Factor::Call {
                         transform,
                         arguments: fitted_arguments,
                     }),
-                    columns,
+                    columns: output.into_columns(),
                 }
             }
         };
@@ -493,9 +488,7 @@ fn evaluate_factors(
                     return Err(TransformError::NotFitted);
                 };
 
-                let column = data
-                    .column(&fitted.definition.name)?
-                    .as_materialized_series();
+                let column = data.column(&fitted.definition.name)?;
 
                 if column.dtype() != &fitted.state.dtype {
                     return Err(TransformError::DtypeMismatch(format!(
@@ -517,13 +510,7 @@ fn evaluate_factors(
                     let result = lookup_factor(&evaluated, argument);
                     inputs.extend(result.columns.iter().cloned());
                 }
-
-                let output = transform.transform(&inputs)?;
-                output
-                    .columns()
-                    .iter()
-                    .map(|column| column.as_materialized_series().clone())
-                    .collect()
+                transform.transform(&inputs)?.into_columns()
             }
         };
         evaluated.push(EvaluatedFactor {
@@ -850,7 +837,7 @@ mod tests {
             assert_eq!(specification.formulas().len(), 6);
             let collection = specification.materialize(&data).unwrap();
             assert_eq!(collection.len(), 6);
-            let expected_interaction = Series::new(
+            let expected_interaction = Column::new(
                 INTERACTION.into(),
                 [Some(2.0), Some(3.0 * std::f64::consts::E.sqrt()), None],
             );
@@ -881,11 +868,9 @@ mod tests {
             ];
             let mut expected_columns = data.clone();
             expected_columns
-                .with_column(Series::new("Intercept".into(), [1.0; 3]).into())
+                .with_column(Column::new("Intercept".into(), [1.0; 3]))
                 .unwrap();
-            expected_columns
-                .with_column(expected_interaction.into())
-                .unwrap();
+            expected_columns.with_column(expected_interaction).unwrap();
 
             for ((formula, model), &(source, response, names)) in collection.iter().zip(cases) {
                 let expected_formula = crate::parse(source).unwrap();
@@ -986,17 +971,11 @@ mod tests {
                 (b, [Some(false), Some(false), Some(true), None]),
                 (c, [Some(true), Some(false), Some(false), None]),
             ] {
-                let expected = Series::new(name.into(), values);
+                let expected = Column::new(name.into(), values);
                 let left = first.column(name).unwrap();
                 let right = second.column(name).unwrap();
-                assert!(
-                    left.as_materialized_series().equals_missing(&expected),
-                    "{name}"
-                );
-                assert!(
-                    right.as_materialized_series().equals_missing(&expected),
-                    "{name}"
-                );
+                assert!(left.equals_missing(&expected), "{name}");
+                assert!(right.equals_missing(&expected), "{name}");
                 let left = left.bool().unwrap();
                 let right = right.bool().unwrap();
                 let left = left.downcast_iter().next().unwrap();
@@ -1029,7 +1008,7 @@ mod tests {
             drop(collection);
             drop(data);
 
-            let expected = Series::new(
+            let expected = Column::new(
                 INTERACTION.into(),
                 [Some(2.0), Some(3.0 * std::f64::consts::E.sqrt()), None],
             );
@@ -1038,7 +1017,6 @@ mod tests {
                     .frame()
                     .column(INTERACTION)
                     .unwrap()
-                    .as_materialized_series()
                     .equals_missing(&expected)
             );
 
@@ -1048,7 +1026,7 @@ mod tests {
             )
             .unwrap();
             let evaluated = retained.evaluate(&fresh).unwrap();
-            let expected = Series::new(
+            let expected = Column::new(
                 INTERACTION.into(),
                 [
                     Some(4.0 * std::f64::consts::E.sqrt()),
@@ -1063,7 +1041,6 @@ mod tests {
                     .frame()
                     .column(INTERACTION)
                     .unwrap()
-                    .as_materialized_series()
                     .equals_missing(&expected)
             );
         }
@@ -1670,16 +1647,8 @@ mod tests {
         let rematerialized = model.evaluate(&input).unwrap();
 
         let training_inputs = [
-            training
-                .column("f1")
-                .unwrap()
-                .as_materialized_series()
-                .clone(),
-            training
-                .column("f2")
-                .unwrap()
-                .as_materialized_series()
-                .clone(),
+            training.column("f1").unwrap().clone(),
+            training.column("f2").unwrap().clone(),
         ];
         let definition = IntegerEncodingDefinition;
         let inner = definition.fit(&training_inputs).unwrap();
@@ -1687,13 +1656,11 @@ mod tests {
 
         for (data, design) in [(&training, model.right()), (&input, rematerialized.right())] {
             let inputs = [
-                data.column("f1").unwrap().as_materialized_series().clone(),
-                data.column("f2").unwrap().as_materialized_series().clone(),
+                data.column("f1").unwrap().clone(),
+                data.column("f2").unwrap().clone(),
             ];
             let encoded = definition.transform(&inner, &inputs).unwrap();
-            let expected = outer
-                .transform(&[encoded[0].as_materialized_series().clone()])
-                .unwrap();
+            let expected = outer.transform(&[encoded[0].clone()]).unwrap();
             assert!(design.frame().equals_missing(&expected));
         }
     }
