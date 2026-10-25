@@ -30,6 +30,7 @@ pub(crate) struct VariableState {
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Factor {
+    Literal(Scalar),
     Variable(Fit<VariableDefinition, VariableState>),
     Call {
         transform: Transform,
@@ -48,7 +49,7 @@ impl From<&str> for Factor {
 impl Factor {
     fn validate(&self) -> Result<(), ValidationError> {
         match self {
-            Self::Variable(_) => Ok(()),
+            Self::Variable(_) | Self::Literal(_) => Ok(()),
             Self::Call {
                 transform,
                 arguments,
@@ -198,7 +199,7 @@ impl Term {
                     };
                     validate_numeric_input(column)?;
                 }
-                Factor::Call { .. } => {}
+                Factor::Call { .. } | Factor::Literal(_) => {}
             }
             factors.push(Arc::clone(&result.factor));
             factor_columns.push(result.columns.clone());
@@ -425,6 +426,11 @@ impl EvaluatedExpression {
     }
 }
 
+fn literal_column(value: &Scalar, height: usize) -> Column {
+    let name = value.as_any_value().str_value().into_owned();
+    Column::new_scalar(name.into(), value.clone(), height)
+}
+
 fn fit_and_evaluate_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
@@ -433,6 +439,10 @@ fn fit_and_evaluate_factors(
 
     for factor in scheduled {
         let result = match factor.as_ref() {
+            Factor::Literal(value) => EvaluatedFactor {
+                factor: Arc::clone(factor),
+                columns: vec![literal_column(value, data.height())],
+            },
             Factor::Variable(variable) => {
                 let definition = variable.definition();
                 let column = data.column(&definition.name)?;
@@ -483,6 +493,9 @@ fn evaluate_factors(
 
     for factor in scheduled {
         let columns = match factor.as_ref() {
+            Factor::Literal(value) => {
+                vec![literal_column(value, data.height())]
+            }
             Factor::Variable(variable) => {
                 let Fit::Fitted(fitted) = variable else {
                     return Err(TransformError::NotFitted);
@@ -612,6 +625,37 @@ mod tests {
         CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
     };
     use polars::prelude::Scalar;
+
+    #[test]
+    fn literal_factors_retain_scalar_storage_at_current_input_height() {
+        let expression = crate::parse_one_expression("mul(add(x, -2), 3.0)").unwrap();
+        let scheduled = schedule_factors(&[&expression]);
+        let training = polars::df!("x" => [1.0, 2.0]).unwrap();
+        let fitted = fit_and_evaluate_factors(&scheduled, &training).unwrap();
+        let fitted_factors = fitted
+            .iter()
+            .map(|entry| Arc::clone(&entry.factor))
+            .collect::<Vec<_>>();
+
+        for height in [0, 1, 4] {
+            let input = polars::df!("x" => vec![4.0; height]).unwrap();
+            let evaluated = evaluate_factors(&fitted_factors, &input).unwrap();
+            for (entries, expected_height) in [(&fitted, training.height()), (&evaluated, height)] {
+                let mut literal_count = 0;
+                for entry in entries {
+                    if let Factor::Literal(value) = entry.factor.as_ref() {
+                        literal_count += 1;
+                        let [Column::Scalar(column)] = entry.columns.as_slice() else {
+                            panic!("literal must retain scalar storage");
+                        };
+                        assert_eq!(column.scalar(), value);
+                        assert_eq!(column.len(), expected_height);
+                    }
+                }
+                assert_eq!(literal_count, 2);
+            }
+        }
+    }
 
     #[test]
     fn quoted_columns_preserve_names_and_values_on_materialization_and_evaluation() {
@@ -925,13 +969,10 @@ mod tests {
                     .values()
                     .as_ptr()
             };
-            for name in ["Intercept", "x:z"] {
-                assert_eq!(
-                    values_ptr(first.right().frame().column(name).unwrap()),
-                    values_ptr(second.right().frame().column(name).unwrap()),
-                    "{name}",
-                );
-            }
+            assert_eq!(
+                values_ptr(first.right().frame().column("x:z").unwrap()),
+                values_ptr(second.right().frame().column("x:z").unwrap()),
+            );
             assert_eq!(
                 values_ptr(&first.left().frame()[0]),
                 values_ptr(&second.left().frame()[0])
@@ -1364,6 +1405,30 @@ mod tests {
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
         assert!(schedule_factors(&[&formula.right]).is_empty());
+    }
+
+    #[test]
+    fn intercepts_use_scalar_columns() {
+        let fitted = crate::parse_one_expression("1")
+            .unwrap()
+            .materialize(&DataFrame::empty_with_height(2))
+            .unwrap();
+
+        for height in [0, 1, 4] {
+            let evaluated = fitted
+                .evaluate(&DataFrame::empty_with_height(height))
+                .unwrap();
+
+            for design in [&fitted, &evaluated] {
+                let column = design.frame().column("Intercept").unwrap();
+                let Column::Scalar(column) = column else {
+                    panic!("intercept must retain scalar storage");
+                };
+                assert_eq!(column.scalar(), &Scalar::from(1.0_f64));
+                assert_eq!(column.len(), design.frame().height());
+            }
+            assert_eq!(evaluated.frame().shape(), (height, 1));
+        }
     }
 
     #[test]

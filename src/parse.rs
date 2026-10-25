@@ -180,7 +180,15 @@ fn parse_transform_call(cursor: &mut &str) -> Result<TransformCall> {
 fn parse_transform_call_arguments(cursor: &mut &str) -> Result<TransformCallArgument> {
     alt((
         parse_transform_call_keyword_arguments,
-        parse_factor.map(TransformCallArgument::Positional),
+        parse_positional_argument.map(TransformCallArgument::Positional),
+    ))
+    .parse_next(cursor)
+}
+
+fn parse_positional_argument(cursor: &mut &str) -> Result<Factor> {
+    alt((
+        terminated(parse_literal_number, parse_argument_boundary).map(Factor::Literal),
+        parse_factor,
     ))
     .parse_next(cursor)
 }
@@ -484,6 +492,72 @@ mod tests {
     }
 
     #[test]
+    fn positional_numbers_preserve_numeric_types_and_values() {
+        for (source, value) in [
+            ("2", Scalar::from(2_i64)),
+            ("2.0", Scalar::from(2.0_f64)),
+            ("-2", Scalar::from(-2_i64)),
+            ("-0.5", Scalar::from(-0.5_f64)),
+            ("1e3", Scalar::from(1000.0_f64)),
+            ("1.2E-3", Scalar::from(0.0012_f64)),
+        ] {
+            assert_eq!(
+                parse_positional_argument.parse(source).unwrap(),
+                Factor::Literal(value),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn positional_numbers_work_in_nested_calls() {
+        let expected = Factor::Call {
+            transform: Transform::Expression(ExpressionTransform::MUL),
+            arguments: vec![
+                Arc::new(Factor::Call {
+                    transform: Transform::Expression(ExpressionTransform::ADD),
+                    arguments: vec![
+                        Arc::new(Factor::from("x")),
+                        Arc::new(Factor::Literal(Scalar::from(-2_i64))),
+                    ],
+                }),
+                Arc::new(Factor::Literal(Scalar::from(3.0_f64))),
+            ],
+        };
+        assert_eq!(
+            parse_factor.parse("mul(add(x, -2), 3.0)").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn positional_numbers_remain_distinct_from_columns_and_intercepts() {
+        assert_eq!(
+            parse_positional_argument.parse("`2`").unwrap(),
+            Factor::from("2"),
+        );
+        assert_eq!(
+            parse_positional_argument.parse("2x").unwrap(),
+            Factor::from("2x"),
+        );
+        assert_ne!(
+            parse_one_expression("mul(x, 2)").unwrap(),
+            parse_one_expression("mul(x, `2`)").unwrap(),
+        );
+        assert_eq!(
+            parse_one_expression("1").unwrap(),
+            Expression::from(Term::intercept()),
+        );
+        assert_eq!(
+            parse_one_expression("-1").unwrap(),
+            Expression::from_iter([]).subtract(Expression::from(Term::intercept())),
+        );
+        for source in ["mul(x, 2.0x)", "mul(x, -)", "mul(x, 1.2.3)"] {
+            assert!(parse_one_expression(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn quoted_columns_decode_literal_names() {
         for (source, name) in [
             ("`household income`", "household income"),
@@ -580,11 +654,11 @@ mod tests {
     }
 
     #[test]
-    fn quoted_one_is_a_column_not_an_intercept() {
+    fn quoted_numbers_are_columns_not_intercepts_or_literals() {
         let column = parse_one_expression("`1`").unwrap();
         assert_eq!(column, expression(&[&["1"]]));
         assert_ne!(column, parse_one_expression("1").unwrap());
-        assert_eq!(
+        assert_ne!(
             parse_one_expression("log(`1`)").unwrap(),
             parse_one_expression("log(1)").unwrap(),
         );

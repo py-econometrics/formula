@@ -1,13 +1,12 @@
 # formula
 
-`formula` is a Rust implementation of Wilkinson formulas.
+`formula` is a Rust implementation of Wilkinson formulas. `formula` provides an interface
+to parse formula strings and materialize data as a design
+matrix for regression analysis.
 
 > [!NOTE]
 > `formula` is in early development and its scope, syntax, API is subject to change. It is
 not ready for production use.
-
-`formula` provides an interface to parse formula strings and materialize data as a design
-matrix for regression analysis.
 
 ## Quickstart
 
@@ -82,10 +81,22 @@ during formula materialization:
 
 | Function                                                                     | Description                                                                                                            |
 |------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric input.                                  |
-| `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric inputs.                                                         |
+| `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.              |
+| `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                                    |
 | `C(group, reference=...)`                                                    | Create categorical indicator columns for `group`; the optional `reference` argument sets the reference level.          |
 | `F(group)`                                                                   | Encode observed levels as integer codes. Multiple inputs, such as `F(firm, year)`, encode their observed combinations. |
+
+Numeric arguments are supported inside transformation calls:
+
+```text
+y ~ mul(x, 2)             # multiply x by 2
+y ~ div(x, 2.0)           # divide x by 2.0
+y ~ mul(add(x, -2), 3)    # combine nested calls and numeric arguments
+```
+
+Integers, decimals, and scientific notation are supported, including negative
+values. Numeric arguments are broadcast over the input rows. To reference a
+column with a numeric name, quote it: ``mul(x, `2`)``.
 
 ### Multiple estimation
 
