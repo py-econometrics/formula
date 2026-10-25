@@ -207,6 +207,73 @@ mod tests {
     }
 
     #[test]
+    fn numeric_arguments_broadcast_and_preserve_nulls() {
+        let data = polars::df!("x" => [Some(6.0), None, Some(-3.0)]).unwrap();
+        for (source, expected) in [
+            ("mul(x, 2)", [Some(12.0), None, Some(-6.0)]),
+            ("mul(2, x)", [Some(12.0), None, Some(-6.0)]),
+            ("div(x, 2.0)", [Some(3.0), None, Some(-1.5)]),
+            ("add(x, -2)", [Some(4.0), None, Some(-5.0)]),
+            ("mul(add(x, -2), 3)", [Some(12.0), None, Some(-15.0)]),
+        ] {
+            let output = crate::parse_one_expression(source)
+                .unwrap()
+                .materialize(&data)
+                .unwrap();
+            assert_numeric_output(output.frame(), source, &expected);
+        }
+    }
+
+    #[test]
+    fn numeric_arguments_use_current_input_height_including_empty_input() {
+        let training = polars::df!("x" => [1.0, 2.0]).unwrap();
+        for (source, expected_value) in [
+            ("mul(x, 2)", 8.0),
+            ("div(x, 2.0)", 2.0),
+            ("mul(add(x, -2), 3)", 6.0),
+            ("add(2, 3)", 5.0),
+            ("mul(add(2, -1), 3)", 3.0),
+        ] {
+            let expression = crate::parse_one_expression(source).unwrap();
+            let fitted = expression.materialize(&training).unwrap();
+            for height in [0, 1, 4] {
+                let input = polars::df!("x" => vec![4.0; height]).unwrap();
+                let expected = vec![Some(expected_value); height];
+                let evaluated = fitted.evaluate(&input).unwrap();
+                assert_numeric_output(evaluated.frame(), source, &expected);
+
+                let materialized = expression.materialize(&input).unwrap();
+                assert_numeric_output(materialized.frame(), source, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_only_calls_use_height_without_input_columns() {
+        let expression = crate::parse_one_expression("add(2, 3)").unwrap();
+        for height in [0, 3] {
+            let data = DataFrame::empty_with_height(height);
+            let output = expression.materialize(&data).unwrap();
+            assert_numeric_output(output.frame(), "add(2, 3)", &vec![Some(5.0); height]);
+        }
+    }
+
+    #[test]
+    fn numeric_arguments_do_not_read_numeric_named_columns() {
+        let data = polars::df!("x" => [3.0, 4.0], "2" => [10.0, 20.0]).unwrap();
+        for (source, expected) in [
+            ("mul(x, 2)", [Some(6.0), Some(8.0)]),
+            ("mul(x, `2`)", [Some(30.0), Some(80.0)]),
+        ] {
+            let output = crate::parse_one_expression(source)
+                .unwrap()
+                .materialize(&data)
+                .unwrap();
+            assert_numeric_output(output.frame(), "mul(x, 2)", &expected);
+        }
+    }
+
+    #[test]
     fn sqrt_preserves_row_order_nulls_and_domain_behavior() {
         let data = polars::df!("x" => [Some(9.0), Some(1.0), Some(4.0), None, Some(-1.0)]).unwrap();
         let output = crate::parse_one_expression("sqrt(x)")
