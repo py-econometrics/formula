@@ -26,18 +26,25 @@ Orchestration lives entirely in `.github/workflows/benchmarks.yml`, with separat
 build, benchmark, and comparison steps. If the base predates the harness, only
 the candidate runs, and its timings are reported without percentage changes.
 Compilation, execution, and malformed JSON failures fail
-the job; timing changes do not.
+the job. A comparable workload whose mean runtime increases by more than 10%
+also fails the job; the full report and artifacts remain available.
 
 The runner writes JSON using the shared types in `results/mod.rs`. Results
 contain raw samples, formulas, operation types, batch sizes, output shapes,
 row count, and the configured `POLARS_MAX_THREADS` value. The comparator reports
-median milliseconds per operation, the sample range, and percentage change.
+mean milliseconds per operation ± sample standard deviation, rounded to three
+significant digits. Percentage changes compare means. Candidate-only runs use a
+three-column table without empty baseline or percentage columns. Standard
+deviation is unavailable (`—`) when there is only one sample.
 Operations are parsing, parsing plus fitting (`ParseAndFit`), and evaluation.
 Durations are stored as fractional milliseconds to retain submillisecond precision.
 Different formulas, batch sizes, output shapes, row counts, or thread settings
 are reported as incomparable; added and removed workloads retain their available
 timings, with percentage changes omitted.
-Timing changes are advisory and do not cause a nonzero exit status.
+The workflow sets `BENCH_REGRESSION_PERCENT=10` to control the regression
+threshold. Without this environment variable, the comparator only reports
+timings. Candidate-only, added, removed, and incomparable workloads do not
+trigger the regression check. Runner noise can cause false alarms.
 
 Data construction, warm-up, output inspection, serialization, and result
 destruction are outside timing. Parsing samples retain a batch of parsed

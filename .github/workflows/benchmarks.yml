@@ -32,6 +32,7 @@ jobs:
       BENCH_SAMPLES: "10"
       BENCH_PARSE_BATCH: "1000"
       BENCH_ROUNDS: "4"
+      BENCH_REGRESSION_PERCENT: "10"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -105,7 +106,7 @@ jobs:
             echo
             rustc --version
             echo
-            echo 'Release builds, default features. Timing changes are advisory.'
+            echo "Release builds, default features. Mean runtime regressions greater than $BENCH_REGRESSION_PERCENT% fail the job."
             echo
             if [[ -d benchmark-results/base ]]; then
               candidate/target/release/examples/compare_benchmarks benchmark-results/base benchmark-results/candidate
