@@ -28,20 +28,33 @@ enum TransformCallArgument {
 }
 
 #[derive(Debug)]
-enum TransformError {
-    InvalidCall,
-    Unknown(String),
+enum TransformCallError {
+    DuplicateKeyword {
+        name: String,
+    },
+    PositionalAfterKeyword {
+        position: usize,
+    },
+    UnknownTransform(String),
     UnexpectedKeywords {
         transform: &'static str,
         keywords: Vec<String>,
     },
 }
 
-impl std::fmt::Display for TransformError {
+impl std::fmt::Display for TransformCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidCall => f.write_str("invalid transform call"),
-            Self::Unknown(name) => write!(f, "unknown transform `{name}`"),
+            Self::DuplicateKeyword { name } => {
+                write!(f, "duplicate keyword `{name}`")
+            }
+            Self::PositionalAfterKeyword { position } => {
+                write!(
+                    f,
+                    "positional argument {position} follows a keyword argument"
+                )
+            }
+            Self::UnknownTransform(name) => write!(f, "unknown transform `{name}`"),
             Self::UnexpectedKeywords {
                 transform,
                 keywords,
@@ -54,7 +67,7 @@ impl std::fmt::Display for TransformError {
     }
 }
 
-impl std::error::Error for TransformError {}
+impl std::error::Error for TransformCallError {}
 
 fn is_identifier_character(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -402,26 +415,29 @@ pub(crate) fn parse_one_expression(source: &str) -> ParseResult<'_, Expression> 
 }
 
 impl TryFrom<TransformCall> for Factor {
-    type Error = TransformError;
+    type Error = TransformCallError;
 
     fn try_from(call: TransformCall) -> std::result::Result<Self, Self::Error> {
         let mut arguments = Vec::new();
         let mut keywords = BTreeMap::new();
         let mut saw_keyword = false;
 
-        for argument in call.arguments {
+        for (index, argument) in call.arguments.into_iter().enumerate() {
             match argument {
                 TransformCallArgument::Positional(argument) if !saw_keyword => {
                     arguments.push(Arc::new(argument));
                 }
                 TransformCallArgument::Positional(_) => {
-                    return Err(TransformError::InvalidCall);
+                    return Err(TransformCallError::PositionalAfterKeyword {
+                        position: index + 1,
+                    });
                 }
                 TransformCallArgument::Keyword { name, value } => {
                     saw_keyword = true;
-                    if keywords.insert(name, value).is_some() {
-                        return Err(TransformError::InvalidCall);
+                    if keywords.contains_key(&name) {
+                        return Err(TransformCallError::DuplicateKeyword { name });
                     }
+                    keywords.insert(name, value);
                 }
             }
         }
@@ -464,7 +480,7 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("F", keywords)?;
                 Transform::F(Fit::Unfitted(IntegerEncodingDefinition))
             }
-            _ => return Err(TransformError::Unknown(call.name)),
+            _ => return Err(TransformCallError::UnknownTransform(call.name)),
         };
 
         Ok(Self::Call {
@@ -477,11 +493,11 @@ impl TryFrom<TransformCall> for Factor {
 fn reject_keywords(
     transform: &'static str,
     keywords: BTreeMap<String, Scalar>,
-) -> std::result::Result<(), TransformError> {
+) -> std::result::Result<(), TransformCallError> {
     if keywords.is_empty() {
         Ok(())
     } else {
-        Err(TransformError::UnexpectedKeywords {
+        Err(TransformCallError::UnexpectedKeywords {
             transform,
             keywords: keywords.into_keys().collect(),
         })
@@ -970,6 +986,31 @@ mod tests {
         ] {
             assert!(parse_one_expression(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn duplicate_keywords_identify_the_keyword() {
+        let call = parse_transform_call
+            .parse("C(x, reference='a', reference='b')")
+            .unwrap();
+
+        assert!(matches!(
+            Factor::try_from(call),
+            Err(TransformCallError::DuplicateKeyword { name })
+                if name == "reference"
+        ));
+    }
+
+    #[test]
+    fn positional_arguments_after_keywords_identify_the_position() {
+        let call = parse_transform_call
+            .parse("C(x, reference='a', y)")
+            .unwrap();
+
+        assert!(matches!(
+            Factor::try_from(call),
+            Err(TransformCallError::PositionalAfterKeyword { position: 3 })
+        ));
     }
 
     #[test]
