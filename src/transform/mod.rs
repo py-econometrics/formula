@@ -9,7 +9,7 @@ pub use input::ArgumentCount;
 pub(crate) use input::validate_numeric_input;
 pub(crate) use integer::IntegerEncodingDefinition;
 
-use crate::fit::{Fit, Fitted};
+use crate::fit::{Fit, FitError};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use polars::error::PolarsError;
@@ -27,70 +27,26 @@ pub enum Transform {
     F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
 }
 
-impl<D: TransformDefinition> Fitted<D, D::State> {
-    pub(crate) fn fit(definition: D, inputs: &[Column]) -> Result<Self, TransformError> {
-        let state = definition.fit(inputs)?;
-        Ok(Self::new(definition, state))
-    }
-
-    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
-        self.definition.transform(&self.state, inputs)
-    }
-}
-
-impl<D: TransformDefinition + Clone> Fit<D, D::State> {
-    pub(crate) fn expands(&self) -> bool {
-        self.definition().expands()
-    }
-
-    pub(crate) fn argument_count(&self) -> ArgumentCount {
-        self.definition().argument_count()
-    }
-
-    pub(crate) fn fit(&self, inputs: &[Column]) -> Result<Self, TransformError> {
-        let fitted = Fitted::fit(self.definition().clone(), inputs)?;
-        Ok(Self::Fitted(fitted))
-    }
-
-    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
-        match self {
-            Self::Unfitted(_) => Err(TransformError::NotFitted),
-            Self::Fitted(operation) => operation.transform(inputs),
-        }
-    }
-}
-
 pub(crate) trait TransformDefinition {
-    /// Data learned during fitting.
-    type State;
-
     fn expands(&self) -> bool;
 
     fn argument_count(&self) -> ArgumentCount;
-
-    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError>;
-
-    fn transform(
-        &self,
-        state: &Self::State,
-        inputs: &[Column],
-    ) -> Result<DataFrame, TransformError>;
 }
 
 impl Transform {
     pub(crate) fn expands(&self) -> bool {
         match self {
             Self::Expression(expression) => expression.expands(),
-            Self::C(categorical) => categorical.expands(),
-            Self::F(integer) => integer.expands(),
+            Self::C(categorical) => categorical.definition().expands(),
+            Self::F(integer) => integer.definition().expands(),
         }
     }
 
     pub(crate) fn argument_count(&self) -> ArgumentCount {
         match self {
             Self::Expression(expression) => expression.argument_count(),
-            Self::C(categorical) => categorical.argument_count(),
-            Self::F(integer) => integer.argument_count(),
+            Self::C(categorical) => categorical.definition().argument_count(),
+            Self::F(integer) => integer.definition().argument_count(),
         }
     }
 
@@ -105,12 +61,17 @@ impl Transform {
         }
     }
 
-    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(
+        &self,
+        inputs: &[Column],
+    ) -> Result<DataFrame, FitError<TransformError>> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 
         match self {
-            Self::Expression(expression) => expression.transform(inputs),
+            Self::Expression(expression) => {
+                expression.transform(inputs).map_err(FitError::Definition)
+            }
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),
         }
@@ -126,7 +87,6 @@ std::thread_local! {
 
 #[derive(Debug)]
 pub enum TransformError {
-    NotFitted,
     InputTypeMismatch,
     InvalidParameter(String),
     Polars(PolarsError),
@@ -176,11 +136,11 @@ mod tests {
         assert_eq!(transform.argument_count(), ArgumentCount::AtLeast(1));
         assert!(matches!(
             transform.transform(&inputs),
-            Err(TransformError::NotFitted)
+            Err(FitError::NotFitted)
         ));
 
         let transform = transform.fit(&inputs)?;
-        let output = transform.transform(&inputs)?;
+        let output = transform.transform(&inputs).unwrap();
         assert_eq!(output.get_column_names(), ["F(group)"]);
         assert_eq!(
             output[0].u32()?.iter().collect::<Vec<_>>(),

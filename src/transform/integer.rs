@@ -1,5 +1,6 @@
 use super::input::{argument_column_name, input_frame};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use crate::fit::Definition;
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
     Column, DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, all_horizontal,
@@ -20,8 +21,6 @@ impl IntegerEncodingDefinition {
 }
 
 impl TransformDefinition for IntegerEncodingDefinition {
-    type State = IntegerEncodingState;
-
     fn expands(&self) -> bool {
         false
     }
@@ -29,8 +28,40 @@ impl TransformDefinition for IntegerEncodingDefinition {
     fn argument_count(&self) -> ArgumentCount {
         ArgumentCount::AtLeast(1)
     }
+}
 
-    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError> {
+impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
+    type Input = [Column];
+    type Output = DataFrame;
+    type Error = TransformError;
+
+    fn validate(
+        &self,
+        state: &IntegerEncodingState,
+        inputs: &[Column],
+    ) -> Result<(), TransformError> {
+        if !inputs
+            .iter()
+            .map(|input| input.name())
+            .eq(state.names.iter())
+        {
+            return Err(TransformError::InvalidParameter(
+                "input column names differ from the fitted encoding".into(),
+            ));
+        }
+
+        for (index, input) in inputs.iter().enumerate() {
+            let expected = state.mapping.column(&argument_column_name(index))?.dtype();
+
+            if input.dtype() != expected {
+                return Err(TransformError::InputTypeMismatch);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fit(&self, inputs: &[Column]) -> Result<IntegerEncodingState, TransformError> {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -59,26 +90,11 @@ impl TransformDefinition for IntegerEncodingDefinition {
 
     fn transform(
         &self,
-        state: &Self::State,
+        state: &IntegerEncodingState,
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
         let mapping = &state.mapping;
-        if !inputs
-            .iter()
-            .map(|input| input.name())
-            .eq(state.names.iter())
-        {
-            return Err(TransformError::InvalidParameter(
-                "input column names differ from the fitted encoding".into(),
-            ));
-        }
-
         let input_frame = input_frame(inputs)?;
-        for column in input_frame.columns() {
-            if column.dtype() != mapping.column(column.name())?.dtype() {
-                return Err(TransformError::InputTypeMismatch);
-            }
-        }
         let keys = input_frame
             .columns()
             .iter()
@@ -126,7 +142,7 @@ mod tests {
         let input = [Column::new("f1".into(), ["a", "b"])];
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
     }
 
@@ -372,7 +388,7 @@ mod tests {
         for input in cases {
             assert!(
                 matches!(
-                    definition.transform(&transform, &input),
+                    definition.validate(&transform, &input),
                     Err(TransformError::InvalidParameter(_))
                 ),
                 "{input:?}"
@@ -396,7 +412,7 @@ mod tests {
 
         for input in cases {
             assert!(matches!(
-                definition.transform(&transform, &input),
+                definition.validate(&transform, &input),
                 Err(TransformError::InputTypeMismatch)
             ));
         }
@@ -458,10 +474,15 @@ mod tests {
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &first)?);
         let transform = transform.fit(&second)?;
 
-        assert_integer_output(&transform.transform(&input)?, &[None, Some(0), Some(1)]);
+        assert_integer_output(
+            &transform.transform(&input).unwrap(),
+            &[None, Some(0), Some(1)],
+        );
         assert!(matches!(
             transform.transform(&first),
-            Err(TransformError::InvalidParameter(_))
+            Err(crate::FitError::Definition(
+                TransformError::InvalidParameter(_)
+            ))
         ));
         Ok(())
     }
@@ -471,7 +492,7 @@ mod tests {
     -> Result<(), TransformError> {
         let training = [Column::new("f1".into(), ["a", "b"])];
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &training)?);
-        let original = transform.transform(&training)?;
+        let original = transform.transform(&training).unwrap();
         assert!(matches!(
             transform.fit(&[]),
             Err(TransformError::InvalidParameter(_))
@@ -482,8 +503,16 @@ mod tests {
             transform.fit(&unequal_lengths),
             Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
         ));
-        assert!(transform.transform(&training)?.equals_missing(&original));
-        assert_integer_output(&transform.transform(&training)?, &[Some(0), Some(1)]);
+        assert!(
+            transform
+                .transform(&training)
+                .unwrap()
+                .equals_missing(&original)
+        );
+        assert_integer_output(
+            &transform.transform(&training).unwrap(),
+            &[Some(0), Some(1)],
+        );
         Ok(())
     }
 }

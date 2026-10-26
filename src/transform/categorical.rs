@@ -1,5 +1,6 @@
 use super::input::{input_frame, validate_single_input};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use crate::fit::Definition;
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
@@ -73,8 +74,6 @@ impl CategoricalDefinition {
 }
 
 impl TransformDefinition for CategoricalDefinition {
-    type State = CategoricalState;
-
     fn expands(&self) -> bool {
         true
     }
@@ -82,8 +81,23 @@ impl TransformDefinition for CategoricalDefinition {
     fn argument_count(&self) -> ArgumentCount {
         ArgumentCount::Exactly(1)
     }
+}
 
-    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError> {
+impl Definition<CategoricalState> for CategoricalDefinition {
+    type Input = [Column];
+    type Output = DataFrame;
+    type Error = TransformError;
+
+    fn validate(&self, state: &CategoricalState, inputs: &[Column]) -> Result<(), TransformError> {
+        let input = validate_single_input(inputs)?;
+
+        if input.dtype() != state.levels.dtype() {
+            return Err(TransformError::InputTypeMismatch);
+        }
+
+        Ok(())
+    }
+    fn fit(&self, inputs: &[Column]) -> Result<CategoricalState, TransformError> {
         let levels = validate_single_input(inputs)?
             .drop_nulls()
             .unique_stable()?;
@@ -109,15 +123,13 @@ impl TransformDefinition for CategoricalDefinition {
 
     fn transform(
         &self,
-        state: &Self::State,
+        state: &CategoricalState,
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
-        let input = validate_single_input(inputs)?;
+        let input = &inputs[0]; // Already validated in Self::validate
         let levels = &state.levels;
-        if input.dtype() != levels.dtype() {
-            return Err(TransformError::InputTypeMismatch);
-        }
         let frame = input_frame(inputs)?;
+
         let argument = col(frame.columns()[0].name().clone());
         let reference = self.reference_for_dtype(input.dtype())?;
         let fitted_levels = (0..levels.len())
@@ -241,10 +253,10 @@ mod tests {
         assert!(transform.expands());
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
         let transform = transform.fit(&input)?;
-        let output = transform.transform(&input)?;
+        let output = transform.transform(&input).unwrap();
         let Transform::C(Fit::Fitted(categorical)) = &transform else {
             unreachable!();
         };
@@ -307,7 +319,7 @@ mod tests {
 
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
         assert!(matches!(
             transform.fit(&input),
@@ -315,7 +327,7 @@ mod tests {
         ));
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
     }
 
@@ -354,13 +366,18 @@ mod tests {
         let training = [Column::new("group".into(), ["a", "b"])];
         let invalid = [Column::new("group".into(), ["b", "c"])];
         let transform = Fit::Fitted(Fitted::fit(definition.clone(), &training)?);
-        let original = transform.transform(&training)?;
+        let original = transform.transform(&training).unwrap();
 
         assert!(matches!(
             transform.fit(&invalid),
             Err(TransformError::InvalidParameter(_))
         ));
-        assert!(transform.transform(&training)?.equals_missing(&original));
+        assert!(
+            transform
+                .transform(&training)
+                .unwrap()
+                .equals_missing(&original)
+        );
         assert_eq!(transform.definition(), &definition);
         Ok(())
     }
@@ -560,7 +577,7 @@ mod tests {
             let definition = CategoricalDefinition::new(reference);
             let transform = definition.fit(&training)?;
             assert!(matches!(
-                definition.transform(&transform, &input),
+                definition.validate(&transform, &input),
                 Err(TransformError::InputTypeMismatch)
             ));
         }
@@ -574,9 +591,14 @@ mod tests {
         let input = [Column::new("group".into(), ["a", "b", "c"])];
         let definition = CategoricalDefinition::new(None);
         let original = Fit::Fitted(Fitted::fit(definition, &first)?);
-        let original_output = original.transform(&input)?;
+        let original_output = original.transform(&input).unwrap();
         let transform = original.fit(&second)?;
-        assert!(original.transform(&input)?.equals_missing(&original_output));
+        assert!(
+            original
+                .transform(&input)
+                .unwrap()
+                .equals_missing(&original_output)
+        );
 
         let Fit::Fitted(transform) = transform else {
             panic!("expected a fitted categorical operation");

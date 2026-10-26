@@ -1,4 +1,5 @@
 use crate::Formula;
+use crate::fit::FitError;
 use crate::formula::{EvaluatedExpression, Expression, ValidationError, evaluate_terms};
 use crate::parse::{ParseResult, parse};
 use crate::transform::TransformError;
@@ -23,7 +24,7 @@ impl Model {
         &self.right
     }
 
-    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
         let terms = evaluate_terms(&[self.left().expression(), self.right().expression()], data)?;
         let left = self.left().expression().assemble(data.height(), &terms)?;
         let right = self.right().expression().assemble(data.height(), &terms)?;
@@ -72,7 +73,7 @@ impl Models {
             .flat_map(|(_, model)| [model.left.expression(), model.right.expression()])
     }
 
-    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
         let expressions: Vec<&Expression> = self.expressions().collect();
         let terms = evaluate_terms(&expressions, data)?;
 
@@ -83,7 +84,7 @@ impl Models {
                 let right = model.right().expression().assemble(data.height(), &terms)?;
                 Ok((formula.clone(), Model::new(left, right)))
             })
-            .collect::<Result<Vec<_>, MaterializationError>>()?;
+            .collect::<Result<Vec<_>, EvaluationError>>()?;
         Ok(Self { entries })
     }
 }
@@ -98,20 +99,27 @@ impl<'a> IntoIterator for &'a Models {
 }
 
 #[derive(Debug)]
-pub enum MaterializationError {
+pub enum EvaluationError {
     Validation(ValidationError),
     Transform(TransformError),
+    Fit(FitError<TransformError>),
 }
 
-impl From<ValidationError> for MaterializationError {
+impl From<ValidationError> for EvaluationError {
     fn from(error: ValidationError) -> Self {
         Self::Validation(error)
     }
 }
 
-impl From<TransformError> for MaterializationError {
+impl From<TransformError> for EvaluationError {
     fn from(error: TransformError) -> Self {
         Self::Transform(error)
+    }
+}
+
+impl From<FitError<TransformError>> for EvaluationError {
+    fn from(error: FitError<TransformError>) -> Self {
+        Self::Fit(error)
     }
 }
 

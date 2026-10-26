@@ -1,5 +1,5 @@
-use crate::fit::{Fit, Fitted};
-use crate::model::{MaterializationError, Model, Models};
+use crate::fit::{Definition, Fit};
+use crate::model::{EvaluationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError, validate_numeric_input};
 use polars::prelude::{Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::sync::Arc;
@@ -26,6 +26,35 @@ pub(crate) struct VariableDefinition {
 #[derive(Debug)]
 pub(crate) struct VariableState {
     dtype: DataType,
+}
+
+impl Definition<VariableState> for VariableDefinition {
+    type Input = Column;
+    type Output = Column;
+    type Error = TransformError;
+
+    fn fit(&self, input: &Column) -> Result<VariableState, TransformError> {
+        Ok(VariableState {
+            dtype: input.dtype().clone(),
+        })
+    }
+
+    fn validate(&self, state: &VariableState, input: &Column) -> Result<(), TransformError> {
+        if input.dtype() != &state.dtype {
+            return Err(TransformError::DtypeMismatch(format!(
+                "column `{}`: expected {}, received {}",
+                self.name,
+                state.dtype,
+                input.dtype(),
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn transform(&self, _state: &VariableState, input: &Column) -> Result<Column, TransformError> {
+        Ok(input.clone())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -261,7 +290,7 @@ impl Expression {
         &self,
         height: usize,
         evaluated: &[EvaluatedTerm],
-    ) -> Result<EvaluatedExpression, MaterializationError> {
+    ) -> Result<EvaluatedExpression, EvaluationError> {
         let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
         for term in &self.terms {
@@ -280,16 +309,13 @@ impl Expression {
         Ok(EvaluatedExpression::new(expression, frame))
     }
 
-    pub fn materialize(
-        &self,
-        data: &DataFrame,
-    ) -> Result<EvaluatedExpression, MaterializationError> {
+    pub fn materialize(&self, data: &DataFrame) -> Result<EvaluatedExpression, EvaluationError> {
         self.validate()?;
         let terms = fit_and_evaluate_terms(&[self], data)?;
         self.assemble(data.height(), &terms)
     }
 
-    fn evaluate(&self, data: &DataFrame) -> Result<EvaluatedExpression, MaterializationError> {
+    fn evaluate(&self, data: &DataFrame) -> Result<EvaluatedExpression, EvaluationError> {
         let terms = evaluate_terms(&[self], data)?;
         self.assemble(data.height(), &terms)
     }
@@ -354,7 +380,7 @@ impl Formula {
         self.right.validate()
     }
 
-    pub fn materialize(&self, data: &DataFrame) -> Result<Model, MaterializationError> {
+    pub fn materialize(&self, data: &DataFrame) -> Result<Model, EvaluationError> {
         self.validate()?;
         let terms = fit_and_evaluate_terms(&[&self.left, &self.right], data)?;
         let dependent = self.left.assemble(data.height(), &terms)?;
@@ -378,7 +404,7 @@ impl Specification {
         &self.formulas
     }
 
-    pub fn materialize(&self, data: &DataFrame) -> Result<Models, MaterializationError> {
+    pub fn materialize(&self, data: &DataFrame) -> Result<Models, EvaluationError> {
         for formula in &self.formulas {
             formula.validate()?;
         }
@@ -399,7 +425,7 @@ impl Specification {
                 let independent = formula.right.assemble(data.height(), &terms)?;
                 Ok((formula.clone(), Model::new(dependent, independent)))
             })
-            .collect::<Result<Vec<_>, MaterializationError>>()?;
+            .collect::<Result<Vec<_>, EvaluationError>>()?;
 
         Ok(Models::new(entries))
     }
@@ -434,7 +460,7 @@ impl EvaluatedExpression {
     fn new(expression: Expression, frame: DataFrame) -> Self {
         Self { expression, frame }
     }
-    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, MaterializationError> {
+    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
         self.expression.evaluate(data)
     }
     pub fn expression(&self) -> &Expression {
@@ -453,7 +479,7 @@ fn literal_column(value: &Scalar, height: usize) -> Column {
 fn fit_and_evaluate_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedFactor>, TransformError> {
+) -> Result<Vec<EvaluatedFactor>, EvaluationError> {
     let mut evaluated = Vec::with_capacity(scheduled.len());
 
     for factor in scheduled {
@@ -463,16 +489,16 @@ fn fit_and_evaluate_factors(
                 columns: vec![literal_column(value, data.height())],
             },
             Factor::Variable(variable) => {
-                let definition = variable.definition();
-                let column = data.column(&definition.name)?;
-                let state = VariableState {
-                    dtype: column.dtype().clone(),
-                };
-                let fitted = Fitted::new(definition.clone(), state);
+                let column = data
+                    .column(&variable.definition().name)
+                    .map_err(TransformError::from)?;
+
+                let fitted = variable.fit(column)?;
+                let output = fitted.transform(column)?;
 
                 EvaluatedFactor {
-                    factor: Arc::new(Factor::Variable(Fit::Fitted(fitted))),
-                    columns: vec![column.clone()],
+                    factor: Arc::new(Factor::Variable(fitted)),
+                    columns: vec![output],
                 }
             }
             Factor::Call {
@@ -507,7 +533,7 @@ fn fit_and_evaluate_factors(
 fn evaluate_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedFactor>, TransformError> {
+) -> Result<Vec<EvaluatedFactor>, EvaluationError> {
     let mut evaluated = Vec::with_capacity(scheduled.len());
 
     for factor in scheduled {
@@ -516,22 +542,11 @@ fn evaluate_factors(
                 vec![literal_column(value, data.height())]
             }
             Factor::Variable(variable) => {
-                let Fit::Fitted(fitted) = variable else {
-                    return Err(TransformError::NotFitted);
-                };
+                let column = data
+                    .column(&variable.definition().name)
+                    .map_err(TransformError::from)?;
 
-                let column = data.column(&fitted.definition.name)?;
-
-                if column.dtype() != &fitted.state.dtype {
-                    return Err(TransformError::DtypeMismatch(format!(
-                        "column `{}`: expected {}, received {}",
-                        fitted.definition.name,
-                        fitted.state.dtype,
-                        column.dtype(),
-                    )));
-                }
-
-                vec![column.clone()]
+                vec![variable.transform(column)?]
             }
             Factor::Call {
                 transform,
@@ -604,19 +619,19 @@ fn assemble_terms(
 pub(crate) fn evaluate_terms(
     expressions: &[&Expression],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedTerm>, TransformError> {
+) -> Result<Vec<EvaluatedTerm>, EvaluationError> {
     let scheduled = schedule_factors(expressions);
     let factors = evaluate_factors(&scheduled, data)?;
-    assemble_terms(expressions, data.height(), &factors)
+    Ok(assemble_terms(expressions, data.height(), &factors)?)
 }
 
 fn fit_and_evaluate_terms(
     expressions: &[&Expression],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedTerm>, TransformError> {
+) -> Result<Vec<EvaluatedTerm>, EvaluationError> {
     let scheduled = schedule_factors(expressions);
     let factors = fit_and_evaluate_factors(&scheduled, data)?;
-    assemble_terms(expressions, data.height(), &factors)
+    Ok(assemble_terms(expressions, data.height(), &factors)?)
 }
 
 fn lookup_factor<'a>(
@@ -639,11 +654,9 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fit::Fit;
+    use crate::fit::{Definition, Fit};
     use crate::parse::parse_expression;
-    use crate::transform::{
-        CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
-    };
+    use crate::transform::{CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition};
     use polars::prelude::Scalar;
     use winnow::Parser;
 
@@ -823,7 +836,7 @@ mod tests {
             ("y ~ x:flag", "flag"),
         ] {
             let specification = crate::parse(source).unwrap();
-            let Err(MaterializationError::Transform(TransformError::NonNumericInput(message))) =
+            let Err(EvaluationError::Transform(TransformError::NonNumericInput(message))) =
                 specification.materialize(&data)
             else {
                 panic!("expected NonNumericInput for `{source}`");
@@ -907,8 +920,8 @@ mod tests {
                     model.evaluate(input).map(|_| ()),
                     model.right().evaluate(input).map(|_| ()),
                 ] {
-                    let Err(MaterializationError::Transform(TransformError::DtypeMismatch(
-                        message,
+                    let Err(EvaluationError::Fit(crate::FitError::Definition(
+                        TransformError::DtypeMismatch(message),
                     ))) = result
                     else {
                         panic!("expected DtypeMismatch for `{source}`");
@@ -948,7 +961,7 @@ mod tests {
         TRANSFORM_CALLS.set((0, 0));
         assert!(matches!(
             specification.materialize(&data),
-            Err(MaterializationError::Validation(
+            Err(EvaluationError::Validation(
                 ValidationError::InvalidArgumentCount { .. }
             ))
         ));
@@ -1588,7 +1601,7 @@ mod tests {
             crate::parse("y ~ Intercept").unwrap().formulas()[0]
                 .clone()
                 .materialize(&data),
-            Err(MaterializationError::Transform(TransformError::Polars(
+            Err(EvaluationError::Transform(TransformError::Polars(
                 polars::error::PolarsError::Duplicate(_)
             )))
         ));

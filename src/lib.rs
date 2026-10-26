@@ -5,6 +5,7 @@ mod parse;
 mod transform;
 
 pub use self::formula::{EvaluatedExpression, Expression, Formula, Specification, ValidationError};
-pub use model::{MaterializationError, Model, Models};
+pub use fit::FitError;
+pub use model::{EvaluationError, Model, Models};
 pub use parse::{parse, parse_many};
 pub use transform::{ArgumentCount, TransformError};
