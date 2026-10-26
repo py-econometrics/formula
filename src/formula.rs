@@ -641,11 +641,9 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fit::Fit;
+    use crate::fit::{Definition, Fit};
     use crate::parse::parse_expression;
-    use crate::transform::{
-        CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, TransformDefinition,
-    };
+    use crate::transform::{CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition};
     use polars::prelude::Scalar;
     use winnow::Parser;
 

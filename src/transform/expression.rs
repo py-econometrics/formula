@@ -1,5 +1,5 @@
 use super::input::{input_frame, validate_numeric_input};
-use super::{ArgumentCount, TransformError, call_name};
+use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use polars::error::PolarsError;
 use polars::prelude::{Column, DataFrame, DataType, Expr, IntoLazy, PlSmallStr, col, lit};
 
@@ -135,15 +135,17 @@ impl ExpressionTransform {
     }
 }
 
-impl ExpressionTransform {
-    pub(crate) fn expands(&self) -> bool {
+impl TransformDefinition for ExpressionTransform {
+    fn expands(&self) -> bool {
         false
     }
 
-    pub(crate) fn argument_count(&self) -> ArgumentCount {
+    fn argument_count(&self) -> ArgumentCount {
         self.argument_count
     }
+}
 
+impl ExpressionTransform {
     pub(crate) fn fit(&self) -> Self {
         self.clone()
     }

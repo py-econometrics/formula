@@ -1,5 +1,6 @@
 use super::input::{argument_column_name, input_frame};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use crate::fit::Definition;
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
     Column, DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, all_horizontal,
@@ -20,8 +21,6 @@ impl IntegerEncodingDefinition {
 }
 
 impl TransformDefinition for IntegerEncodingDefinition {
-    type State = IntegerEncodingState;
-
     fn expands(&self) -> bool {
         false
     }
@@ -29,8 +28,39 @@ impl TransformDefinition for IntegerEncodingDefinition {
     fn argument_count(&self) -> ArgumentCount {
         ArgumentCount::AtLeast(1)
     }
+}
 
-    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError> {
+impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
+    type Input = [Column];
+    type Output = DataFrame;
+    type Error = TransformError;
+
+    fn validate(
+        &self,
+        state: &IntegerEncodingState,
+        inputs: &[Column],
+    ) -> Result<(), TransformError> {
+        if !inputs
+            .iter()
+            .map(|input| input.name())
+            .eq(state.names.iter())
+        {
+            return Err(TransformError::InvalidParameter(
+                "input column names differ from the fitted encoding".into(),
+            ));
+        }
+
+        let input_frame = input_frame(inputs)?;
+        for column in input_frame.columns() {
+            if column.dtype() != state.mapping.column(column.name())?.dtype() {
+                return Err(TransformError::InputTypeMismatch);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fit(&self, inputs: &[Column]) -> Result<IntegerEncodingState, TransformError> {
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -59,26 +89,11 @@ impl TransformDefinition for IntegerEncodingDefinition {
 
     fn transform(
         &self,
-        state: &Self::State,
+        state: &IntegerEncodingState,
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
         let mapping = &state.mapping;
-        if !inputs
-            .iter()
-            .map(|input| input.name())
-            .eq(state.names.iter())
-        {
-            return Err(TransformError::InvalidParameter(
-                "input column names differ from the fitted encoding".into(),
-            ));
-        }
-
         let input_frame = input_frame(inputs)?;
-        for column in input_frame.columns() {
-            if column.dtype() != mapping.column(column.name())?.dtype() {
-                return Err(TransformError::InputTypeMismatch);
-            }
-        }
         let keys = input_frame
             .columns()
             .iter()
@@ -372,7 +387,7 @@ mod tests {
         for input in cases {
             assert!(
                 matches!(
-                    definition.transform(&transform, &input),
+                    definition.validate(&transform, &input),
                     Err(TransformError::InvalidParameter(_))
                 ),
                 "{input:?}"
@@ -396,7 +411,7 @@ mod tests {
 
         for input in cases {
             assert!(matches!(
-                definition.transform(&transform, &input),
+                definition.validate(&transform, &input),
                 Err(TransformError::InputTypeMismatch)
             ));
         }

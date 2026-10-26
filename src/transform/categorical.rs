@@ -1,5 +1,6 @@
 use super::input::{input_frame, validate_single_input};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use crate::fit::Definition;
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
@@ -73,8 +74,6 @@ impl CategoricalDefinition {
 }
 
 impl TransformDefinition for CategoricalDefinition {
-    type State = CategoricalState;
-
     fn expands(&self) -> bool {
         true
     }
@@ -82,8 +81,23 @@ impl TransformDefinition for CategoricalDefinition {
     fn argument_count(&self) -> ArgumentCount {
         ArgumentCount::Exactly(1)
     }
+}
 
-    fn fit(&self, inputs: &[Column]) -> Result<Self::State, TransformError> {
+impl Definition<CategoricalState> for CategoricalDefinition {
+    type Input = [Column];
+    type Output = DataFrame;
+    type Error = TransformError;
+
+    fn validate(&self, state: &CategoricalState, inputs: &[Column]) -> Result<(), TransformError> {
+        let input = validate_single_input(inputs)?;
+
+        if input.dtype() != state.levels.dtype() {
+            return Err(TransformError::InputTypeMismatch);
+        }
+
+        Ok(())
+    }
+    fn fit(&self, inputs: &[Column]) -> Result<CategoricalState, TransformError> {
         let levels = validate_single_input(inputs)?
             .drop_nulls()
             .unique_stable()?;
@@ -109,15 +123,13 @@ impl TransformDefinition for CategoricalDefinition {
 
     fn transform(
         &self,
-        state: &Self::State,
+        state: &CategoricalState,
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
-        let input = validate_single_input(inputs)?;
+        let input = &inputs[0]; // Already validated in Self::validate
         let levels = &state.levels;
-        if input.dtype() != levels.dtype() {
-            return Err(TransformError::InputTypeMismatch);
-        }
         let frame = input_frame(inputs)?;
+
         let argument = col(frame.columns()[0].name().clone());
         let reference = self.reference_for_dtype(input.dtype())?;
         let fitted_levels = (0..levels.len())
@@ -565,7 +577,7 @@ mod tests {
             let definition = CategoricalDefinition::new(reference);
             let transform = definition.fit(&training)?;
             assert!(matches!(
-                definition.transform(&transform, &input),
+                definition.validate(&transform, &input),
                 Err(TransformError::InputTypeMismatch)
             ));
         }
