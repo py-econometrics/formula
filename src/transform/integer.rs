@@ -105,7 +105,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
 mod tests {
     use super::super::input::argument_column_name;
     use super::*;
-    use crate::fit::{Fit, Fitted};
+    use crate::fit::{Fit, FitError, Fitted};
     use polars::error::PolarsError;
 
     fn assert_integer_output(actual: &DataFrame, expected: &[Option<u32>]) {
@@ -126,7 +126,7 @@ mod tests {
         let input = [Column::new("f1".into(), ["a", "b"])];
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(FitError::NotFitted)
         ));
     }
 
@@ -458,10 +458,13 @@ mod tests {
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &first)?);
         let transform = transform.fit(&second)?;
 
-        assert_integer_output(&transform.transform(&input)?, &[None, Some(0), Some(1)]);
+        assert_integer_output(
+            &transform.transform(&input).unwrap(),
+            &[None, Some(0), Some(1)],
+        );
         assert!(matches!(
             transform.transform(&first),
-            Err(TransformError::InvalidParameter(_))
+            Err(FitError::Definition(TransformError::InvalidParameter(_)))
         ));
         Ok(())
     }
@@ -471,7 +474,7 @@ mod tests {
     -> Result<(), TransformError> {
         let training = [Column::new("f1".into(), ["a", "b"])];
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &training)?);
-        let original = transform.transform(&training)?;
+        let original = transform.transform(&training).unwrap();
         assert!(matches!(
             transform.fit(&[]),
             Err(TransformError::InvalidParameter(_))
@@ -482,8 +485,16 @@ mod tests {
             transform.fit(&unequal_lengths),
             Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
         ));
-        assert!(transform.transform(&training)?.equals_missing(&original));
-        assert_integer_output(&transform.transform(&training)?, &[Some(0), Some(1)]);
+        assert!(
+            transform
+                .transform(&training)
+                .unwrap()
+                .equals_missing(&original)
+        );
+        assert_integer_output(
+            &transform.transform(&training).unwrap(),
+            &[Some(0), Some(1)],
+        );
         Ok(())
     }
 }

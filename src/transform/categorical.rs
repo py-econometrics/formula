@@ -165,7 +165,7 @@ pub(crate) struct CategoricalState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fit::{Fit, Fitted};
+    use crate::fit::{Fit, FitError, Fitted};
     use crate::transform::Transform;
 
     #[test]
@@ -241,10 +241,10 @@ mod tests {
         assert!(transform.expands());
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(FitError::NotFitted)
         ));
         let transform = transform.fit(&input)?;
-        let output = transform.transform(&input)?;
+        let output = transform.transform(&input).unwrap();
         let Transform::C(Fit::Fitted(categorical)) = &transform else {
             unreachable!();
         };
@@ -307,7 +307,7 @@ mod tests {
 
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(FitError::NotFitted)
         ));
         assert!(matches!(
             transform.fit(&input),
@@ -315,7 +315,7 @@ mod tests {
         ));
         assert!(matches!(
             transform.transform(&input),
-            Err(TransformError::NotFitted)
+            Err(FitError::NotFitted)
         ));
     }
 
@@ -354,13 +354,18 @@ mod tests {
         let training = [Column::new("group".into(), ["a", "b"])];
         let invalid = [Column::new("group".into(), ["b", "c"])];
         let transform = Fit::Fitted(Fitted::fit(definition.clone(), &training)?);
-        let original = transform.transform(&training)?;
+        let original = transform.transform(&training).unwrap();
 
         assert!(matches!(
             transform.fit(&invalid),
             Err(TransformError::InvalidParameter(_))
         ));
-        assert!(transform.transform(&training)?.equals_missing(&original));
+        assert!(
+            transform
+                .transform(&training)
+                .unwrap()
+                .equals_missing(&original)
+        );
         assert_eq!(transform.definition(), &definition);
         Ok(())
     }
@@ -574,9 +579,14 @@ mod tests {
         let input = [Column::new("group".into(), ["a", "b", "c"])];
         let definition = CategoricalDefinition::new(None);
         let original = Fit::Fitted(Fitted::fit(definition, &first)?);
-        let original_output = original.transform(&input)?;
+        let original_output = original.transform(&input).unwrap();
         let transform = original.fit(&second)?;
-        assert!(original.transform(&input)?.equals_missing(&original_output));
+        assert!(
+            original
+                .transform(&input)
+                .unwrap()
+                .equals_missing(&original_output)
+        );
 
         let Fit::Fitted(transform) = transform else {
             panic!("expected a fitted categorical operation");

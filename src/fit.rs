@@ -1,3 +1,21 @@
+pub(crate) trait Definition<S> {
+    type Input: ?Sized;
+    type Output;
+    type Error;
+
+    fn fit(&self, input: &Self::Input) -> Result<S, Self::Error>;
+
+    fn validate(&self, state: &S, input: &Self::Input) -> Result<(), Self::Error>;
+
+    fn transform(&self, state: &S, input: &Self::Input) -> Result<Self::Output, Self::Error>;
+}
+
+#[derive(Debug)]
+pub enum FitError<E> {
+    NotFitted,
+    Definition(E),
+}
+
 #[derive(Debug)]
 pub(crate) enum Fit<D, S> {
     Unfitted(D),

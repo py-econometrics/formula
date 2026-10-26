@@ -177,6 +177,7 @@ impl ExpressionTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fit::FitError;
     use crate::parse::parse_expression;
     use crate::transform::Transform;
     use winnow::Parser;
@@ -363,7 +364,7 @@ mod tests {
             assert!(
                 matches!(
                     expression.materialize(&data),
-                    Err(crate::MaterializationError::Validation(
+                    Err(crate::EvaluationError::Validation(
                         crate::ValidationError::InvalidArgumentCount { .. }
                     ))
                 ),
@@ -413,7 +414,7 @@ mod tests {
         assert!(!transform.expands());
         let transform = transform.fit(&input)?;
         assert_numeric_output(
-            &transform.transform(&input)?,
+            &transform.transform(&input).unwrap(),
             "log(x)",
             &[Some(0.0), Some(1.0), None],
         );
@@ -431,7 +432,7 @@ mod tests {
         assert!(!transform.expands());
         let transform = transform.fit(&input)?;
         assert_numeric_output(
-            &transform.transform(&input)?,
+            &transform.transform(&input).unwrap(),
             "exp(x)",
             &[
                 Some(1.0),
@@ -456,12 +457,16 @@ mod tests {
 
         for input in cases {
             assert_numeric_output(
-                &Transform::Expression(ExpressionTransform::LOG).transform(&input)?,
+                &Transform::Expression(ExpressionTransform::LOG)
+                    .transform(&input)
+                    .unwrap(),
                 "log(x)",
                 &[Some(0.0), Some(std::f64::consts::LN_2)],
             );
             assert_numeric_output(
-                &Transform::Expression(ExpressionTransform::EXP).transform(&input)?,
+                &Transform::Expression(ExpressionTransform::EXP)
+                    .transform(&input)
+                    .unwrap(),
                 "exp(x)",
                 &[Some(std::f64::consts::E), Some(std::f64::consts::E.powi(2))],
             );
@@ -484,7 +489,7 @@ mod tests {
                 let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
-                    Err(TransformError::NonNumericInput(_))
+                    Err(FitError::Definition(TransformError::NonNumericInput(_)))
                 ));
             }
         }
@@ -499,8 +504,12 @@ mod tests {
             (Transform::Expression(ExpressionTransform::LOG), "log(x)"),
             (Transform::Expression(ExpressionTransform::EXP), "exp(x)"),
         ] {
-            assert_numeric_output(&transform.transform(&empty)?, name, &[]);
-            assert_numeric_output(&transform.transform(&all_null)?, name, &[None, None]);
+            assert_numeric_output(&transform.transform(&empty).unwrap(), name, &[]);
+            assert_numeric_output(
+                &transform.transform(&all_null).unwrap(),
+                name,
+                &[None, None],
+            );
         }
         Ok(())
     }
@@ -510,14 +519,18 @@ mod tests {
     {
         let input = [Column::new("x".into(), [-1.0_f64, 0.0, 1.0])];
         assert_numeric_output(
-            &Transform::Expression(ExpressionTransform::LOG).transform(&input)?,
+            &Transform::Expression(ExpressionTransform::LOG)
+                .transform(&input)
+                .unwrap(),
             "log(x)",
             &[Some(f64::NAN), Some(f64::NEG_INFINITY), Some(0.0)],
         );
 
         let input = [Column::new("x".into(), [1000.0_f64])];
         assert_numeric_output(
-            &Transform::Expression(ExpressionTransform::EXP).transform(&input)?,
+            &Transform::Expression(ExpressionTransform::EXP)
+                .transform(&input)
+                .unwrap(),
             "exp(x)",
             &[Some(f64::INFINITY)],
         );
