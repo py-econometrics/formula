@@ -1,4 +1,4 @@
-use crate::fit::{Fit, FitError, Fitted};
+use crate::fit::{Definition, Fit};
 use crate::model::{EvaluationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError, validate_numeric_input};
 use polars::prelude::{Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -26,6 +26,35 @@ pub(crate) struct VariableDefinition {
 #[derive(Debug)]
 pub(crate) struct VariableState {
     dtype: DataType,
+}
+
+impl Definition<VariableState> for VariableDefinition {
+    type Input = Column;
+    type Output = Column;
+    type Error = TransformError;
+
+    fn fit(&self, input: &Column) -> Result<VariableState, TransformError> {
+        Ok(VariableState {
+            dtype: input.dtype().clone(),
+        })
+    }
+
+    fn validate(&self, state: &VariableState, input: &Column) -> Result<(), TransformError> {
+        if input.dtype() != &state.dtype {
+            return Err(TransformError::DtypeMismatch(format!(
+                "column `{}`: expected {}, received {}",
+                self.name,
+                state.dtype,
+                input.dtype(),
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn transform(&self, _state: &VariableState, input: &Column) -> Result<Column, TransformError> {
+        Ok(input.clone())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -460,18 +489,16 @@ fn fit_and_evaluate_factors(
                 columns: vec![literal_column(value, data.height())],
             },
             Factor::Variable(variable) => {
-                let definition = variable.definition();
                 let column = data
-                    .column(&definition.name)
+                    .column(&variable.definition().name)
                     .map_err(TransformError::from)?;
-                let state = VariableState {
-                    dtype: column.dtype().clone(),
-                };
-                let fitted = Fitted::new(definition.clone(), state);
+
+                let fitted = variable.fit(column)?;
+                let output = fitted.transform(column)?;
 
                 EvaluatedFactor {
-                    factor: Arc::new(Factor::Variable(Fit::Fitted(fitted))),
-                    columns: vec![column.clone()],
+                    factor: Arc::new(Factor::Variable(fitted)),
+                    columns: vec![output],
                 }
             }
             Factor::Call {
@@ -515,25 +542,11 @@ fn evaluate_factors(
                 vec![literal_column(value, data.height())]
             }
             Factor::Variable(variable) => {
-                let Fit::Fitted(fitted) = variable else {
-                    return Err(EvaluationError::Fit(FitError::NotFitted));
-                };
-
                 let column = data
-                    .column(&fitted.definition.name)
+                    .column(&variable.definition().name)
                     .map_err(TransformError::from)?;
 
-                if column.dtype() != &fitted.state.dtype {
-                    return Err(TransformError::DtypeMismatch(format!(
-                        "column `{}`: expected {}, received {}",
-                        fitted.definition.name,
-                        fitted.state.dtype,
-                        column.dtype(),
-                    ))
-                    .into());
-                }
-
-                vec![column.clone()]
+                vec![variable.transform(column)?]
             }
             Factor::Call {
                 transform,
@@ -907,8 +920,9 @@ mod tests {
                     model.evaluate(input).map(|_| ()),
                     model.right().evaluate(input).map(|_| ()),
                 ] {
-                    let Err(EvaluationError::Transform(TransformError::DtypeMismatch(message))) =
-                        result
+                    let Err(EvaluationError::Fit(crate::FitError::Definition(
+                        TransformError::DtypeMismatch(message),
+                    ))) = result
                     else {
                         panic!("expected DtypeMismatch for `{source}`");
                     };

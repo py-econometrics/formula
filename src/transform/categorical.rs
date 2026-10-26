@@ -177,7 +177,7 @@ pub(crate) struct CategoricalState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fit::{Fit, FitError, Fitted};
+    use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
 
     #[test]
@@ -253,7 +253,7 @@ mod tests {
         assert!(transform.expands());
         assert!(matches!(
             transform.transform(&input),
-            Err(FitError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
         let transform = transform.fit(&input)?;
         let output = transform.transform(&input).unwrap();
@@ -319,7 +319,7 @@ mod tests {
 
         assert!(matches!(
             transform.transform(&input),
-            Err(FitError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
         assert!(matches!(
             transform.fit(&input),
@@ -327,7 +327,7 @@ mod tests {
         ));
         assert!(matches!(
             transform.transform(&input),
-            Err(FitError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
     }
 

@@ -50,9 +50,10 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
             ));
         }
 
-        let input_frame = input_frame(inputs)?;
-        for column in input_frame.columns() {
-            if column.dtype() != state.mapping.column(column.name())?.dtype() {
+        for (index, input) in inputs.iter().enumerate() {
+            let expected = state.mapping.column(&argument_column_name(index))?.dtype();
+
+            if input.dtype() != expected {
                 return Err(TransformError::InputTypeMismatch);
             }
         }
@@ -120,7 +121,7 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
 mod tests {
     use super::super::input::argument_column_name;
     use super::*;
-    use crate::fit::{Fit, FitError, Fitted};
+    use crate::fit::{Fit, Fitted};
     use polars::error::PolarsError;
 
     fn assert_integer_output(actual: &DataFrame, expected: &[Option<u32>]) {
@@ -141,7 +142,7 @@ mod tests {
         let input = [Column::new("f1".into(), ["a", "b"])];
         assert!(matches!(
             transform.transform(&input),
-            Err(FitError::NotFitted)
+            Err(crate::FitError::NotFitted)
         ));
     }
 
@@ -479,7 +480,9 @@ mod tests {
         );
         assert!(matches!(
             transform.transform(&first),
-            Err(FitError::Definition(TransformError::InvalidParameter(_)))
+            Err(crate::FitError::Definition(
+                TransformError::InvalidParameter(_)
+            ))
         ));
         Ok(())
     }

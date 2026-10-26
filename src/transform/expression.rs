@@ -179,7 +179,6 @@ impl ExpressionTransform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fit::FitError;
     use crate::parse::parse_expression;
     use crate::transform::Transform;
     use winnow::Parser;
@@ -491,7 +490,9 @@ mod tests {
                 let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
-                    Err(FitError::Definition(TransformError::NonNumericInput(_)))
+                    Err(crate::FitError::Definition(
+                        TransformError::NonNumericInput(_)
+                    ))
                 ));
             }
         }

@@ -13,7 +13,7 @@ pub(crate) trait Definition<S> {
 impl<D: Definition<S>, S> Fitted<D, S> {
     pub(crate) fn fit(definition: D, input: &D::Input) -> Result<Self, D::Error> {
         let state = definition.fit(input)?;
-        Ok(Self::new(definition, state))
+        Ok(Self { definition, state })
     }
 
     pub(crate) fn transform(&self, input: &D::Input) -> Result<D::Output, D::Error> {
@@ -54,12 +54,6 @@ pub(crate) enum Fit<D, S> {
 pub(crate) struct Fitted<D, S> {
     pub(crate) definition: D,
     pub(crate) state: S,
-}
-
-impl<D, S> Fitted<D, S> {
-    pub(crate) fn new(definition: D, state: S) -> Self {
-        Self { definition, state }
-    }
 }
 
 impl<D, S> Fit<D, S> {
