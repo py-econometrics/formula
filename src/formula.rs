@@ -41,7 +41,11 @@ impl Definition<VariableState> for VariableDefinition {
 
     fn validate(&self, state: &VariableState, input: &Column) -> Result<(), TransformError> {
         if input.dtype() != &state.dtype {
-            return Err(TransformError::input_type_mismatch(input, &state.dtype));
+            return Err(TransformError::InputTypeMismatch {
+                name: input.name().clone(),
+                expected: state.dtype.to_string(),
+                actual: input.dtype().to_string(),
+            });
         }
 
         Ok(())
@@ -82,6 +86,7 @@ impl Factor {
 
                 if !expected.accepts(arguments.len()) {
                     return Err(ValidationError::InvalidArgumentCount {
+                        transform: transform.name(),
                         expected,
                         actual: arguments.len(),
                     });
@@ -429,6 +434,7 @@ impl Specification {
 #[derive(Debug)]
 pub enum ValidationError {
     InvalidArgumentCount {
+        transform: &'static str,
         expected: ArgumentCount,
         actual: usize,
     },
@@ -668,15 +674,14 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidArgumentCount { expected, actual } => {
-                let (requirement, count) = match expected {
-                    ArgumentCount::Exactly(count) => ("exactly", count),
-                    ArgumentCount::AtLeast(count) => ("at least", count),
-                };
-
+            Self::InvalidArgumentCount {
+                transform,
+                expected,
+                actual,
+            } => {
                 write!(
                     f,
-                    "invalid argument count: expected {requirement} {count}, received {actual}",
+                    "{transform}: invalid argument count: expected {expected}, received {actual}",
                 )
             }
             Self::InvalidTransformComposition => {
@@ -873,13 +878,14 @@ mod tests {
             ("y ~ x:flag", "flag"),
         ] {
             let specification = crate::parse(source).unwrap();
-            let Err(EvaluationError::Transform(TransformError::NonNumericInput(message))) =
+            let Err(EvaluationError::Transform(TransformError::NonNumericInput { name, actual })) =
                 specification.materialize(&data)
             else {
                 panic!("expected NonNumericInput for `{source}`");
             };
 
-            assert!(message.contains(&format!("`{column}`")), "{message}");
+            assert_eq!(name.as_str(), column);
+            assert_eq!(actual, data.column(column).unwrap().dtype().to_string());
         }
     }
 
@@ -1032,14 +1038,14 @@ mod tests {
                     model.right().evaluate(input).map(|_| ()),
                 ] {
                     let Err(EvaluationError::Fit(crate::FitError::Evaluation(
-                        TransformError::InputTypeMismatch(error),
+                        error @ TransformError::InputTypeMismatch { .. },
                     ))) = result
                     else {
                         panic!("expected InputTypeMismatch for `{source}`");
                     };
 
                     assert_eq!(
-                        error,
+                        error.to_string(),
                         format!(
                             "input `x`: expected {}, received {}",
                             DataType::Int32,
@@ -1059,6 +1065,40 @@ mod tests {
             .materialize(&data)
             .unwrap();
         assert!(models.is_empty());
+    }
+
+    #[test]
+    fn argument_count_errors_identify_the_failing_transform_before_evaluation() {
+        let data = DataFrame::default();
+        for (source, expected) in [
+            (
+                "y ~ log(x) + add(x)",
+                "add: invalid argument count: expected at least 2, received 1",
+            ),
+            (
+                "y ~ exp(log(x, x))",
+                "log: invalid argument count: expected exactly 1, received 2",
+            ),
+            (
+                "y ~ C(x, x)",
+                "C: invalid argument count: expected exactly 1, received 2",
+            ),
+            (
+                "y ~ F()",
+                "F: invalid argument count: expected at least 1, received 0",
+            ),
+        ] {
+            let error = crate::parse(source)
+                .unwrap()
+                .materialize(&data)
+                .err()
+                .unwrap();
+            assert!(matches!(
+                error,
+                EvaluationError::Validation(ValidationError::InvalidArgumentCount { .. })
+            ));
+            assert_eq!(error.to_string(), expected, "{source}");
+        }
     }
 
     #[test]
@@ -1810,6 +1850,7 @@ mod tests {
                         Err(ValidationError::InvalidArgumentCount {
                             expected: ArgumentCount::Exactly(1),
                             actual,
+                            ..
                         }) if actual == count
                     ),
                     "{factor:?}: expected an argument-count error, got {result:?}",
@@ -1853,6 +1894,7 @@ mod tests {
                 assert!(matches!(
                     result,
                     Err(ValidationError::InvalidArgumentCount {
+                        transform: "F",
                         expected: ArgumentCount::AtLeast(1),
                         actual: 0,
                     })

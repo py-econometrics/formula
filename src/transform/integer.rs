@@ -45,10 +45,10 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         inputs: &[Column],
     ) -> Result<(), TransformError> {
         if inputs.len() != state.names.len() {
-            return Err(TransformError::input_count_mismatch(
-                ArgumentCount::Exactly(state.names.len()),
-                inputs.len(),
-            ));
+            return Err(TransformError::InputCountMismatch {
+                expected: ArgumentCount::Exactly(state.names.len()),
+                actual: inputs.len(),
+            });
         }
 
         if !inputs
@@ -56,14 +56,21 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
             .map(|input| input.name())
             .eq(state.names.iter())
         {
-            return Err(TransformError::input_names_mismatch(&state.names, inputs));
+            return Err(TransformError::InputNamesMismatch {
+                expected: state.names.clone(),
+                actual: inputs.iter().map(|input| input.name().clone()).collect(),
+            });
         }
 
         for (index, input) in inputs.iter().enumerate() {
             let expected = state.mapping.column(&argument_column_name(index))?.dtype();
 
             if input.dtype() != expected {
-                return Err(TransformError::input_type_mismatch(input, expected));
+                return Err(TransformError::InputTypeMismatch {
+                    name: input.name().clone(),
+                    expected: expected.to_string(),
+                    actual: input.dtype().to_string(),
+                });
             }
         }
 
@@ -394,12 +401,12 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            let Err(TransformError::InputNamesMismatch(error)) =
+            let Err(error @ TransformError::InputNamesMismatch { .. }) =
                 definition.validate(&transform, &input)
             else {
                 panic!("expected InputNamesMismatch for {input:?}");
             };
-            assert_eq!(error, expected);
+            assert_eq!(error.to_string(), expected);
         }
         Ok(())
     }
@@ -423,14 +430,17 @@ mod tests {
         ];
 
         for input in cases {
-            let Err(TransformError::InputCountMismatch(error)) =
+            let Err(error @ TransformError::InputCountMismatch { .. }) =
                 definition.validate(&transform, &input)
             else {
                 panic!("expected InputCountMismatch for {input:?}");
             };
             assert_eq!(
-                error,
-                format!("expected exactly 2 input columns, received {}", input.len()),
+                error.to_string(),
+                format!(
+                    "number of input columns: expected exactly 2, received {}",
+                    input.len()
+                ),
             );
         }
         Ok(())
@@ -450,13 +460,13 @@ mod tests {
         ];
 
         for (index, input) in cases.into_iter().enumerate() {
-            let Err(TransformError::InputTypeMismatch(error)) =
+            let Err(error @ TransformError::InputTypeMismatch { .. }) =
                 definition.validate(&transform, &input)
             else {
                 panic!("expected InputTypeMismatch for {input:?}");
             };
             assert_eq!(
-                error,
+                error.to_string(),
                 format!(
                     "input `{}`: expected {}, received {}",
                     training[index].name(),
@@ -527,12 +537,15 @@ mod tests {
             &transform.transform(&input).unwrap(),
             &[None, Some(0), Some(1)],
         );
-        let Err(crate::FitError::Evaluation(TransformError::InputNamesMismatch(error))) =
+        let Err(crate::FitError::Evaluation(error @ TransformError::InputNamesMismatch { .. })) =
             transform.transform(&first)
         else {
             panic!("expected InputNamesMismatch");
         };
-        assert_eq!(error, "expected input names [\"other\"], received [\"f1\"]",);
+        assert_eq!(
+            error.to_string(),
+            "expected input names [\"other\"], received [\"f1\"]",
+        );
         Ok(())
     }
 
@@ -542,10 +555,13 @@ mod tests {
         let training = [Column::new("f1".into(), ["a", "b"])];
         let transform = Fit::Fitted(Fitted::fit(IntegerEncodingDefinition, &training)?);
         let original = transform.transform(&training).unwrap();
-        let Err(TransformError::InputCountMismatch(error)) = transform.fit(&[]) else {
+        let Err(error @ TransformError::InputCountMismatch { .. }) = transform.fit(&[]) else {
             panic!("expected InputCountMismatch");
         };
-        assert_eq!(error, "expected at least 1 input column, received 0");
+        assert_eq!(
+            error.to_string(),
+            "number of input columns: expected at least 1, received 0"
+        );
 
         let unequal_lengths = [training[0].clone(), Column::new("f2".into(), [1_i32])];
         assert!(matches!(

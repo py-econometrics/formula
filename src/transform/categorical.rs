@@ -106,10 +106,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let input = validate_single_input(inputs)?;
 
         if input.dtype() != state.levels.dtype() {
-            return Err(TransformError::input_type_mismatch(
-                input,
-                state.levels.dtype(),
-            ));
+            return Err(TransformError::InputTypeMismatch {
+                name: input.name().clone(),
+                expected: state.levels.dtype().to_string(),
+                actual: input.dtype().to_string(),
+            });
         }
 
         Ok(())
@@ -594,13 +595,13 @@ mod tests {
         for reference in [None, Some(Scalar::from(1_i64))] {
             let definition = CategoricalDefinition::new(reference);
             let transform = definition.fit(&training)?;
-            let Err(TransformError::InputTypeMismatch(error)) =
+            let Err(error @ TransformError::InputTypeMismatch { .. }) =
                 definition.validate(&transform, &input)
             else {
                 panic!("expected InputTypeMismatch");
             };
             assert_eq!(
-                error,
+                error.to_string(),
                 format!(
                     "input `group`: expected {}, received {}",
                     DataType::Int32,

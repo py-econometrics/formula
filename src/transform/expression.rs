@@ -121,10 +121,10 @@ impl ExpressionTransform {
 
     fn validate_inputs(&self, inputs: &[Column]) -> Result<(), TransformError> {
         if !self.argument_count.accepts(inputs.len()) {
-            return Err(TransformError::input_count_mismatch(
-                self.argument_count,
-                inputs.len(),
-            ));
+            return Err(TransformError::InputCountMismatch {
+                expected: self.argument_count,
+                actual: inputs.len(),
+            });
         }
         for input in inputs {
             self.input_policy.validate(input)?;
@@ -483,25 +483,26 @@ mod tests {
             (
                 ExpressionTransform::LOG,
                 0,
-                "expected exactly 1 input column, received 0",
+                "number of input columns: expected exactly 1, received 0",
             ),
             (
                 ExpressionTransform::LOG,
                 2,
-                "expected exactly 1 input column, received 2",
+                "number of input columns: expected exactly 1, received 2",
             ),
             (
                 ExpressionTransform::ADD,
                 1,
-                "expected at least 2 input columns, received 1",
+                "number of input columns: expected at least 2, received 1",
             ),
         ] {
             let inputs = vec![Column::new("x".into(), [1.0, 2.0]); count];
-            let Err(TransformError::InputCountMismatch(message)) = transform.transform(&inputs)
+            let Err(error @ TransformError::InputCountMismatch { .. }) =
+                transform.transform(&inputs)
             else {
                 panic!("expected InputCountMismatch");
             };
-            assert_eq!(message, expected);
+            assert_eq!(error.to_string(), expected);
         }
     }
 
@@ -521,7 +522,7 @@ mod tests {
                 assert!(matches!(
                     transform.transform(&input),
                     Err(crate::FitError::Evaluation(
-                        TransformError::NonNumericInput(_)
+                        TransformError::NonNumericInput { .. }
                     ))
                 ));
             }

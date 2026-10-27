@@ -13,7 +13,7 @@ use crate::fit::{Fit, FitError};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, DataFrame, DataType, PlSmallStr};
+use polars::prelude::{Column, DataFrame, PlSmallStr};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -40,6 +40,14 @@ pub(crate) trait TransformDefinition {
 }
 
 impl Transform {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Expression(expression) => expression.name(),
+            Self::C(categorical) => categorical.definition().name(),
+            Self::F(integer) => integer.definition().name(),
+        }
+    }
+
     pub(crate) fn expands(&self) -> bool {
         match self {
             Self::Expression(expression) => expression.expands(),
@@ -101,49 +109,25 @@ std::thread_local! {
 
 #[derive(Debug)]
 pub enum TransformError {
-    InputCountMismatch(String),
-    InputNamesMismatch(String),
-    InputTypeMismatch(String),
-    NonNumericInput(String),
+    InputCountMismatch {
+        expected: ArgumentCount,
+        actual: usize,
+    },
+    InputNamesMismatch {
+        expected: Vec<PlSmallStr>,
+        actual: Vec<PlSmallStr>,
+    },
+    InputTypeMismatch {
+        name: PlSmallStr,
+        expected: String,
+        actual: String,
+    },
+    NonNumericInput {
+        name: PlSmallStr,
+        actual: String,
+    },
     InvalidParameter(String),
     Polars(PolarsError),
-}
-
-impl TransformError {
-    pub(crate) fn input_count_mismatch(expected: ArgumentCount, actual: usize) -> Self {
-        let (requirement, count) = match expected {
-            ArgumentCount::Exactly(count) => ("exactly", count),
-            ArgumentCount::AtLeast(count) => ("at least", count),
-        };
-        let noun = if count == 1 { "column" } else { "columns" };
-        Self::InputCountMismatch(format!(
-            "expected {requirement} {count} input {noun}, received {actual}",
-        ))
-    }
-
-    pub(crate) fn input_names_mismatch(expected: &[PlSmallStr], inputs: &[Column]) -> Self {
-        let actual = inputs.iter().map(|input| input.name()).collect::<Vec<_>>();
-        Self::InputNamesMismatch(format!(
-            "expected input names {expected:?}, received {actual:?}",
-        ))
-    }
-
-    pub(crate) fn input_type_mismatch(input: &Column, expected: &DataType) -> Self {
-        Self::InputTypeMismatch(format!(
-            "input `{}`: expected {}, received {}",
-            input.name(),
-            expected,
-            input.dtype(),
-        ))
-    }
-
-    pub(crate) fn non_numeric_input(input: &Column) -> Self {
-        Self::NonNumericInput(format!(
-            "column `{}`: expected a primitive numeric dtype, received {}",
-            input.name(),
-            input.dtype(),
-        ))
-    }
 }
 
 impl From<PolarsError> for TransformError {
@@ -157,11 +141,27 @@ impl std::error::Error for TransformError {}
 impl std::fmt::Display for TransformError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InputCountMismatch(message)
-            | Self::InputNamesMismatch(message)
-            | Self::InputTypeMismatch(message)
-            | Self::NonNumericInput(message)
-            | Self::InvalidParameter(message) => f.write_str(message),
+            Self::InputCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "number of input columns: expected {expected}, received {actual}"
+                )
+            }
+            Self::InputNamesMismatch { expected, actual } => {
+                write!(f, "expected input names {expected:?}, received {actual:?}")
+            }
+            Self::InputTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                write!(f, "input `{name}`: expected {expected}, received {actual}")
+            }
+            Self::NonNumericInput { name, actual } => write!(
+                f,
+                "column `{name}`: expected a primitive numeric dtype, received {actual}",
+            ),
+            Self::InvalidParameter(message) => f.write_str(message),
             Self::Polars(error) => error.fmt(f),
         }
     }
