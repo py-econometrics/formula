@@ -56,6 +56,15 @@ jobs:
           path: base
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Keep only the benchmark toolchain
+        shell: bash
+        run: |
+          benchmark_toolchain=$(rustup show active-toolchain | cut -d ' ' -f1)
+          rustup toolchain list | while read -r toolchain _; do
+            if [[ "$toolchain" != "$benchmark_toolchain" ]]; then
+              rustup toolchain uninstall "$toolchain"
+            fi
+          done
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
