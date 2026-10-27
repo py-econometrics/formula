@@ -28,6 +28,12 @@ pub enum Transform {
 }
 
 pub(crate) trait TransformDefinition {
+    fn name(&self) -> &'static str;
+
+    fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
+        call_name(self.name(), arguments.iter().copied())
+    }
+
     fn expands(&self) -> bool;
 
     fn argument_count(&self) -> ArgumentCount;
@@ -47,6 +53,14 @@ impl Transform {
             Self::Expression(expression) => expression.argument_count(),
             Self::C(categorical) => categorical.definition().argument_count(),
             Self::F(integer) => integer.definition().argument_count(),
+        }
+    }
+
+    pub(crate) fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
+        match self {
+            Self::Expression(expression) => expression.call_name(arguments),
+            Self::C(categorical) => categorical.definition().call_name(arguments),
+            Self::F(integer) => integer.definition().call_name(arguments),
         }
     }
 
@@ -70,7 +84,7 @@ impl Transform {
 
         match self {
             Self::Expression(expression) => {
-                expression.transform(inputs).map_err(FitError::Definition)
+                expression.transform(inputs).map_err(FitError::Evaluation)
             }
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),
@@ -87,16 +101,61 @@ std::thread_local! {
 
 #[derive(Debug)]
 pub enum TransformError {
-    InputTypeMismatch,
+    InputCountMismatch {
+        expected: ArgumentCount,
+        actual: usize,
+    },
+    InputNamesMismatch {
+        expected: Vec<PlSmallStr>,
+        actual: Vec<PlSmallStr>,
+    },
+    InputTypeMismatch {
+        name: PlSmallStr,
+        expected: String,
+        actual: String,
+    },
+    NonNumericInput {
+        name: PlSmallStr,
+        actual: String,
+    },
     InvalidParameter(String),
     Polars(PolarsError),
-    DtypeMismatch(String),
-    NonNumericInput(String),
 }
 
 impl From<PolarsError> for TransformError {
     fn from(error: PolarsError) -> Self {
         Self::Polars(error)
+    }
+}
+
+impl std::error::Error for TransformError {}
+
+impl std::fmt::Display for TransformError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "number of input columns: expected {expected}, received {actual}"
+                )
+            }
+            Self::InputNamesMismatch { expected, actual } => {
+                write!(f, "expected input names {expected:?}, received {actual:?}")
+            }
+            Self::InputTypeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                write!(f, "input `{name}`: expected {expected}, received {actual}")
+            }
+            Self::NonNumericInput { name, actual } => write!(
+                f,
+                "column `{name}`: expected a primitive numeric dtype, received {actual}",
+            ),
+            Self::InvalidParameter(message) => f.write_str(message),
+            Self::Polars(error) => error.fmt(f),
+        }
     }
 }
 

@@ -121,12 +121,10 @@ impl ExpressionTransform {
 
     fn validate_inputs(&self, inputs: &[Column]) -> Result<(), TransformError> {
         if !self.argument_count.accepts(inputs.len()) {
-            return Err(TransformError::InvalidParameter(format!(
-                "{} expects {:?} arguments, got {}",
-                self.name,
-                self.argument_count,
-                inputs.len(),
-            )));
+            return Err(TransformError::InputCountMismatch {
+                expected: self.argument_count,
+                actual: inputs.len(),
+            });
         }
         for input in inputs {
             self.input_policy.validate(input)?;
@@ -142,6 +140,10 @@ impl TransformDefinition for ExpressionTransform {
 
     fn argument_count(&self) -> ArgumentCount {
         self.argument_count
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -476,6 +478,35 @@ mod tests {
     }
 
     #[test]
+    fn numeric_transforms_report_expected_and_actual_input_counts() {
+        for (transform, count, expected) in [
+            (
+                ExpressionTransform::LOG,
+                0,
+                "number of input columns: expected exactly 1, received 0",
+            ),
+            (
+                ExpressionTransform::LOG,
+                2,
+                "number of input columns: expected exactly 1, received 2",
+            ),
+            (
+                ExpressionTransform::ADD,
+                1,
+                "number of input columns: expected at least 2, received 1",
+            ),
+        ] {
+            let inputs = vec![Column::new("x".into(), [1.0, 2.0]); count];
+            let Err(error @ TransformError::InputCountMismatch { .. }) =
+                transform.transform(&inputs)
+            else {
+                panic!("expected InputCountMismatch");
+            };
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
     fn numeric_transforms_reject_strings_and_booleans() {
         let cases = [
             [Column::new("x".into(), ["1", "2"])],
@@ -490,8 +521,8 @@ mod tests {
                 let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
-                    Err(crate::FitError::Definition(
-                        TransformError::NonNumericInput(_)
+                    Err(crate::FitError::Evaluation(
+                        TransformError::NonNumericInput { .. }
                     ))
                 ));
             }

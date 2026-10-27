@@ -33,7 +33,7 @@ impl<D: Definition<S>, S> Fit<D, S> {
     pub(crate) fn transform(&self, input: &D::Input) -> Result<D::Output, FitError<D::Error>> {
         match self {
             Self::Unfitted(_) => Err(FitError::NotFitted),
-            Self::Fitted(fitted) => fitted.transform(input).map_err(FitError::Definition),
+            Self::Fitted(fitted) => fitted.transform(input).map_err(FitError::Evaluation),
         }
     }
 }
@@ -41,7 +41,7 @@ impl<D: Definition<S>, S> Fit<D, S> {
 #[derive(Debug)]
 pub enum FitError<E> {
     NotFitted,
-    Definition(E),
+    Evaluation(E),
 }
 
 #[derive(Debug)]
@@ -71,3 +71,14 @@ impl<D: PartialEq, S> PartialEq for Fit<D, S> {
         self.definition() == other.definition()
     }
 }
+
+impl<E: std::fmt::Display> std::fmt::Display for FitError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFitted => f.write_str("cannot evaluate before fitting"),
+            Self::Evaluation(error) => error.fmt(f),
+        }
+    }
+}
+
+impl<E: std::error::Error> std::error::Error for FitError<E> {}
