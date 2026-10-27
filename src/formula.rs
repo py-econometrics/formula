@@ -86,7 +86,7 @@ impl Factor {
 
                 if !expected.accepts(arguments.len()) {
                     return Err(ValidationError::InvalidArgumentCount {
-                        transform: transform.name(),
+                        call: self.label(),
                         expected,
                         actual: arguments.len(),
                     });
@@ -102,6 +102,24 @@ impl Factor {
                 }
 
                 Ok(())
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Variable(variable) => variable.definition().name.clone(),
+            Self::Literal(value) => value.as_any_value().to_string(),
+            Self::Call {
+                transform,
+                arguments,
+            } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| argument.label())
+                    .collect::<Vec<_>>();
+                let names = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+                transform.call_name(&names).to_string()
             }
         }
     }
@@ -434,7 +452,7 @@ impl Specification {
 #[derive(Debug)]
 pub enum ValidationError {
     InvalidArgumentCount {
-        transform: &'static str,
+        call: String,
         expected: ArgumentCount,
         actual: usize,
     },
@@ -477,18 +495,6 @@ fn literal_column(value: &Scalar, height: usize) -> Column {
     Column::new_scalar(name.into(), value.clone(), height)
 }
 
-fn transform_error(
-    transform: &Transform,
-    inputs: &[Column],
-    error: impl std::fmt::Display,
-) -> EvaluationError {
-    let arguments = inputs
-        .iter()
-        .map(|column| column.name().as_str())
-        .collect::<Vec<_>>();
-    EvaluationError::TransformCall(format!("{}: {error}", transform.call_name(&arguments)))
-}
-
 fn fit_and_evaluate_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
@@ -526,12 +532,12 @@ fn fit_and_evaluate_factors(
                     inputs.extend(result.columns.iter().cloned());
                 }
 
-                let transform = transform
-                    .fit(&inputs)
-                    .map_err(|error| transform_error(transform, &inputs, error))?;
-                let output = transform
-                    .transform(&inputs)
-                    .map_err(|error| transform_error(&transform, &inputs, error))?;
+                let transform = transform.fit(&inputs).map_err(|error| {
+                    EvaluationError::TransformCall(format!("{}: {error}", factor.label()))
+                })?;
+                let output = transform.transform(&inputs).map_err(|error| {
+                    EvaluationError::TransformCall(format!("{}: {error}", factor.label()))
+                })?;
 
                 EvaluatedFactor {
                     factor: Arc::new(Factor::Call {
@@ -576,7 +582,9 @@ fn evaluate_factors(
                 }
                 transform
                     .transform(&inputs)
-                    .map_err(|error| transform_error(transform, &inputs, error))?
+                    .map_err(|error| {
+                        EvaluationError::TransformCall(format!("{}: {error}", factor.label()))
+                    })?
                     .into_columns()
             }
         };
@@ -675,13 +683,13 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidArgumentCount {
-                transform,
+                call,
                 expected,
                 actual,
             } => {
                 write!(
                     f,
-                    "{transform}: invalid argument count: expected {expected}, received {actual}",
+                    "{call}: invalid argument count: expected {expected}, received {actual}",
                 )
             }
             Self::InvalidTransformComposition => {
@@ -1068,24 +1076,32 @@ mod tests {
     }
 
     #[test]
-    fn argument_count_errors_identify_the_failing_transform_before_evaluation() {
+    fn argument_count_errors_identify_the_failing_call_before_evaluation() {
         let data = DataFrame::default();
         for (source, expected) in [
             (
-                "y ~ log(x) + add(x)",
-                "add: invalid argument count: expected at least 2, received 1",
+                "y ~ log(x) + add(x) + add(y, z)",
+                "add(x): invalid argument count: expected at least 2, received 1",
             ),
             (
                 "y ~ exp(log(x, x))",
-                "log: invalid argument count: expected exactly 1, received 2",
+                "log(x, x): invalid argument count: expected exactly 1, received 2",
+            ),
+            (
+                "y ~ log(add(x, 2), x)",
+                "log(add(x, 2), x): invalid argument count: expected exactly 1, received 2",
             ),
             (
                 "y ~ C(x, x)",
-                "C: invalid argument count: expected exactly 1, received 2",
+                "C(x, x): invalid argument count: expected exactly 1, received 2",
+            ),
+            (
+                "y ~ C(x, x, reference='a')",
+                "C(x, x, reference=\"a\"): invalid argument count: expected exactly 1, received 2",
             ),
             (
                 "y ~ F()",
-                "F: invalid argument count: expected at least 1, received 0",
+                "F(): invalid argument count: expected at least 1, received 0",
             ),
         ] {
             let error = crate::parse(source)
@@ -1894,10 +1910,10 @@ mod tests {
                 assert!(matches!(
                     result,
                     Err(ValidationError::InvalidArgumentCount {
-                        transform: "F",
+                        call,
                         expected: ArgumentCount::AtLeast(1),
                         actual: 0,
-                    })
+                    }) if call == "F()"
                 ));
             } else {
                 assert!(result.is_ok(), "{count} arguments: {result:?}");

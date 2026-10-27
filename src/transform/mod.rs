@@ -40,14 +40,6 @@ pub(crate) trait TransformDefinition {
 }
 
 impl Transform {
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::Expression(expression) => expression.name(),
-            Self::C(categorical) => categorical.definition().name(),
-            Self::F(integer) => integer.definition().name(),
-        }
-    }
-
     pub(crate) fn expands(&self) -> bool {
         match self {
             Self::Expression(expression) => expression.expands(),
