@@ -19,19 +19,9 @@ impl CategoricalDefinition {
     }
 
     fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
-        let call = match &self.reference {
-            Some(reference) => {
-                let value = match reference.as_any_value() {
-                    AnyValue::String(value) => format!("{value:?}"),
-                    AnyValue::StringOwned(value) => format!("{:?}", value.as_str()),
-                    _ => Self::level_name(reference),
-                };
-                let reference_argument = format!("reference={value}");
-                call_name("C", [input_name, reference_argument.as_str()])
-            }
-            None => call_name("C", [input_name]),
-        };
+        let call = self.call_name(&[input_name]);
         let prefix = if self.reference.is_some() { "T." } else { "" };
+
         format!("{call}[{prefix}{}]", Self::level_name(level)).into()
     }
 
@@ -81,6 +71,30 @@ impl TransformDefinition for CategoricalDefinition {
     fn argument_count(&self) -> ArgumentCount {
         ArgumentCount::Exactly(1)
     }
+
+    fn name(&self) -> &'static str {
+        "C"
+    }
+
+    fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
+        let reference_argument = self.reference.as_ref().map(|reference| {
+            let value = match reference.as_any_value() {
+                AnyValue::String(value) => format!("{value:?}"),
+                AnyValue::StringOwned(value) => format!("{:?}", value.as_str()),
+                _ => Self::level_name(reference),
+            };
+
+            format!("reference={value}")
+        });
+
+        call_name(
+            self.name(),
+            arguments
+                .iter()
+                .copied()
+                .chain(reference_argument.as_deref()),
+        )
+    }
 }
 
 impl Definition<CategoricalState> for CategoricalDefinition {
@@ -92,11 +106,15 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let input = validate_single_input(inputs)?;
 
         if input.dtype() != state.levels.dtype() {
-            return Err(TransformError::InputTypeMismatch);
+            return Err(TransformError::input_type_mismatch(
+                input,
+                state.levels.dtype(),
+            ));
         }
 
         Ok(())
     }
+
     fn fit(&self, inputs: &[Column]) -> Result<CategoricalState, TransformError> {
         let levels = validate_single_input(inputs)?
             .drop_nulls()
@@ -576,10 +594,19 @@ mod tests {
         for reference in [None, Some(Scalar::from(1_i64))] {
             let definition = CategoricalDefinition::new(reference);
             let transform = definition.fit(&training)?;
-            assert!(matches!(
-                definition.validate(&transform, &input),
-                Err(TransformError::InputTypeMismatch)
-            ));
+            let Err(TransformError::InputTypeMismatch(error)) =
+                definition.validate(&transform, &input)
+            else {
+                panic!("expected InputTypeMismatch");
+            };
+            assert_eq!(
+                error,
+                format!(
+                    "input `group`: expected {}, received {}",
+                    DataType::Int32,
+                    DataType::Int64,
+                ),
+            );
         }
         Ok(())
     }

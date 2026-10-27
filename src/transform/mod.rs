@@ -13,7 +13,7 @@ use crate::fit::{Fit, FitError};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, DataFrame, PlSmallStr};
+use polars::prelude::{Column, DataFrame, DataType, PlSmallStr};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -28,6 +28,12 @@ pub enum Transform {
 }
 
 pub(crate) trait TransformDefinition {
+    fn name(&self) -> &'static str;
+
+    fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
+        call_name(self.name(), arguments.iter().copied())
+    }
+
     fn expands(&self) -> bool;
 
     fn argument_count(&self) -> ArgumentCount;
@@ -47,6 +53,14 @@ impl Transform {
             Self::Expression(expression) => expression.argument_count(),
             Self::C(categorical) => categorical.definition().argument_count(),
             Self::F(integer) => integer.definition().argument_count(),
+        }
+    }
+
+    pub(crate) fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
+        match self {
+            Self::Expression(expression) => expression.call_name(arguments),
+            Self::C(categorical) => categorical.definition().call_name(arguments),
+            Self::F(integer) => integer.definition().call_name(arguments),
         }
     }
 
@@ -70,7 +84,7 @@ impl Transform {
 
         match self {
             Self::Expression(expression) => {
-                expression.transform(inputs).map_err(FitError::Definition)
+                expression.transform(inputs).map_err(FitError::Evaluation)
             }
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),
@@ -87,16 +101,69 @@ std::thread_local! {
 
 #[derive(Debug)]
 pub enum TransformError {
-    InputTypeMismatch,
+    InputCountMismatch(String),
+    InputNamesMismatch(String),
+    InputTypeMismatch(String),
+    NonNumericInput(String),
     InvalidParameter(String),
     Polars(PolarsError),
-    DtypeMismatch(String),
-    NonNumericInput(String),
+}
+
+impl TransformError {
+    pub(crate) fn input_count_mismatch(expected: ArgumentCount, actual: usize) -> Self {
+        let (requirement, count) = match expected {
+            ArgumentCount::Exactly(count) => ("exactly", count),
+            ArgumentCount::AtLeast(count) => ("at least", count),
+        };
+        let noun = if count == 1 { "column" } else { "columns" };
+        Self::InputCountMismatch(format!(
+            "expected {requirement} {count} input {noun}, received {actual}",
+        ))
+    }
+
+    pub(crate) fn input_names_mismatch(expected: &[PlSmallStr], inputs: &[Column]) -> Self {
+        let actual = inputs.iter().map(|input| input.name()).collect::<Vec<_>>();
+        Self::InputNamesMismatch(format!(
+            "expected input names {expected:?}, received {actual:?}",
+        ))
+    }
+
+    pub(crate) fn input_type_mismatch(input: &Column, expected: &DataType) -> Self {
+        Self::InputTypeMismatch(format!(
+            "input `{}`: expected {}, received {}",
+            input.name(),
+            expected,
+            input.dtype(),
+        ))
+    }
+
+    pub(crate) fn non_numeric_input(input: &Column) -> Self {
+        Self::NonNumericInput(format!(
+            "column `{}`: expected a primitive numeric dtype, received {}",
+            input.name(),
+            input.dtype(),
+        ))
+    }
 }
 
 impl From<PolarsError> for TransformError {
     fn from(error: PolarsError) -> Self {
         Self::Polars(error)
+    }
+}
+
+impl std::error::Error for TransformError {}
+
+impl std::fmt::Display for TransformError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InputCountMismatch(message)
+            | Self::InputNamesMismatch(message)
+            | Self::InputTypeMismatch(message)
+            | Self::NonNumericInput(message)
+            | Self::InvalidParameter(message) => f.write_str(message),
+            Self::Polars(error) => error.fmt(f),
+        }
     }
 }
 

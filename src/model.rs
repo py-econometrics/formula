@@ -103,6 +103,7 @@ pub enum EvaluationError {
     Validation(ValidationError),
     Transform(TransformError),
     Fit(FitError<TransformError>),
+    TransformCall(String),
 }
 
 impl From<ValidationError> for EvaluationError {
@@ -122,6 +123,19 @@ impl From<FitError<TransformError>> for EvaluationError {
         Self::Fit(error)
     }
 }
+
+impl std::fmt::Display for EvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation(error) => error.fmt(f),
+            Self::Transform(error) => error.fmt(f),
+            Self::Fit(error) => error.fmt(f),
+            Self::TransformCall(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for EvaluationError {}
 
 #[cfg(test)]
 mod tests {

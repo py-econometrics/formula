@@ -22,8 +22,9 @@ pub(super) fn argument_column_name(index: usize) -> PlSmallStr {
 
 pub(super) fn input_frame(inputs: &[Column]) -> Result<DataFrame, TransformError> {
     let Some(first) = inputs.first() else {
-        return Err(TransformError::InvalidParameter(
-            "expected at least one input column".into(),
+        return Err(TransformError::input_count_mismatch(
+            ArgumentCount::AtLeast(1),
+            inputs.len(),
         ));
     };
 
@@ -43,8 +44,9 @@ pub(super) fn input_frame(inputs: &[Column]) -> Result<DataFrame, TransformError
 
 pub(super) fn validate_single_input(inputs: &[Column]) -> Result<&Column, TransformError> {
     let [input] = inputs else {
-        return Err(TransformError::InvalidParameter(
-            "expected exactly one input column".into(),
+        return Err(TransformError::input_count_mismatch(
+            ArgumentCount::Exactly(1),
+            inputs.len(),
         ));
     };
     Ok(input)
@@ -52,11 +54,7 @@ pub(super) fn validate_single_input(inputs: &[Column]) -> Result<&Column, Transf
 
 pub(crate) fn validate_numeric_input(input: &Column) -> Result<(), TransformError> {
     if !input.dtype().is_primitive_numeric() {
-        return Err(TransformError::NonNumericInput(format!(
-            "column `{}`: expected a primitive numeric dtype, received {}",
-            input.name(),
-            input.dtype(),
-        )));
+        return Err(TransformError::non_numeric_input(input));
     }
 
     Ok(())

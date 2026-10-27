@@ -41,12 +41,7 @@ impl Definition<VariableState> for VariableDefinition {
 
     fn validate(&self, state: &VariableState, input: &Column) -> Result<(), TransformError> {
         if input.dtype() != &state.dtype {
-            return Err(TransformError::DtypeMismatch(format!(
-                "column `{}`: expected {}, received {}",
-                self.name,
-                state.dtype,
-                input.dtype(),
-            )));
+            return Err(TransformError::input_type_mismatch(input, &state.dtype));
         }
 
         Ok(())
@@ -476,6 +471,18 @@ fn literal_column(value: &Scalar, height: usize) -> Column {
     Column::new_scalar(name.into(), value.clone(), height)
 }
 
+fn transform_error(
+    transform: &Transform,
+    inputs: &[Column],
+    error: impl std::fmt::Display,
+) -> EvaluationError {
+    let arguments = inputs
+        .iter()
+        .map(|column| column.name().as_str())
+        .collect::<Vec<_>>();
+    EvaluationError::TransformCall(format!("{}: {error}", transform.call_name(&arguments)))
+}
+
 fn fit_and_evaluate_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
@@ -513,8 +520,12 @@ fn fit_and_evaluate_factors(
                     inputs.extend(result.columns.iter().cloned());
                 }
 
-                let transform = transform.fit(&inputs)?;
-                let output = transform.transform(&inputs)?;
+                let transform = transform
+                    .fit(&inputs)
+                    .map_err(|error| transform_error(transform, &inputs, error))?;
+                let output = transform
+                    .transform(&inputs)
+                    .map_err(|error| transform_error(&transform, &inputs, error))?;
 
                 EvaluatedFactor {
                     factor: Arc::new(Factor::Call {
@@ -557,7 +568,10 @@ fn evaluate_factors(
                     let result = lookup_factor(&evaluated, argument);
                     inputs.extend(result.columns.iter().cloned());
                 }
-                transform.transform(&inputs)?.into_columns()
+                transform
+                    .transform(&inputs)
+                    .map_err(|error| transform_error(transform, &inputs, error))?
+                    .into_columns()
             }
         };
         evaluated.push(EvaluatedFactor {
@@ -650,6 +664,29 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
         .find(|entry| &entry.term == term)
         .expect("every term must have an evaluated entry")
 }
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidArgumentCount { expected, actual } => {
+                let (requirement, count) = match expected {
+                    ArgumentCount::Exactly(count) => ("exactly", count),
+                    ArgumentCount::AtLeast(count) => ("at least", count),
+                };
+
+                write!(
+                    f,
+                    "invalid argument count: expected {requirement} {count}, received {actual}",
+                )
+            }
+            Self::InvalidTransformComposition => {
+                f.write_str("an expanding transform cannot be used as a transform argument")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ValidationError {}
 
 #[cfg(test)]
 mod tests {
@@ -847,6 +884,80 @@ mod tests {
     }
 
     #[test]
+    fn transform_errors_identify_the_directly_failing_call() {
+        let data = polars::df!("y" => [1.0, 2.0], "x" => ["a", "b"]).unwrap();
+
+        for (source, call) in [
+            ("y ~ log(x)", "log(x)"),
+            ("y ~ exp(log(x))", "log(x)"),
+            ("y ~ add(1, log(x))", "log(x)"),
+        ] {
+            let error = crate::parse(source)
+                .unwrap()
+                .materialize(&data)
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "{call}: column `x`: expected a primitive numeric dtype, received {}",
+                    DataType::String,
+                ),
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn categorical_fit_errors_include_reference_and_original_input_name() {
+        let data = polars::df!("y" => [1.0, 2.0], "group name" => ["a", "b"]).unwrap();
+        let error = crate::parse("y ~ C(`group name`, reference='missing')")
+            .unwrap()
+            .materialize(&data)
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "C(group name, reference=\"missing\"): `reference` value is not among the fitted levels",
+        );
+    }
+
+    #[test]
+    fn fitted_integer_encoding_looks_up_columns_by_name() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0],
+            "a" => ["x", "y"],
+            "b" => [1_i32, 2],
+        )
+        .unwrap();
+        let models = crate::parse("y ~ F(a, b) - 1")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        let reordered = data.select(["b", "y", "a"]).unwrap();
+        let evaluated = models.evaluate(&reordered).unwrap();
+        assert!(
+            models
+                .iter()
+                .next()
+                .unwrap()
+                .1
+                .right()
+                .frame()
+                .equals_missing(evaluated.iter().next().unwrap().1.right().frame())
+        );
+
+        let missing = data.select(["y", "a"]).unwrap();
+        let error = models.evaluate(&missing).err().unwrap();
+        assert!(matches!(
+            error,
+            EvaluationError::Transform(TransformError::Polars(_))
+        ));
+        assert!(error.to_string().contains('b'));
+    }
+
+    #[test]
     fn explicit_encodings_accept_string_and_boolean_inputs() {
         let training = polars::df!(
             "group" => ["a", "b", "a"],
@@ -920,22 +1031,20 @@ mod tests {
                     model.evaluate(input).map(|_| ()),
                     model.right().evaluate(input).map(|_| ()),
                 ] {
-                    let Err(EvaluationError::Fit(crate::FitError::Definition(
-                        TransformError::DtypeMismatch(message),
+                    let Err(EvaluationError::Fit(crate::FitError::Evaluation(
+                        TransformError::InputTypeMismatch(error),
                     ))) = result
                     else {
-                        panic!("expected DtypeMismatch for `{source}`");
+                        panic!("expected InputTypeMismatch for `{source}`");
                     };
 
-                    assert!(message.contains("`x`"), "{message}");
-                    assert!(
-                        message.contains(&format!("expected {}", DataType::Int32)),
-                        "{message}",
-                    );
-                    assert!(
-                        message
-                            .contains(&format!("received {}", input.column("x").unwrap().dtype())),
-                        "{message}",
+                    assert_eq!(
+                        error,
+                        format!(
+                            "input `x`: expected {}, received {}",
+                            DataType::Int32,
+                            input.column("x").unwrap().dtype(),
+                        ),
                     );
                 }
             }

@@ -121,12 +121,10 @@ impl ExpressionTransform {
 
     fn validate_inputs(&self, inputs: &[Column]) -> Result<(), TransformError> {
         if !self.argument_count.accepts(inputs.len()) {
-            return Err(TransformError::InvalidParameter(format!(
-                "{} expects {:?} arguments, got {}",
-                self.name,
+            return Err(TransformError::input_count_mismatch(
                 self.argument_count,
                 inputs.len(),
-            )));
+            ));
         }
         for input in inputs {
             self.input_policy.validate(input)?;
@@ -142,6 +140,10 @@ impl TransformDefinition for ExpressionTransform {
 
     fn argument_count(&self) -> ArgumentCount {
         self.argument_count
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -476,6 +478,34 @@ mod tests {
     }
 
     #[test]
+    fn numeric_transforms_report_expected_and_actual_input_counts() {
+        for (transform, count, expected) in [
+            (
+                ExpressionTransform::LOG,
+                0,
+                "expected exactly 1 input column, received 0",
+            ),
+            (
+                ExpressionTransform::LOG,
+                2,
+                "expected exactly 1 input column, received 2",
+            ),
+            (
+                ExpressionTransform::ADD,
+                1,
+                "expected at least 2 input columns, received 1",
+            ),
+        ] {
+            let inputs = vec![Column::new("x".into(), [1.0, 2.0]); count];
+            let Err(TransformError::InputCountMismatch(message)) = transform.transform(&inputs)
+            else {
+                panic!("expected InputCountMismatch");
+            };
+            assert_eq!(message, expected);
+        }
+    }
+
+    #[test]
     fn numeric_transforms_reject_strings_and_booleans() {
         let cases = [
             [Column::new("x".into(), ["1", "2"])],
@@ -490,7 +520,7 @@ mod tests {
                 let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
-                    Err(crate::FitError::Definition(
+                    Err(crate::FitError::Evaluation(
                         TransformError::NonNumericInput(_)
                     ))
                 ));
