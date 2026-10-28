@@ -4,8 +4,8 @@ use crate::fit::Definition;
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoLazy, NULL, PlSmallStr, Scalar, col,
-    lit, when,
+    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr,
+    Scalar, col, lit, when,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,22 +35,61 @@ impl CategoricalDefinition {
         }
     }
 
+    /// Converts the reference value to the input dtype.
+    ///
+    /// String references for categorical and enum inputs are resolved through the
+    /// existing dictionary without inserting new levels. Numeric references may
+    /// convert between integer widths or between float widths; other dtype
+    /// combinations must match exactly. Nonfinite numeric references are rejected.
+    ///
+    /// Membership in the observed fitting levels is checked separately in `fit`.
     fn reference_for_dtype(&self, dtype: &DataType) -> Result<Option<Scalar>, TransformError> {
+        // No reference provided
         let Some(reference) = &self.reference else {
             return Ok(None);
         };
+        // Get the dtype of the reference provided
         let source = reference.dtype();
-        let compatible = source == dtype
-            || (source.is_integer() && dtype.is_integer())
-            || (source.is_float() && dtype.is_float());
-        if !compatible {
-            return Err(TransformError::InvalidParameter(format!(
-                "`reference` dtype {source:?} is incompatible with input dtype {dtype:?}"
-            )));
-        }
-        let reference = reference
-            .clone()
-            .cast_with_options(dtype, CastOptions::Strict)?;
+        // Check compatibility with and convert to dtype
+        let reference = match (source, dtype) {
+            // Source and target dtype match
+            (source, target) if source == target => reference.clone(),
+            // Target is Categorical/Enum; check if reference is in observed levels
+            (DataType::String, DataType::Categorical(_, mapping) | DataType::Enum(_, mapping)) => {
+                let value = reference.as_any_value();
+                let label = value.str_value();
+                let code = mapping.get_cat(label.as_ref()).ok_or_else(|| {
+                    TransformError::InvalidParameter(
+                        "`reference` value is not among the fitted levels".into(),
+                    )
+                })?;
+
+                let value = match dtype {
+                    DataType::Categorical(_, _) => {
+                        AnyValue::CategoricalOwned(code, mapping.clone())
+                    }
+                    DataType::Enum(_, _) => AnyValue::EnumOwned(code, mapping.clone()),
+                    _ => unreachable!("dtype is Categorical or Enum"),
+                };
+
+                Scalar::new(dtype.clone(), value)
+            }
+            // Reference/target are integers; we cast here compatible integers
+            (source, target) if source.is_integer() && target.is_integer() => reference
+                .clone()
+                .cast_with_options(target, CastOptions::Strict)?,
+            // Reference/target are floats; we cast here compatible floats
+            (source, target) if source.is_float() && target.is_float() => reference
+                .clone()
+                .cast_with_options(target, CastOptions::Strict)?,
+            // Reference not compatible with target dtype
+            _ => {
+                return Err(TransformError::InvalidParameter(format!(
+                    "`reference` dtype {source:?} is incompatible with input dtype {dtype:?}"
+                )));
+            }
+        };
+
         if reference.dtype().is_float()
             && !reference.as_any_value().try_extract::<f64>()?.is_finite()
         {
@@ -160,11 +199,19 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             })
             .collect::<PolarsResult<Vec<_>>>()?;
 
-        let level_was_seen = fitted_levels
-            .iter()
-            .map(|level| argument.clone().eq_missing(lit(level.clone())))
-            .reduce(|left, right| left.or(right))
-            .unwrap_or(lit(false));
+        // Direct `or` comparisons are cheaper for small sets;
+        // `is_in`'s hashing scales better as the number of observed levels grows.
+        let level_was_seen = if levels.len() <= 8 {
+            fitted_levels
+                .iter()
+                .map(|level| argument.clone().eq_missing(lit(level.clone())))
+                .reduce(|left, right| left.or(right))
+                .unwrap_or(lit(false))
+        } else {
+            argument
+                .clone()
+                .is_in(lit(levels.implode()?.into_series()), false)
+        };
 
         let expressions = fitted_levels
             .into_iter()
@@ -198,6 +245,217 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
+    use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+
+    fn native_dtypes() -> Vec<DataType> {
+        let categorical = DataType::from_categories(Categories::random(
+            "formula-tests".into(),
+            CategoricalPhysical::U32,
+        ));
+        for label in ["a", "b", "c", "d"] {
+            categorical
+                .cat_mapping()
+                .unwrap()
+                .insert_cat(label)
+                .unwrap();
+        }
+        vec![
+            categorical,
+            DataType::from_frozen_categories(FrozenCategories::new(["a", "b", "c", "d"]).unwrap()),
+        ]
+    }
+
+    #[test]
+    fn native_levels_preserve_observed_order_and_label_names() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?];
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
+            let output = fitted.transform(&training)?;
+
+            assert_eq!(output.get_column_names(), ["C(x)[d]", "C(x)[b]"]);
+            assert_output(
+                &fitted.definition,
+                &fitted.state,
+                &training,
+                &output,
+                &[
+                    &[Some(true), Some(false), Some(true)],
+                    &[Some(false), Some(true), Some(false)],
+                ],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_unknown_levels_and_nulls_produce_null_indicators() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
+            let input = [Column::new(
+                "x".into(),
+                [Some("b"), Some("a"), None, Some("d"), Some("c")],
+            )
+            .cast(&dtype)?];
+            assert_output(
+                &fitted.definition,
+                &fitted.state,
+                &input,
+                &fitted.transform(&input)?,
+                &[
+                    &[Some(false), None, None, Some(true), None],
+                    &[Some(true), None, None, Some(false), None],
+                ],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_reference_is_omitted_without_treating_unknown_levels_as_reference()
+    -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let reference = Scalar::from(PlSmallStr::from_static("b"));
+            let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
+            let input = [
+                Column::new("x".into(), [Some("b"), Some("a"), None, Some("d")]).cast(&dtype)?,
+            ];
+            let output = fitted.transform(&input)?;
+            assert_eq!(output.get_column_names(), ["C(x, reference=\"b\")[T.d]"]);
+            assert_output(
+                &fitted.definition,
+                &fitted.state,
+                &input,
+                &output,
+                &[&[Some(false), None, None, Some(true)]],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_reference_must_be_observed_not_just_declared() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let reference = Scalar::from(PlSmallStr::from_static("a"));
+            let error =
+                Fitted::fit(CategoricalDefinition::new(Some(reference)), &training).unwrap_err();
+            assert!(matches!(error, TransformError::InvalidParameter(_)));
+            assert_eq!(
+                error.to_string(),
+                "`reference` value is not among the fitted levels"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_missing_reference_does_not_extend_dictionary() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let mapping = dtype.cat_mapping().unwrap();
+            assert!(mapping.get_cat("missing").is_none());
+            let reference = Scalar::from(PlSmallStr::from_static("missing"));
+            assert!(matches!(
+                Fitted::fit(CategoricalDefinition::new(Some(reference)), &training),
+                Err(TransformError::InvalidParameter(_))
+            ));
+            assert!(mapping.get_cat("missing").is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn categorical_dictionary_growth_preserves_fitted_schema() -> Result<(), TransformError> {
+        let dtype = native_dtypes().remove(0);
+        let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+        let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
+        let original = fitted.transform(&training)?;
+        let input = [Column::new("x".into(), ["new", "b", "a"]).cast(&dtype)?];
+
+        for _ in 0..2 {
+            let output = fitted.transform(&input)?;
+            assert_eq!(output.get_column_names(), original.get_column_names());
+            assert_output(
+                &fitted.definition,
+                &fitted.state,
+                &input,
+                &output,
+                &[&[None, Some(false), None], &[None, Some(true), None]],
+            );
+            assert!(fitted.transform(&training)?.equals_missing(&original));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_encoding_rejects_incompatible_dictionaries() -> Result<(), TransformError> {
+        for (dtype, incompatible) in native_dtypes().into_iter().zip([
+            DataType::from_categories(Categories::random(
+                "formula-tests".into(),
+                CategoricalPhysical::U32,
+            )),
+            DataType::from_frozen_categories(FrozenCategories::new(["b", "a", "c", "d"])?),
+        ]) {
+            let training = [Column::new("x".into(), ["a", "b"]).cast(&dtype)?];
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
+            let input = [Column::new("x".into(), ["a", "b"]).cast(&incompatible)?];
+            assert!(matches!(
+                fitted.transform(&input),
+                Err(TransformError::InputTypeMismatch { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_empty_and_all_null_training_preserve_prediction_height() -> Result<(), TransformError>
+    {
+        for dtype in native_dtypes() {
+            for values in [vec![], vec![None::<&str>, None]] {
+                let training = [Column::new("x".into(), values).cast(&dtype)?];
+                let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
+                let input = [Column::new("x".into(), [Some("a"), None, Some("b")]).cast(&dtype)?];
+                assert_eq!(fitted.transform(&input)?.shape(), (3, 0));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_empty_and_all_null_predictions_preserve_fitted_schema() -> Result<(), TransformError>
+    {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["b", "d"]).cast(&dtype)?];
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
+            let original = fitted.transform(&training)?;
+            for values in [vec![], vec![None::<&str>, None]] {
+                let height = values.len();
+                let input = [Column::new("x".into(), values).cast(&dtype)?];
+                let output = fitted.transform(&input)?;
+                assert_eq!(output.shape(), (height, 2));
+                assert_eq!(output.get_column_names(), original.get_column_names());
+                for column in output.columns() {
+                    assert_eq!(column.dtype(), &DataType::Boolean);
+                    assert_eq!(column.null_count(), height);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_reference_only_encoding_preserves_prediction_height() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [Column::new("x".into(), ["b", "b"]).cast(&dtype)?];
+            let reference = Scalar::from(PlSmallStr::from_static("b"));
+            let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
+            let input = [Column::new("x".into(), [Some("b"), Some("a"), None]).cast(&dtype)?];
+            assert_eq!(fitted.transform(&input)?.shape(), (3, 0));
+        }
+        Ok(())
+    }
 
     #[test]
     fn reference_only_encoding_preserves_input_height() -> Result<(), TransformError> {

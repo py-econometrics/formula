@@ -51,3 +51,6 @@ destruction are outside timing. Parsing samples retain a batch of parsed
 results until timing stops; fit and evaluation samples contain one operation.
 Evaluation reuses a model fitted outside timing. The deterministic dataset has
 90% fully finite rows; the remaining rows contain nulls, NaN, or infinities.
+The `categorical` and `integer` workloads apply `C` and `F` to a string column;
+their `_native` counterparts use a categorical copy of the same column.
+Categorical conversion happens during data construction, outside timing.
