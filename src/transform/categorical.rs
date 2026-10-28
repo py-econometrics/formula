@@ -197,9 +197,19 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             })
             .collect::<PolarsResult<Vec<_>>>()?;
 
-        let level_was_seen = argument
-            .clone()
-            .is_in(lit(levels.implode()?.into_series()), false);
+        // Direct `or` comparisons are cheaper for small sets;
+        // `is_in`'s hashing scales better as the number of observed levels grows.
+        let level_was_seen = if levels.len() <= 8 {
+            fitted_levels
+                .iter()
+                .map(|level| argument.clone().eq_missing(lit(level.clone())))
+                .reduce(|left, right| left.or(right))
+                .unwrap_or(lit(false))
+        } else {
+            argument
+                .clone()
+                .is_in(lit(levels.implode()?.into_series()), false)
+        };
 
         let expressions = fitted_levels
             .into_iter()
