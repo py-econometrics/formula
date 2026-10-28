@@ -2,6 +2,7 @@ mod categorical;
 mod expression;
 mod input;
 mod integer;
+mod polynomial;
 
 pub(crate) use categorical::CategoricalDefinition;
 pub(crate) use expression::ExpressionTransform;
