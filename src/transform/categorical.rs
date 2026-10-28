@@ -310,10 +310,7 @@ mod tests {
                 Column::new("x".into(), [Some("b"), Some("a"), None, Some("d")]).cast(&dtype)?,
             ];
             let output = fitted.transform(&input)?;
-            assert_eq!(
-                output.get_column_names(),
-                ["C(x, reference=\"b\")[T.d]"]
-            );
+            assert_eq!(output.get_column_names(), ["C(x, reference=\"b\")[T.d]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
