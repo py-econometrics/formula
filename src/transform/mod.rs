@@ -119,6 +119,7 @@ pub enum TransformError {
         name: PlSmallStr,
         actual: String,
     },
+    NumericalError(String),
     InvalidParameter(String),
     Polars(PolarsError),
 }
@@ -154,6 +155,7 @@ impl std::fmt::Display for TransformError {
                 f,
                 "column `{name}`: expected a primitive numeric dtype, received {actual}",
             ),
+            Self::NumericalError(message) => f.write_str(message),
             Self::InvalidParameter(message) => f.write_str(message),
             Self::Polars(error) => error.fmt(f),
         }

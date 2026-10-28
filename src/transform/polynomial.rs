@@ -4,7 +4,7 @@ use crate::transform::{TransformDefinition, call_name, validate_numeric_input};
 use crate::{ArgumentCount, TransformError};
 use polars::datatypes::DataType;
 use polars::frame::DataFrame;
-use polars::prelude::{Column, Expr, Field, IntoLazy, NULL, PlSmallStr, col, lit, when};
+use polars::prelude::{Column, Expr, Field, IntoLazy, NULL, PlSmallStr, Scalar, col, lit, when};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PolynomialDefinition {
@@ -20,6 +20,11 @@ impl PolynomialDefinition {
             ));
         }
         Ok(Self { degree, raw })
+    }
+
+    fn output_name(&self, input_name: &str, exponent: usize) -> PlSmallStr {
+        let call = self.call_name(&[input_name]);
+        format!("{call}[{exponent}]").into()
     }
 }
 
@@ -53,15 +58,150 @@ impl TransformDefinition for PolynomialDefinition {
 #[derive(Debug)]
 enum PolynomialBasis {
     Raw,
+    Orthogonal(OrthogonalBasis),
+}
+
+#[derive(Debug)]
+struct OrthogonalBasis {
+    steps: Vec<RecurrenceStep>,
+}
+
+#[derive(Debug)]
+struct RecurrenceStep {
+    alpha: f64,
+    beta: f64,
+    norm: f64,
 }
 
 impl PolynomialBasis {
-    fn expressions(&self, input: Expr, degree: usize) -> Vec<Expr> {
+    fn evaluate(&self, frame: DataFrame, degree: usize) -> Result<Vec<Column>, TransformError> {
+        let name = argument_column_name(0);
+        let argument = finite_values(col(name.clone()));
+
         match self {
-            Self::Raw => (1..=degree)
-                .map(|exponent| input.clone().pow(lit(exponent as u64)))
-                .collect(),
+            Self::Raw => Ok(frame
+                .lazy()
+                .select(
+                    (1..=degree)
+                        .map(|exponent| {
+                            argument
+                                .clone()
+                                .pow(lit(exponent as u64))
+                                .alias(exponent.to_string())
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .collect()?
+                .into_columns()),
+
+            Self::Orthogonal(basis) => {
+                let prepared = frame.lazy().select([argument]).collect()?;
+                basis.evaluate(prepared.column(name.as_str())?)
+            }
         }
+    }
+}
+
+impl OrthogonalBasis {
+    fn evaluate(&self, values: &Column) -> Result<Vec<Column>, TransformError> {
+        let mut previous = Column::new_scalar("previous".into(), Scalar::from(0.0), values.len());
+        let mut current = Column::new_scalar("current".into(), Scalar::from(1.0), values.len());
+        let mut columns = Vec::with_capacity(self.steps.len());
+
+        for step in &self.steps {
+            let centered = values - step.alpha;
+            let leading = (&centered * &current)?;
+            let correction = &previous * step.beta;
+            let next = (&leading - &correction)?;
+
+            columns.push(&next / step.norm);
+
+            previous = current;
+            current = next;
+        }
+
+        Ok(columns)
+    }
+
+    fn training_frame(input: &Column, degree: usize) -> Result<DataFrame, TransformError> {
+        let name = argument_column_name(0);
+        let frame = input_frame(std::slice::from_ref(input))?
+            .lazy()
+            .select([finite_values(col(name.clone()))])
+            .drop_nulls(None)
+            .collect()?;
+
+        let distinct = frame.column(name.as_str())?.n_unique()?;
+
+        if degree >= distinct {
+            return Err(TransformError::NumericalError(format!(
+                "orthogonal polynomial degree {degree} requires at least {} distinct finite values; found {distinct}",
+                degree.saturating_add(1),
+            )));
+        }
+
+        Ok(frame)
+    }
+
+    fn fit(input: &Column, degree: usize) -> Result<Self, TransformError> {
+        let frame = Self::training_frame(input, degree)?;
+        let values = frame.column(argument_column_name(0).as_str())?;
+
+        // Squared norms of starting polynomials p0 = 1 and p-1 = 0
+        let mut previous = Column::new_scalar("previous".into(), Scalar::from(0.0), frame.height());
+        let mut current = Column::new_scalar("current".into(), Scalar::from(1.0), frame.height());
+        // Initialise values
+        let mut current_norm2 = frame.height() as f64;
+        let mut previous_norm2 = 0.0;
+        let mut steps = Vec::with_capacity(degree);
+
+        for exponent in 1..=degree {
+            let squared = (&current * &current)?;
+            let weighted_values = (values * &squared)?;
+            let weighted_sum = weighted_values.sum_reduce()?.value().try_extract::<f64>()?;
+
+            // Update alpha and beta
+            let alpha = weighted_sum / current_norm2;
+            let beta = if exponent == 1 {
+                0.0
+            } else {
+                current_norm2 / previous_norm2
+            };
+            if !alpha.is_finite() || !beta.is_finite() {
+                return Err(TransformError::NumericalError(format!(
+                    "invalid orthogonal polynomial coefficients at degree {exponent}"
+                )));
+            }
+
+            // Compute the next unnormalized polynomial using the three-term recurrence.
+            let centered = values - alpha;
+            let leading = (&centered * &current)?;
+            let correction = &previous * beta;
+            let next = (&leading - &correction)?;
+            let next_norm2 = (&next * &next)?
+                .sum_reduce()?
+                .value()
+                .try_extract::<f64>()?;
+
+            if !next_norm2.is_finite() || next_norm2 <= 0.0 {
+                return Err(TransformError::NumericalError(format!(
+                    "invalid orthogonal polynomial normalization at degree {exponent}"
+                )));
+            }
+
+            steps.push(RecurrenceStep {
+                alpha,
+                beta,
+                norm: next_norm2.sqrt(),
+            });
+
+            previous = current;
+            current = next;
+            previous_norm2 = current_norm2;
+            current_norm2 = next_norm2;
+        }
+
+        Ok(Self { steps })
     }
 }
 
@@ -101,15 +241,15 @@ impl Definition<PolynomialState> for PolynomialDefinition {
         let input = validate_single_input(inputs)?;
         validate_numeric_input(input)?;
 
-        if !self.raw {
-            return Err(TransformError::InvalidParameter(
-                "orthogonal polynomial encoding is not implemented yet".into(),
-            ));
-        }
+        let basis = if self.raw {
+            PolynomialBasis::Raw
+        } else {
+            PolynomialBasis::Orthogonal(OrthogonalBasis::fit(input, self.degree)?)
+        };
 
         Ok(PolynomialState {
             field: input.field().into_owned(),
-            basis: PolynomialBasis::Raw,
+            basis,
         })
     }
 
@@ -118,19 +258,19 @@ impl Definition<PolynomialState> for PolynomialDefinition {
         state: &PolynomialState,
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
-        let call = self.call_name(&[state.field.name().as_str()]);
         let frame = input_frame(inputs)?;
-        let argument = finite_values(col(argument_column_name(0)));
-
-        let expressions = state
+        let height = frame.height();
+        let columns = state
             .basis
-            .expressions(argument, self.degree)
+            .evaluate(frame, self.degree)?
             .into_iter()
             .enumerate()
-            .map(|(index, expression)| expression.alias(format!("{call}[{}]", index + 1)))
+            .map(|(index, column)| {
+                column.with_name(self.output_name(state.field.name().as_str(), index + 1))
+            })
             .collect::<Vec<_>>();
 
-        Ok(frame.lazy().select(expressions).collect()?)
+        Ok(DataFrame::new(height, columns)?)
     }
 }
 
@@ -146,6 +286,210 @@ fn finite_values(input: Expr) -> Expr {
 mod tests {
     use super::*;
     use crate::fit::Fitted;
+
+    // Absolute tolerance for these small, well-conditioned fixtures.
+    const ORTHOGONAL_TOLERANCE: f64 = 1e-10;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < ORTHOGONAL_TOLERANCE,
+            "expected {expected}, received {actual}"
+        );
+    }
+
+    fn assert_orthogonal_schema(frame: &DataFrame, height: usize, degree: usize) {
+        assert_eq!(frame.shape(), (height, degree));
+        for (index, column) in frame.columns().iter().enumerate() {
+            assert_eq!(column.dtype(), &DataType::Float64);
+            assert_eq!(
+                column.name().as_str(),
+                format!("poly(x, degree={degree}, raw=false)[{}]", index + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn orthogonal_basis_matches_hand_calculated_fixture() -> Result<(), TransformError> {
+        let training = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
+        let fitted = Fitted::fit(PolynomialDefinition::new(2, false)?, &training)?;
+        let output = fitted.transform(&training)?;
+        assert_orthogonal_schema(&output, 3, 2);
+
+        // q1 = x / sqrt(2), q2 = (3*x^2 - 2) / sqrt(6).
+        for (column, expected) in output.columns().iter().zip([
+            [-1.0 / 2.0_f64.sqrt(), 0.0, 1.0 / 2.0_f64.sqrt()],
+            [
+                1.0 / 6.0_f64.sqrt(),
+                -2.0 / 6.0_f64.sqrt(),
+                1.0 / 6.0_f64.sqrt(),
+            ],
+        ]) {
+            for (actual, expected) in column.f64()?.iter().zip(expected) {
+                assert_close(actual.expect("finite training value"), expected);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_training_columns_are_centered_and_orthonormal() -> Result<(), TransformError> {
+        for values in [
+            vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+            vec![0.0, 0.0, 0.2, 1.0, 2.0, 4.0, 7.0],
+            vec![98.0, 99.0, 100.0, 101.0, 103.0, 105.0],
+        ] {
+            let training = [Column::new("x".into(), values)];
+            let fitted = Fitted::fit(PolynomialDefinition::new(3, false)?, &training)?;
+            let output = fitted.transform(&training)?;
+            assert_orthogonal_schema(&output, training[0].len(), 3);
+            let columns = output
+                .columns()
+                .iter()
+                .map(|column| {
+                    column
+                        .f64()
+                        .unwrap()
+                        .iter()
+                        .map(Option::unwrap)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            for (index, column) in columns.iter().enumerate() {
+                assert_close(column.iter().sum::<f64>(), 0.0);
+                for (other_index, other) in columns.iter().enumerate() {
+                    let product = column.iter().zip(other).map(|(a, b)| a * b).sum::<f64>();
+                    assert_close(product, if index == other_index { 1.0 } else { 0.0 });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_prediction_reuses_training_basis() -> Result<(), TransformError> {
+        let training = [Column::new("x".into(), [9.0, 10.0, 11.0])];
+        let fitted = Fitted::fit(PolynomialDefinition::new(2, false)?, &training)?;
+        let prediction = [Column::new("x".into(), [12.0])];
+        for _ in 0..2 {
+            let output = fitted.transform(&prediction)?;
+            assert_orthogonal_schema(&output, 1, 2);
+            assert_close(output[0].f64()?.get(0).unwrap(), 2.0 / 2.0_f64.sqrt());
+            assert_close(output[1].f64()?.get(0).unwrap(), 10.0 / 6.0_f64.sqrt());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_fit_ignores_missing_values_and_prediction_preserves_rows()
+    -> Result<(), TransformError> {
+        let clean = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
+        let missing = [Column::new(
+            "x".into(),
+            [
+                Some(-1.0),
+                None,
+                Some(f64::NAN),
+                Some(0.0),
+                Some(f64::INFINITY),
+                Some(1.0),
+                Some(f64::NEG_INFINITY),
+            ],
+        )];
+        let definition = PolynomialDefinition::new(2, false)?;
+        let clean_fit = Fitted::fit(definition.clone(), &clean)?;
+        let missing_fit = Fitted::fit(definition, &missing)?;
+        let expected = clean_fit.transform(&clean)?;
+
+        for fitted in [&clean_fit, &missing_fit] {
+            let output = fitted.transform(&missing)?;
+            assert_orthogonal_schema(&output, 7, 2);
+            for (column, expected) in output.columns().iter().zip(expected.columns()) {
+                assert_eq!(column.null_count(), 4);
+                for row in [1, 2, 4, 6] {
+                    assert_eq!(column.f64()?.get(row), None);
+                }
+                for (row, expected_row) in [(0, 0), (3, 1), (5, 2)] {
+                    assert_close(
+                        column.f64()?.get(row).unwrap(),
+                        expected.f64()?.get(expected_row).unwrap(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_fit_rejects_insufficient_distinct_finite_values() -> Result<(), TransformError> {
+        for (degree, values) in [
+            (1, vec![]),
+            (1, vec![None, None]),
+            (
+                1,
+                vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
+            ),
+            (1, vec![Some(2.0), Some(2.0), Some(2.0)]),
+            (
+                2,
+                vec![
+                    Some(0.0),
+                    Some(1.0),
+                    Some(0.0),
+                    Some(1.0),
+                    None,
+                    Some(f64::NAN),
+                ],
+            ),
+        ] {
+            assert!(matches!(
+                Fitted::fit(
+                    PolynomialDefinition::new(degree, false)?,
+                    &[Column::new("x".into(), values)]
+                ),
+                Err(TransformError::NumericalError(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_empty_and_all_missing_predictions_retain_schema() -> Result<(), TransformError> {
+        let training = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
+        let fitted = Fitted::fit(PolynomialDefinition::new(2, false)?, &training)?;
+        for values in [
+            vec![],
+            vec![None, None],
+            vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
+        ] {
+            let height = values.len();
+            let output = fitted.transform(&[Column::new("x".into(), values)])?;
+            assert_orthogonal_schema(&output, height, 2);
+            for column in output.columns() {
+                assert_eq!(column.null_count(), height);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_fit_rejects_numerically_invalid_coefficients_and_norms()
+    -> Result<(), TransformError> {
+        for values in [
+            vec![f64::MAX, f64::MAX / 2.0, f64::MAX / 4.0],
+            vec![-f64::MAX, 0.0, f64::MAX],
+            vec![-1e-200, 0.0, 1e-200],
+        ] {
+            assert!(matches!(
+                Fitted::fit(
+                    PolynomialDefinition::new(1, false)?,
+                    &[Column::new("x".into(), values)]
+                ),
+                Err(TransformError::NumericalError(_))
+            ));
+        }
+        Ok(())
+    }
 
     fn assert_raw_schema(frame: &DataFrame, height: usize, degree: usize) {
         assert_eq!(frame.shape(), (height, degree));
