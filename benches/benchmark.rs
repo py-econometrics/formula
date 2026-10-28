@@ -20,7 +20,7 @@ fn sample_data(rows: usize) -> PolarsResult<DataFrame> {
         _ => Some(value),
     };
 
-    df!(
+    let mut data = df!(
         "y" => (0..rows).map(|i| numeric(i, i as f64)).collect::<Vec<_>>(),
         "a" => (0..rows).map(|i| numeric(i, 1.0 + (i % 100) as f64)).collect::<Vec<_>>(),
         "b" => (0..rows).map(|i| numeric(i, 1.0 + (i % 73) as f64)).collect::<Vec<_>>(),
@@ -33,7 +33,16 @@ fn sample_data(rows: usize) -> PolarsResult<DataFrame> {
                 Some("second")
             }
         }).collect::<Vec<_>>(),
-    )
+    )?;
+    let categorical = data
+        .column("g1")?
+        .cast(&DataType::from_categories(Categories::random(
+            "formula-benchmarks".into(),
+            CategoricalPhysical::U32,
+        )))?
+        .with_name("g_cat".into());
+    data.with_column(categorical)?;
+    Ok(data)
 }
 
 fn measure<T>(iterations: usize, run: &mut impl FnMut() -> T) -> (f64, Vec<T>) {
@@ -102,6 +111,9 @@ fn main() {
         ("numeric", "y ~ a*b"),
         ("transform", "y ~ log(a) + sqrt(b)"),
         ("categorical", "y ~ C(g1)"),
+        ("categorical_native", "y ~ C(g_cat)"),
+        ("integer", "y ~ F(g1)"),
+        ("integer_native", "y ~ F(g_cat)"),
         ("interaction", "y ~ a:C(g1)"),
     ] {
         results.samples.extend(measure_samples(
