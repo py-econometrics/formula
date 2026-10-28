@@ -99,7 +99,7 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         {
             return Ok(IntegerEncodingState {
                 fields,
-                encoding: IntegerEncoding::Native(input.unique_stable()?.drop_nulls()),
+                encoding: IntegerEncoding::Native(input.drop_nulls().unique_stable()?),
             });
         }
 

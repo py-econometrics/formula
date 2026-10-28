@@ -156,7 +156,9 @@ impl Definition<CategoricalState> for CategoricalDefinition {
     }
 
     fn fit(&self, inputs: &[Column]) -> Result<CategoricalState, TransformError> {
-        let levels = validate_single_input(inputs)?.unique_stable()?.drop_nulls();
+        let levels = validate_single_input(inputs)?
+            .drop_nulls()
+            .unique_stable()?;
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
             levels.filter(&levels.is_finite()?)?
