@@ -3,8 +3,8 @@ use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
-    Column, DataFrame, DataType, IntoLazy, JoinType, MaintainOrderJoin, PlSmallStr, all_horizontal,
-    col,
+    Column, DataFrame, DataType, Field, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin, NULL,
+    all_horizontal, col, lit, when,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -12,8 +12,14 @@ pub(crate) struct IntegerEncodingDefinition;
 
 #[derive(Debug)]
 pub(crate) struct IntegerEncodingState {
-    names: Vec<PlSmallStr>,
-    mapping: DataFrame,
+    fields: Vec<Field>,
+    encoding: IntegerEncoding,
+}
+
+#[derive(Debug)]
+enum IntegerEncoding {
+    Mapping(DataFrame),
+    Native(Column),
 }
 
 impl IntegerEncodingDefinition {
@@ -44,9 +50,9 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         state: &IntegerEncodingState,
         inputs: &[Column],
     ) -> Result<(), TransformError> {
-        if inputs.len() != state.names.len() {
+        if inputs.len() != state.fields.len() {
             return Err(TransformError::InputCountMismatch {
-                expected: ArgumentCount::Exactly(state.names.len()),
+                expected: ArgumentCount::Exactly(state.fields.len()),
                 actual: inputs.len(),
             });
         }
@@ -54,21 +60,23 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         if !inputs
             .iter()
             .map(|input| input.name())
-            .eq(state.names.iter())
+            .eq(state.fields.iter().map(Field::name))
         {
             return Err(TransformError::InputNamesMismatch {
-                expected: state.names.clone(),
+                expected: state
+                    .fields
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
                 actual: inputs.iter().map(|input| input.name().clone()).collect(),
             });
         }
 
-        for (index, input) in inputs.iter().enumerate() {
-            let expected = state.mapping.column(&argument_column_name(index))?.dtype();
-
-            if input.dtype() != expected {
+        for (input, expected) in inputs.iter().zip(&state.fields) {
+            if input.dtype() != expected.dtype() {
                 return Err(TransformError::InputTypeMismatch {
                     name: input.name().clone(),
-                    expected: expected.to_string(),
+                    expected: expected.dtype().to_string(),
                     actual: input.dtype().to_string(),
                 });
             }
@@ -78,6 +86,23 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
     }
 
     fn fit(&self, inputs: &[Column]) -> Result<IntegerEncodingState, TransformError> {
+        let fields = inputs
+            .iter()
+            .map(|input| input.field().into_owned())
+            .collect();
+        // Use native codes for a single column in Polars' Categorical/Enum dtype
+        if let [input] = inputs
+            && matches!(
+                input.dtype(),
+                DataType::Categorical(_, _) | DataType::Enum(_, _)
+            )
+        {
+            return Ok(IntegerEncodingState {
+                fields,
+                encoding: IntegerEncoding::Native(input.unique_stable()?.drop_nulls()),
+            });
+        }
+
         let mapping = input_frame(inputs)?
             .lazy()
             .drop_nulls(None)
@@ -96,11 +121,13 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         };
 
         Ok(IntegerEncodingState {
-            names: inputs.iter().map(|input| input.name().clone()).collect(),
-            mapping: mapping
-                .with_row_index(Self::CODE_COLUMN, None)
-                .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
-                .collect()?,
+            fields,
+            encoding: IntegerEncoding::Mapping(
+                mapping
+                    .with_row_index(Self::CODE_COLUMN, None)
+                    .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
+                    .collect()?,
+            ),
         })
     }
 
@@ -109,27 +136,45 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         state: &IntegerEncodingState,
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
-        let mapping = &state.mapping;
         let input_frame = input_frame(inputs)?;
-        let keys = input_frame
-            .columns()
-            .iter()
-            .map(|column| col(column.name().clone()))
-            .collect::<Vec<_>>();
+        let output_name = call_name("F", state.fields.iter().map(|field| field.name().as_str()));
 
-        let output_name = call_name("F", state.names.iter().map(|name| name.as_str()));
-
-        Ok(input_frame
-            .lazy()
-            .join_builder()
-            .with(mapping.clone().lazy())
-            .how(JoinType::Left)
-            .on(keys)
-            .join_nulls(false)
-            .maintain_order(MaintainOrderJoin::Left)
-            .finish()
-            .select([col(IntegerEncodingDefinition::CODE_COLUMN).alias(output_name)])
-            .collect()?)
+        match &state.encoding {
+            IntegerEncoding::Native(levels) => {
+                let argument = col(argument_column_name(0));
+                // Check if levels were observed during fitting
+                let observed = argument
+                    .clone()
+                    .is_in(lit(levels.implode()?.into_series()), false);
+                Ok(input_frame
+                    .lazy()
+                    .select([when(observed)
+                        .then(argument.to_physical().cast(DataType::UInt32))
+                        .otherwise(lit(NULL))
+                        .alias(output_name)])
+                    .collect()?)
+            }
+            IntegerEncoding::Mapping(mapping) => {
+                // Collect level combinations observed during fitting
+                let level_keys = input_frame
+                    .columns()
+                    .iter()
+                    .map(|column| col(column.name().clone()))
+                    .collect::<Vec<_>>();
+                // Join observed levels in input frame on to fitted levels
+                Ok(input_frame
+                    .lazy()
+                    .join_builder()
+                    .with(mapping.clone().lazy())
+                    .how(JoinType::Left)
+                    .on(level_keys)
+                    .join_nulls(false)
+                    .maintain_order(MaintainOrderJoin::Left)
+                    .finish()
+                    .select([col(IntegerEncodingDefinition::CODE_COLUMN).alias(output_name)])
+                    .collect()?)
+            }
+        }
     }
 }
 
@@ -139,6 +184,25 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use polars::error::PolarsError;
+    use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+
+    fn native_dtypes() -> Vec<DataType> {
+        let categorical = DataType::from_categories(Categories::random(
+            "formula-tests".into(),
+            CategoricalPhysical::U32,
+        ));
+        for label in ["a", "b", "c", "d"] {
+            categorical
+                .cat_mapping()
+                .unwrap()
+                .insert_cat(label)
+                .unwrap();
+        }
+        vec![
+            categorical,
+            DataType::from_frozen_categories(FrozenCategories::new(["a", "b", "c", "d"]).unwrap()),
+        ]
+    }
 
     fn assert_integer_output(actual: &DataFrame, expected: &[Option<u32>]) {
         assert_eq!(actual.shape(), (expected.len(), 1));
@@ -224,16 +288,153 @@ mod tests {
         ];
         let definition = IntegerEncodingDefinition;
         let transform = definition.fit(&training)?;
-        let fitted_names = transform.names.clone();
-        let fitted_mapping = transform.mapping.clone();
+        let fitted_fields = transform.fields.clone();
+        let IntegerEncoding::Mapping(mapping) = &transform.encoding else {
+            panic!("expected combination mapping");
+        };
+        let fitted_mapping = mapping.clone();
 
         for _ in 0..2 {
             let output = definition.transform(&transform, &input)?;
             // Codes are returned in order input data
             assert_integer_output(&output, &[Some(3), Some(2), Some(1), Some(0), None]);
             assert_eq!(output.columns()[0].name().as_str(), "F(f1, f2)");
-            assert_eq!(transform.names, fitted_names);
-            assert!(transform.mapping.equals_missing(&fitted_mapping));
+            assert_eq!(transform.fields, fitted_fields);
+            assert!(mapping.equals_missing(&fitted_mapping));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_encoding_preserves_codes_and_masks_unobserved_levels() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [
+                Column::new("x".into(), [Some("d"), None, Some("b"), Some("d")]).cast(&dtype)?,
+            ];
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+            let IntegerEncoding::Native(levels) = &fitted.state.encoding else {
+                panic!("expected native encoding");
+            };
+            assert_eq!(levels.len(), 2);
+            assert_eq!(levels.null_count(), 0);
+
+            let input = [Column::new(
+                "x".into(),
+                [Some("b"), Some("a"), None, Some("d"), Some("c"), Some("b")],
+            )
+            .cast(&dtype)?];
+            let output = fitted.transform(&input)?;
+            assert_integer_output(&output, &[Some(1), None, None, Some(3), None, Some(1)]);
+            assert_eq!(output.columns()[0].name().as_str(), "F(x)");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_encoding_handles_empty_and_all_null_inputs() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            for values in [vec![], vec![None::<&str>, None]] {
+                let training = [Column::new("x".into(), values).cast(&dtype)?];
+                let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+                let input = [Column::new("x".into(), [Some("a"), None]).cast(&dtype)?];
+                assert_integer_output(&fitted.transform(&input)?, &[None, None]);
+            }
+
+            let training = [Column::new("x".into(), ["a"]).cast(&dtype)?];
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+            let empty = [training[0].slice(0, 0)];
+            assert_integer_output(&fitted.transform(&empty)?, &[]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_encoding_does_not_learn_levels_from_dictionary_growth() -> Result<(), TransformError>
+    {
+        let dtype = native_dtypes().remove(0);
+        let training = [Column::new("x".into(), ["b"]).cast(&dtype)?];
+        let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+        let input = [Column::new("x".into(), ["new", "b", "a"]).cast(&dtype)?];
+
+        for _ in 0..2 {
+            assert_integer_output(&fitted.transform(&input)?, &[None, Some(1), None]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_encoding_rejects_incompatible_dictionaries() -> Result<(), TransformError> {
+        for (dtype, incompatible) in native_dtypes().into_iter().zip([
+            DataType::from_categories(Categories::random(
+                "formula-tests".into(),
+                CategoricalPhysical::U32,
+            )),
+            DataType::from_frozen_categories(FrozenCategories::new(["b", "a", "c", "d"])?),
+        ]) {
+            let training = [Column::new("x".into(), ["a", "b"]).cast(&dtype)?];
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+            let input = [Column::new("x".into(), ["a", "b"]).cast(&incompatible)?];
+            assert!(matches!(
+                fitted.transform(&input),
+                Err(TransformError::InputTypeMismatch { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enum_encoding_widens_physical_codes_to_uint32() -> Result<(), TransformError> {
+        for count in [256, 65_536] {
+            let labels = (0..count).map(|i| format!("level{i}")).collect::<Vec<_>>();
+            let dtype = DataType::from_frozen_categories(FrozenCategories::new(
+                labels.iter().map(String::as_str),
+            )?);
+            let training = [Column::new("x".into(), [labels[count - 1].as_str()]).cast(&dtype)?];
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+            assert_integer_output(&fitted.transform(&training)?, &[Some((count - 1) as u32)]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_columns_in_combinations_use_observed_tuple_codes() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let training = [
+                Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?,
+                Column::new("n".into(), [1_i32, 1, 2]),
+            ];
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+            let input = [
+                Column::new(
+                    "x".into(),
+                    [Some("d"), Some("b"), Some("a"), None, Some("b")],
+                )
+                .cast(&dtype)?,
+                Column::new("n".into(), [2_i32, 2, 1, 1, 1]),
+            ];
+            assert_integer_output(
+                &fitted.transform(&input)?,
+                &[Some(2), None, None, None, Some(1)],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn combinations_support_two_native_columns() -> Result<(), TransformError> {
+        for left_dtype in native_dtypes() {
+            for right_dtype in native_dtypes() {
+                let training = [
+                    Column::new("x".into(), ["d", "b", "d"]).cast(&left_dtype)?,
+                    Column::new("z".into(), ["a", "a", "c"]).cast(&right_dtype)?,
+                ];
+                let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
+                let input = [
+                    Column::new("x".into(), ["d", "b", "a", "b"]).cast(&left_dtype)?,
+                    Column::new("z".into(), ["c", "c", "a", "a"]).cast(&right_dtype)?,
+                ];
+                assert_integer_output(&fitted.transform(&input)?, &[Some(2), None, None, Some(1)]);
+            }
         }
         Ok(())
     }

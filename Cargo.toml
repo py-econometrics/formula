@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-polars = { version = "0.55.2", default-features = false, features = ["lazy", "log", "fmt", "dtype-categorical"] }
+polars = { version = "0.55.2", default-features = false, features = ["lazy", "log", "fmt", "dtype-categorical", "is_in", "dtype-u8", "dtype-u16"] }
 winnow = "1.0.4"
 
 [dev-dependencies]
