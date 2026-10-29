@@ -110,6 +110,29 @@ fn main() {
     for (name, source) in [
         ("numeric", "y ~ a*b"),
         ("transform", "y ~ log(a) + sqrt(b)"),
+        ("polynomial_raw_degree3", "y ~ poly(a, degree=3, raw=true)"),
+        ("polynomial_orthogonal_degree3", "y ~ poly(a, degree=3)"),
+        (
+            "polynomial_raw_degree10",
+            "y ~ poly(a, degree=10, raw=true)",
+        ),
+        ("polynomial_orthogonal_degree10", "y ~ poly(a, degree=10)"),
+        (
+            "polynomial_raw_interaction",
+            "y ~ poly(a, degree=3, raw=true)*b",
+        ),
+        (
+            "polynomial_orthogonal_interaction",
+            "y ~ poly(a, degree=3)*b",
+        ),
+        (
+            "polynomial_raw_basis_interaction",
+            "y ~ poly(a, degree=3, raw=true)*poly(b, degree=3, raw=true)",
+        ),
+        (
+            "polynomial_orthogonal_basis_interaction",
+            "y ~ poly(a, degree=3)*poly(b, degree=3)",
+        ),
         ("categorical", "y ~ C(g1)"),
         ("categorical_native", "y ~ C(g_cat)"),
         ("integer", "y ~ F(g1)"),

@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_encoding_suorts_multiple_inputs() -> Result<(), TransformError> {
+    fn integer_encoding_supports_multiple_inputs() -> Result<(), TransformError> {
         let input = [
             Column::new("f1".into(), ["a", "a", "a", "b", "a"]),
             Column::new("f2".into(), [1_i32, 1, 2, 1, 1]),
