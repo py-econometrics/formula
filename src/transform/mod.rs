@@ -9,10 +9,12 @@ pub(crate) use expression::ExpressionTransform;
 pub use input::ArgumentCount;
 pub(crate) use input::validate_numeric_input;
 pub(crate) use integer::IntegerEncodingDefinition;
+pub(crate) use polynomial::PolynomialDefinition;
 
 use crate::fit::{Fit, FitError};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
+use crate::transform::polynomial::PolynomialState;
 use polars::error::PolarsError;
 use polars::prelude::{Column, DataFrame, PlSmallStr};
 
@@ -26,6 +28,7 @@ pub enum Transform {
     Expression(ExpressionTransform),
     C(Fit<CategoricalDefinition, CategoricalState>),
     F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
+    Poly(Fit<PolynomialDefinition, PolynomialState>),
 }
 
 pub(crate) trait TransformDefinition {
@@ -41,28 +44,25 @@ pub(crate) trait TransformDefinition {
 }
 
 impl Transform {
-    pub(crate) fn expands(&self) -> bool {
+    fn definition(&self) -> &dyn TransformDefinition {
         match self {
-            Self::Expression(expression) => expression.expands(),
-            Self::C(categorical) => categorical.definition().expands(),
-            Self::F(integer) => integer.definition().expands(),
+            Self::Expression(expression) => expression,
+            Self::C(categorical) => categorical.definition(),
+            Self::F(integer) => integer.definition(),
+            Self::Poly(polynomial) => polynomial.definition(),
         }
+    }
+
+    pub(crate) fn expands(&self) -> bool {
+        self.definition().expands()
     }
 
     pub(crate) fn argument_count(&self) -> ArgumentCount {
-        match self {
-            Self::Expression(expression) => expression.argument_count(),
-            Self::C(categorical) => categorical.definition().argument_count(),
-            Self::F(integer) => integer.definition().argument_count(),
-        }
+        self.definition().argument_count()
     }
 
     pub(crate) fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
-        match self {
-            Self::Expression(expression) => expression.call_name(arguments),
-            Self::C(categorical) => categorical.definition().call_name(arguments),
-            Self::F(integer) => integer.definition().call_name(arguments),
-        }
+        self.definition().call_name(arguments)
     }
 
     pub(crate) fn fit(&self, inputs: &[Column]) -> Result<Self, TransformError> {
@@ -73,6 +73,7 @@ impl Transform {
             Self::Expression(expression) => Ok(Self::Expression(expression.fit())),
             Self::C(categorical) => Ok(Self::C(categorical.fit(inputs)?)),
             Self::F(integer) => Ok(Self::F(integer.fit(inputs)?)),
+            Self::Poly(polynomial) => Ok(Self::Poly(polynomial.fit(inputs)?)),
         }
     }
 
@@ -89,6 +90,7 @@ impl Transform {
             }
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),
+            Self::Poly(polynomial) => polynomial.transform(inputs),
         }
     }
 }

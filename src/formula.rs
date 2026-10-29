@@ -710,6 +710,239 @@ mod tests {
     use polars::prelude::Scalar;
     use winnow::Parser;
 
+    mod polynomial {
+        use super::*;
+        use crate::transform::TRANSFORM_CALLS;
+
+        fn materialize(source: &str, data: &DataFrame) -> crate::Model {
+            let models = crate::parse(source).unwrap().materialize(data).unwrap();
+            models.iter().next().unwrap().1.clone()
+        }
+
+        #[test]
+        fn raw_materialization_and_prediction_preserve_values_and_schema() {
+            let training = polars::df!(
+                "y" => [1.0, 2.0, 3.0, 4.0, 5.0],
+                "x" => [Some(2.0), Some(-3.0), None, Some(f64::NAN), Some(f64::INFINITY)],
+            )
+            .unwrap();
+            let model = materialize("y ~ poly(x, degree=3, raw=true)", &training);
+            let expected = polars::df!(
+                "Intercept" => [1.0; 5],
+                "poly(x, degree=3, raw=true)[1]" => [Some(2.0), Some(-3.0), None, None, None],
+                "poly(x, degree=3, raw=true)[2]" => [Some(4.0), Some(9.0), None, None, None],
+                "poly(x, degree=3, raw=true)[3]" => [Some(8.0), Some(-27.0), None, None, None],
+            )
+            .unwrap();
+            assert!(model.right().frame().equals_missing(&expected));
+
+            let prediction = polars::df!("y" => [6.0, 7.0], "x" => [Some(4.0), None]).unwrap();
+            let output = model.evaluate(&prediction).unwrap();
+            let expected = polars::df!(
+                "Intercept" => [1.0; 2],
+                "poly(x, degree=3, raw=true)[1]" => [Some(4.0), None],
+                "poly(x, degree=3, raw=true)[2]" => [Some(16.0), None],
+                "poly(x, degree=3, raw=true)[3]" => [Some(64.0), None],
+            )
+            .unwrap();
+            assert!(output.right().frame().equals_missing(&expected));
+        }
+
+        #[test]
+        fn orthogonal_prediction_reuses_coefficients_and_preserves_missing_rows() {
+            let training = polars::df!(
+                "y" => [1.0; 6],
+                "x" => [Some(-1.0), Some(0.0), Some(1.0), None, Some(f64::NAN), Some(f64::INFINITY)],
+            ).unwrap();
+            let model = materialize("y ~ poly(x, degree=2)", &training);
+            assert_eq!(model.right().frame().shape(), (6, 3));
+            for column in &model.right().frame().columns()[1..] {
+                assert_eq!(column.null_count(), 3);
+                for row in 3..6 {
+                    assert_eq!(column.f64().unwrap().get(row), None);
+                }
+            }
+
+            let prediction = polars::df!("y" => [2.0, 3.0], "x" => [Some(2.0), None]).unwrap();
+            for _ in 0..2 {
+                TRANSFORM_CALLS.set((0, 0));
+                let output = model.evaluate(&prediction).unwrap();
+                assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
+                let frame = output.right().frame();
+                assert_eq!(
+                    frame.get_column_names(),
+                    [
+                        "Intercept",
+                        "poly(x, degree=2, raw=false)[1]",
+                        "poly(x, degree=2, raw=false)[2]",
+                    ]
+                );
+                for (column, expected) in frame.columns()[1..]
+                    .iter()
+                    .zip([2.0 / 2.0_f64.sqrt(), 10.0 / 6.0_f64.sqrt()])
+                {
+                    assert!((column.f64().unwrap().get(0).unwrap() - expected).abs() < 1e-12);
+                    assert_eq!(column.f64().unwrap().get(1), None);
+                }
+            }
+        }
+
+        #[test]
+        fn empty_predictions_retain_both_basis_schemas() {
+            let training = polars::df!("y" => [1.0; 3], "x" => [-1.0, 0.0, 1.0]).unwrap();
+            let empty = polars::df!("y" => Vec::<f64>::new(), "x" => Vec::<f64>::new()).unwrap();
+            for source in ["y ~ poly(x, degree=2)", "y ~ poly(x, degree=2, raw=true)"] {
+                let model = materialize(source, &training);
+                let output = model.evaluate(&empty).unwrap();
+                assert_eq!(output.right().frame().shape(), (0, 3));
+                assert_eq!(output.left().frame().shape(), (0, 1));
+                assert_eq!(
+                    output.right().frame().schema(),
+                    model.right().frame().schema()
+                );
+            }
+        }
+
+        #[test]
+        fn nested_numeric_inputs_match_explicit_transforms() {
+            let data = polars::df!(
+                "y" => [1.0; 3], "x" => [1.0, std::f64::consts::E, std::f64::consts::E.powi(2)],
+            )
+            .unwrap();
+            let expected = materialize("y ~ log(x) + mul(log(x), log(x))", &data);
+            TRANSFORM_CALLS.set((0, 0));
+            let actual = materialize("y ~ poly(log(x), degree=2, raw=true)", &data);
+            assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
+            assert_eq!(
+                actual.right().frame().get_column_names(),
+                [
+                    "Intercept",
+                    "poly(log(x), degree=2, raw=true)[1]",
+                    "poly(log(x), degree=2, raw=true)[2]",
+                ]
+            );
+            for (actual, expected) in actual
+                .right()
+                .frame()
+                .columns()
+                .iter()
+                .zip(expected.right().frame().columns())
+            {
+                assert_eq!(
+                    actual.f64().unwrap().iter().collect::<Vec<_>>(),
+                    expected.f64().unwrap().iter().collect::<Vec<_>>()
+                );
+            }
+        }
+
+        #[test]
+        fn basis_by_column_interactions_preserve_order_and_values() {
+            let data =
+                polars::df!("y" => [1.0, 2.0], "x" => [2.0, 3.0], "z" => [5.0, 7.0]).unwrap();
+            let model = materialize("y ~ poly(x, degree=2, raw=true):z - 1", &data);
+            let expected = polars::df!(
+                "poly(x, degree=2, raw=true)[1]:z" => [10.0, 21.0],
+                "poly(x, degree=2, raw=true)[2]:z" => [20.0, 63.0],
+            )
+            .unwrap();
+            assert!(model.right().frame().equals_missing(&expected));
+        }
+
+        #[test]
+        fn basis_by_basis_interactions_form_the_cartesian_product() {
+            let data =
+                polars::df!("y" => [1.0, 2.0], "x" => [2.0, 3.0], "z" => [5.0, 7.0]).unwrap();
+            let model = materialize(
+                "y ~ poly(x, degree=2, raw=true):poly(z, degree=2, raw=true) - 1",
+                &data,
+            );
+            let expected = polars::df!(
+                "poly(x, degree=2, raw=true)[1]:poly(z, degree=2, raw=true)[1]" => [10.0, 21.0],
+                "poly(x, degree=2, raw=true)[1]:poly(z, degree=2, raw=true)[2]" => [50.0, 147.0],
+                "poly(x, degree=2, raw=true)[2]:poly(z, degree=2, raw=true)[1]" => [20.0, 63.0],
+                "poly(x, degree=2, raw=true)[2]:poly(z, degree=2, raw=true)[2]" => [100.0, 441.0],
+            )
+            .unwrap();
+            assert!(model.right().frame().equals_missing(&expected));
+        }
+
+        #[test]
+        fn polynomial_calls_reject_expanding_compositions() {
+            let data = polars::df!("y" => [1.0], "x" => [2.0], "z" => [3.0], "g" => ["a"]).unwrap();
+            for source in [
+                "y ~ poly(C(g))",
+                "y ~ log(poly(x))",
+                "y ~ poly(poly(x))",
+                "y ~ poly(add(x, poly(z)))",
+            ] {
+                assert!(
+                    matches!(
+                        crate::parse(source).unwrap().materialize(&data),
+                        Err(EvaluationError::Validation(
+                            ValidationError::InvalidTransformComposition
+                        ))
+                    ),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn polynomial_calls_require_exactly_one_positional_argument() {
+            let data = polars::df!("y" => [1.0], "x" => [2.0], "z" => [3.0]).unwrap();
+            for (source, count) in [
+                ("y ~ poly()", 0),
+                ("y ~ poly(x, z)", 2),
+                ("y ~ poly(x, 2)", 2),
+            ] {
+                assert!(
+                    matches!(
+                        crate::parse(source).unwrap().materialize(&data),
+                        Err(EvaluationError::Validation(ValidationError::InvalidArgumentCount {
+                            expected: ArgumentCount::Exactly(1), actual, ..
+                        })) if actual == count
+                    ),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn scheduling_reuses_identical_calls_and_distinguishes_configurations() {
+            let training =
+                polars::df!("y" => [1.0; 4], "x" => [-2.0, -1.0, 1.0, 2.0], "z" => [2.0; 4])
+                    .unwrap();
+            let specification = crate::parse_many([
+                "y ~ poly(x) + poly(x, degree=1, raw=false)",
+                "y ~ poly(x, degree=2) + poly(x, degree=2, raw=true)",
+                "y ~ poly(x, raw=false, degree=1):z",
+            ])
+            .unwrap();
+            TRANSFORM_CALLS.set((0, 0));
+            let models = specification.materialize(&training).unwrap();
+            assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
+            assert_eq!(
+                models
+                    .iter()
+                    .map(|(_, m)| m.right().frame().width())
+                    .collect::<Vec<_>>(),
+                [2, 5, 2]
+            );
+
+            let prediction = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
+            TRANSFORM_CALLS.set((0, 0));
+            let output = models.evaluate(&prediction).unwrap();
+            assert_eq!(TRANSFORM_CALLS.get(), (0, 3));
+            assert_eq!(
+                output
+                    .iter()
+                    .map(|(_, m)| m.right().frame().shape())
+                    .collect::<Vec<_>>(),
+                [(1, 2), (1, 5), (1, 2)]
+            );
+        }
+    }
+
     #[test]
     fn multiplicative_operators_preserve_column_order() {
         let data = polars::df!("a" => [2.0], "b" => [3.0], "c" => [4.0]).unwrap();

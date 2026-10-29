@@ -1,7 +1,8 @@
 use crate::fit::Fit;
 use crate::formula::{Expression, Factor, Formula, Specification, Term, push_unique};
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, PolynomialDefinition,
+    Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -29,16 +30,20 @@ enum TransformCallArgument {
 
 #[derive(Debug)]
 enum TransformCallError {
+    UnknownTransform(String),
     DuplicateKeyword {
         name: String,
     },
     PositionalAfterKeyword {
         position: usize,
     },
-    UnknownTransform(String),
     UnexpectedKeywords {
         transform: &'static str,
         keywords: Vec<String>,
+    },
+    InvalidParameter {
+        transform: &'static str,
+        message: String,
     },
 }
 
@@ -63,6 +68,12 @@ impl std::fmt::Display for TransformCallError {
                 "unexpected keywords for transform `{transform}`: {}",
                 keywords.join(", ")
             ),
+            Self::InvalidParameter { transform, message } => {
+                write!(
+                    f,
+                    "invalid parameter for transform `{transform}`: {message}"
+                )
+            }
         }
     }
 }
@@ -548,6 +559,20 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("F", keywords)?;
                 Transform::F(Fit::Unfitted(IntegerEncodingDefinition))
             }
+            "poly" => {
+                let degree = keywords.remove("degree");
+                let raw = keywords.remove("raw");
+                reject_keywords("poly", keywords)?;
+
+                let definition = PolynomialDefinition::new(degree, raw).map_err(|error| {
+                    TransformCallError::InvalidParameter {
+                        transform: "poly",
+                        message: error.to_string(),
+                    }
+                })?;
+
+                Transform::Poly(Fit::Unfitted(definition))
+            }
             _ => return Err(TransformCallError::UnknownTransform(call.name)),
         };
 
@@ -575,6 +600,99 @@ fn reject_keywords(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn polynomial_defaults_and_keyword_order_preserve_identity() {
+        for (source, equivalent) in [
+            ("y ~ poly(x)", "y ~ poly(x, degree=1, raw=false)"),
+            ("y ~ poly(x, degree=3)", "y ~ poly(x, raw=false, degree=3)"),
+            (
+                "y ~ poly(x, degree=3, raw=true)",
+                "y ~ poly(x, raw=true, degree=3)",
+            ),
+            (
+                "y ~ poly( x , raw = TRUE , degree = 3 )",
+                "y ~ poly(x, degree=3, raw=true)",
+            ),
+        ] {
+            assert_eq!(
+                parse(source).unwrap(),
+                parse(equivalent).unwrap(),
+                "{source}"
+            );
+        }
+        assert_ne!(
+            parse("y ~ poly(x, degree=2)").unwrap(),
+            parse("y ~ poly(x, degree=3)").unwrap(),
+        );
+        assert_ne!(
+            parse("y ~ poly(x, raw=false)").unwrap(),
+            parse("y ~ poly(x, raw=true)").unwrap(),
+        );
+    }
+
+    #[test]
+    fn polynomial_calls_construct_the_configured_transform() {
+        for (source, degree, raw) in [
+            ("poly(x)", 1_i64, false),
+            ("poly(x, degree=3)", 3, false),
+            ("poly(x, degree=2, raw=true)", 2, true),
+        ] {
+            let expected = Factor::Call {
+                transform: Transform::Poly(Fit::Unfitted(
+                    PolynomialDefinition::new(Some(Scalar::from(degree)), Some(Scalar::from(raw)))
+                        .unwrap(),
+                )),
+                arguments: vec![Arc::new(Factor::from("x"))],
+            };
+            assert_eq!(parse_factor.parse(source).unwrap(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn invalid_polynomial_parameters_identify_the_transform_and_parameter() {
+        for (source, parameter) in [
+            ("y ~ poly(x, degree=0)", "degree"),
+            ("y ~ poly(x, degree=-1)", "degree"),
+            ("y ~ poly(x, degree=3.0)", "degree"),
+            ("y ~ poly(x, degree=1e3)", "degree"),
+            ("y ~ poly(x, degree=true)", "degree"),
+            ("y ~ poly(x, degree='3')", "degree"),
+            ("y ~ poly(x, raw=1)", "raw"),
+            ("y ~ poly(x, raw='true')", "raw"),
+        ] {
+            let error = parse(source).unwrap_err();
+            let cause = error
+                .inner()
+                .cause()
+                .and_then(|cause| cause.downcast_ref::<TransformCallError>());
+            assert!(
+                matches!(cause,
+                    Some(TransformCallError::InvalidParameter { transform: "poly", message })
+                        if message.contains(parameter)
+                ),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn polynomial_keywords_follow_shared_argument_rules() {
+        let error = parse("y ~ poly(x, degree=2, degree=3)").unwrap_err();
+        assert!(matches!(
+            error.inner().cause().and_then(|cause| cause.downcast_ref::<TransformCallError>()),
+            Some(TransformCallError::DuplicateKeyword { name }) if name == "degree"
+        ));
+
+        let error = parse("y ~ poly(degree=2, x)").unwrap_err();
+        assert!(matches!(
+            error
+                .inner()
+                .cause()
+                .and_then(|cause| cause.downcast_ref::<TransformCallError>()),
+            Some(TransformCallError::PositionalAfterKeyword { position: 2 })
+        ));
+    }
 
     fn expression(terms: &[&[&str]]) -> Expression {
         terms
@@ -1310,6 +1428,7 @@ mod tests {
             for (source, transform, keyword) in [
                 ("y ~ C(x, unknown=1)", "C", "unknown"),
                 ("y ~ F(x, reference=1)", "F", "reference"),
+                ("y ~ poly(x, unknown=1)", "poly", "unknown"),
                 ("y ~ C(log(x, base=2))", "log", "base"),
             ] {
                 let error = parse(source).unwrap_err();
