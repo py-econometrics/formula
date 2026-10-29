@@ -86,6 +86,7 @@ during formula materialization:
 | `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                                    |
 | `C(group, reference=...)`                                                    | Create categorical indicator columns for `group`; the optional `reference` argument sets the reference level.          |
 | `F(group)`                                                                   | Encode observed levels as integer codes. Multiple inputs, such as `F(firm, year)`, encode their observed combinations. |
+| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                             |
 
 Numeric arguments are supported inside transformation calls:
 
