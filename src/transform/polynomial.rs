@@ -167,7 +167,7 @@ impl OrthogonalBasis {
         let frame = Self::training_frame(input, degree)?;
         let values = frame.column(argument_column_name(0).as_str())?;
 
-        // Squared norms of starting polynomials p0 = 1 and p-1 = 0
+        // Initialise starting polynomials p0 = 1 and p-1 = 0
         let mut previous = Column::new_scalar("previous".into(), Scalar::from(0.0), frame.height());
         let mut current = Column::new_scalar("current".into(), Scalar::from(1.0), frame.height());
         // Initialise values
@@ -774,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn polynomial_expands_exactly_one_argument() -> Result<(), TransformError> {
+    fn polynomial_expands_and_requires_exactly_one_argument() -> Result<(), TransformError> {
         for raw in [false, true] {
             let definition =
                 PolynomialDefinition::new(Some(Scalar::from(1_i64)), Some(Scalar::from(raw)))?;

@@ -906,41 +906,6 @@ mod tests {
                 );
             }
         }
-
-        #[test]
-        fn scheduling_reuses_identical_calls_and_distinguishes_configurations() {
-            let training =
-                polars::df!("y" => [1.0; 4], "x" => [-2.0, -1.0, 1.0, 2.0], "z" => [2.0; 4])
-                    .unwrap();
-            let specification = crate::parse_many([
-                "y ~ poly(x) + poly(x, degree=1, raw=false)",
-                "y ~ poly(x, degree=2) + poly(x, degree=2, raw=true)",
-                "y ~ poly(x, raw=false, degree=1):z",
-            ])
-            .unwrap();
-            TRANSFORM_CALLS.set((0, 0));
-            let models = specification.materialize(&training).unwrap();
-            assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
-            assert_eq!(
-                models
-                    .iter()
-                    .map(|(_, m)| m.right().frame().width())
-                    .collect::<Vec<_>>(),
-                [2, 5, 2]
-            );
-
-            let prediction = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
-            TRANSFORM_CALLS.set((0, 0));
-            let output = models.evaluate(&prediction).unwrap();
-            assert_eq!(TRANSFORM_CALLS.get(), (0, 3));
-            assert_eq!(
-                output
-                    .iter()
-                    .map(|(_, m)| m.right().frame().shape())
-                    .collect::<Vec<_>>(),
-                [(1, 2), (1, 5), (1, 2)]
-            );
-        }
     }
 
     #[test]
@@ -1493,53 +1458,79 @@ mod tests {
         }
 
         #[test]
-        fn expanding_transform_runs_once_and_shares_all_columns() {
+        fn transform_runs_once_and_shares_all_columns() {
             use crate::transform::TRANSFORM_CALLS;
 
             let data = polars::df!(
                 "y" => [1.0, 2.0, 3.0, 4.0],
                 "g" => [Some("c"), Some("a"), Some("b"), None],
-                "x" => [5.0, 6.0, 7.0, 8.0],
+                "x" => [Some(5.0), Some(6.0), Some(7.0), None],
+                "z" => [2.0; 4],
             )
             .unwrap();
-            let specification = crate::parse("y ~ C(g, reference='a') + sw0(x)").unwrap();
-            TRANSFORM_CALLS.set((0, 0));
-            let collection = specification.materialize(&data).unwrap();
-            assert_eq!(TRANSFORM_CALLS.get(), (1, 1));
-            assert_eq!(collection.len(), 2);
+            let input = polars::df!(
+                "y" => [4.0, 3.0, 2.0, 1.0],
+                "g" => [Some("b"), Some("c"), None, Some("a")],
+                "x" => [Some(8.0), None, Some(9.0), Some(10.0)],
+                "z" => [3.0; 4],
+            )
+            .unwrap();
 
-            let mut models = collection.iter().map(|(_, model)| model);
-            let first = models.next().unwrap().right().frame();
-            let second = models.next().unwrap().right().frame();
-            let b = "C(g, reference=\"a\")[T.b]";
-            let c = "C(g, reference=\"a\")[T.c]";
-            // C preserves the order in which levels first appear.
-            assert_eq!(first.get_column_names(), ["Intercept", c, b]);
-            assert_eq!(second.get_column_names(), ["Intercept", c, b, "x"]);
-
-            for (name, values) in [
-                (b, [Some(false), Some(false), Some(true), None]),
-                (c, [Some(true), Some(false), Some(false), None]),
+            for (source, width) in [
+                ("y ~ C(g) + sw0(x)", 4),
+                ("y ~ C(g, reference='a') + sw0(x)", 3),
+                (
+                    "y ~ (C(g, reference='a') + C(g, reference='a'))*z + sw0(x)",
+                    6,
+                ),
+                ("y ~ F(g) + sw0(x)", 2),
+                ("y ~ F(g, z) + sw0(x)", 2),
+                ("y ~ (F(g) + F(g))*z + sw0(x)", 4),
+                ("y ~ (F(g, z) + F(g, z))*z + sw0(x)", 4),
+                (
+                    "y ~ (poly(x, degree=2, raw=true) + poly(x, raw=true, degree=2))*z + sw0(x)",
+                    6,
+                ),
+                (
+                    "y ~ (poly(x, degree=2) + poly(x, raw=false, degree=2))*z + sw0(x)",
+                    6,
+                ),
+                ("y ~ (poly(x) + poly(x, degree=1, raw=false))*z + sw0(x)", 4),
             ] {
-                let expected = Column::new(name.into(), values);
-                let left = first.column(name).unwrap();
-                let right = second.column(name).unwrap();
-                assert!(left.equals_missing(&expected), "{name}");
-                assert!(right.equals_missing(&expected), "{name}");
-                let left = left.bool().unwrap();
-                let right = right.bool().unwrap();
-                let left = left.downcast_iter().next().unwrap();
-                let right = right.downcast_iter().next().unwrap();
-                assert_eq!(
-                    left.values().as_slice().0.as_ptr(),
-                    right.values().as_slice().0.as_ptr(),
-                    "{name}"
-                );
-                assert_eq!(
-                    left.validity().unwrap().as_slice().0.as_ptr(),
-                    right.validity().unwrap().as_slice().0.as_ptr(),
-                    "{name}: validity"
-                );
+                let specification = crate::parse(source).unwrap();
+                TRANSFORM_CALLS.set((0, 0));
+                let collection = specification.materialize(&data).unwrap();
+                assert_eq!(TRANSFORM_CALLS.get(), (1, 1), "{source}");
+
+                TRANSFORM_CALLS.set((0, 0));
+                let applied = collection.evaluate(&input).unwrap();
+                assert_eq!(TRANSFORM_CALLS.get(), (0, 1), "{source}");
+
+                for models in [&collection, &applied] {
+                    assert_eq!(models.len(), 2);
+                    let mut models = models.iter().map(|(_, model)| model.right().frame());
+                    let first = models.next().unwrap();
+                    let second = models.next().unwrap();
+                    assert_eq!(first.shape(), (4, width), "{source}");
+                    assert_eq!(second.shape(), (4, width + 1), "{source}");
+                    let names = first.get_column_names();
+                    assert_eq!(&second.get_column_names()[..width], names.as_slice());
+                    assert_eq!(second.columns().last().unwrap().name().as_str(), "x");
+
+                    for left in &first.columns()[1..] {
+                        let right = second.column(left.name().as_str()).unwrap();
+                        assert!(left.equals_missing(right), "{source}: {}", left.name());
+                        // Sharing the Series shares both its values and validity buffers.
+                        assert!(
+                            Arc::ptr_eq(
+                                &left.as_materialized_series().0,
+                                &right.as_materialized_series().0,
+                            ),
+                            "{source}: {}",
+                            left.name()
+                        );
+                    }
+                }
             }
         }
 
@@ -1667,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_stateful_factors_execute_once_and_retain_shared_nodes() {
+    fn shared_factors_execute_once_and_retain_shared_nodes() {
         use crate::transform::TRANSFORM_CALLS;
 
         let training = polars::df!("g" => ["a", "b", "a"], "x" => [2.0, 3.0, 4.0]).unwrap();
@@ -1722,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_nested_stateless_factors_execute_once_per_call() {
+    fn repeated_nested_transforms_execute_once_per_call() {
         use crate::transform::TRANSFORM_CALLS;
 
         let expressions = parse_expression
@@ -1846,13 +1837,46 @@ mod tests {
 
     #[test]
     fn planning_deduplicates_factors_across_formula_sides() {
-        let formula = crate::parse("log(x) ~ log(x) - 1").unwrap().formulas()[0].clone();
-        let scheduled = schedule_factors(&[&formula.left, &formula.right]);
+        for (source, count, right_index) in [
+            ("log(x) ~ log(x) - 1", 2, 0),
+            ("C(x) ~ C(x) - 1", 2, 0),
+            ("C(x, reference='a') ~ C(x, reference='a') - 1", 2, 0),
+            ("C(x):z ~ z:C(x) - 1", 3, 1),
+            (
+                "C(x, reference='a'):C(z) ~ C(z):C(x, reference='a') - 1",
+                4,
+                1,
+            ),
+            ("F(x) ~ F(x) - 1", 2, 0),
+            ("F(x, z) ~ F(x, z) - 1", 3, 0),
+            ("F(x):z ~ z:F(x) - 1", 3, 1),
+            ("F(x, z):F(z) ~ F(z):F(x, z) - 1", 4, 1),
+            ("poly(x, raw=true) ~ poly(x, degree=1, raw=true) - 1", 2, 0),
+            ("poly(x) ~ poly(x, degree=1, raw=false) - 1", 2, 0),
+            ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2, 0),
+        ] {
+            let formula = crate::parse(source).unwrap().formulas()[0].clone();
+            let scheduled = schedule_factors(&[&formula.left, &formula.right]);
 
-        assert_eq!(scheduled.len(), 2);
-        assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
-        assert_eq!(scheduled[1], formula.left.terms[0].factors[0]);
-        assert_eq!(scheduled[1], formula.right.terms[0].factors[0]);
+            assert_eq!(scheduled.len(), count, "{source}");
+            assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
+            assert_eq!(
+                formula.left.terms[0].factors[0], formula.right.terms[0].factors[right_index],
+                "{source}"
+            );
+            for factor in formula.left.terms[0]
+                .factors
+                .iter()
+                .chain(&formula.right.terms[0].factors)
+            {
+                assert_eq!(
+                    scheduled.iter().filter(|entry| *entry == factor).count(),
+                    1,
+                    "{source}: {}",
+                    factor.label()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1899,17 +1923,25 @@ mod tests {
 
     #[test]
     fn planning_distinguishes_transform_parameters() {
-        let expressions = parse_expression
-            .parse("C(g, reference='a') + C(g, reference='b')")
-            .unwrap();
-        let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&[expression]);
+        for (source, input) in [
+            ("C(g, reference='a') + C(g, reference='b')", "g"),
+            ("poly(x) + poly(x, degree=2)", "x"),
+            ("poly(x, raw=true) + poly(x, degree=2, raw=true)", "x"),
+            (
+                "poly(x, degree=2, raw=false) + poly(x, degree=2, raw=true)",
+                "x",
+            ),
+        ] {
+            let expressions = parse_expression.parse(source).unwrap();
+            let expression = expressions.first().unwrap();
+            let scheduled = schedule_factors(&[expression]);
 
-        assert_eq!(scheduled.len(), 3);
-        assert_eq!(scheduled[0].as_ref(), &Factor::from("g"));
-        assert_eq!(scheduled[1], expression.terms[0].factors[0]);
-        assert_eq!(scheduled[2], expression.terms[1].factors[0]);
-        assert_ne!(scheduled[1], scheduled[2]);
+            assert_eq!(scheduled.len(), 3, "{source}");
+            assert_eq!(scheduled[0].as_ref(), &Factor::from(input));
+            assert_eq!(scheduled[1], expression.terms[0].factors[0]);
+            assert_eq!(scheduled[2], expression.terms[1].factors[0]);
+            assert_ne!(scheduled[1], scheduled[2]);
+        }
     }
 
     #[test]
@@ -2011,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_uses_new_input_height_on_rematerialization() {
+    fn intercept_uses_new_input_height_on_evaluation() {
         let training = polars::df!("y" => [2.0, 3.0]).unwrap();
         let model = crate::parse("y ~ 1").unwrap().formulas()[0]
             .clone()
@@ -2043,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_design_uses_new_input_height_on_rematerialization() {
+    fn empty_design_uses_new_input_height_on_evaluation() {
         let training = polars::df!("x" => [1.0, 2.0, 3.0]).unwrap();
         let expressions = parse_expression.parse("x-x").unwrap();
         let expression = expressions.first().unwrap();
@@ -2174,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn model_materialization_reuses_fitted_integer_encoding() {
+    fn model_evaluation_reuses_fitted_integer_encoding() {
         let training = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "f1" => ["a", "b", "a"],
@@ -2189,8 +2221,8 @@ mod tests {
         .unwrap();
         let specification = crate::parse("y ~ F(f1, f2) - 1").unwrap().formulas()[0].clone();
         let model = specification.materialize(&training).unwrap();
-        let rematerialized = model.evaluate(&input).unwrap();
-        let output = rematerialized.right().frame();
+        let evaluated = model.evaluate(&input).unwrap();
+        let output = evaluated.right().frame();
 
         assert_eq!(output.width(), 1);
         assert_eq!(output[0].name().as_str(), "F(f1, f2)");
@@ -2199,7 +2231,7 @@ mod tests {
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),
             vec![Some(2), Some(1), Some(0), None]
         );
-        assert_eq!(rematerialized.left().frame()[0].len(), 4);
+        assert_eq!(evaluated.left().frame()[0].len(), 4);
 
         let original = model.right().frame()[0]
             .u32()
@@ -2207,10 +2239,7 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(original, vec![Some(0), Some(1), Some(2)]);
-        assert_eq!(
-            model.right().expression(),
-            rematerialized.right().expression()
-        );
+        assert_eq!(model.right().expression(), evaluated.right().expression());
     }
 
     #[test]
