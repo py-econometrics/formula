@@ -382,7 +382,7 @@ fn parse_stepwise(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
     };
 
     if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
-        expressions.insert(0, Expression::from_iter([]));
+        expressions.insert(0, Expression::from(Term::intercept()));
     }
 
     Ok(expressions)
@@ -875,9 +875,9 @@ mod tests {
     fn stepwise_operators_expand_in_order() {
         let cases: &[(&str, &[&str])] = &[
             ("sw(x, z)", &["x", "z"]),
-            ("sw0(x, z)", &["x-x", "x", "z"]),
+            ("sw0(x, z)", &["1", "x", "z"]),
             ("csw(x, z)", &["x", "x + z"]),
-            ("csw0(x, z)", &["x-x", "x", "x + z"]),
+            ("csw0(x, z)", &["1", "x", "x + z"]),
             ("sw(x)", &["x"]),
             ("sw( x + y,\n log(z) )", &["x + y", "log(z)"]),
             ("sw(x, sw(y, z))", &["x", "y", "z"]),
@@ -886,7 +886,7 @@ mod tests {
                 &["x", "y", "x+z", "x+w", "y+z", "y+w"],
             ),
             ("sw(csw(x, y), z)", &["x", "x+y", "z"]),
-            ("csw0(x + y, z)", &["x-x", "x+y", "x+y+z"]),
+            ("csw0(x + y, z)", &["1", "x+y", "x+y+z"]),
         ];
 
         for &(source, expected) in cases {
@@ -917,7 +917,10 @@ mod tests {
             ("sw(x+y, z):w", &["x:w+y:w", "z:w"]),
             ("a - sw(x, a)", &["a", "a-a"]),
             ("sw(x, y)*z", &["x*z", "y*z"]),
-            ("sw0(x)*z", &["z", "x*z"]),
+            ("sw0(x)*z", &["1+z", "x*z"]),
+            ("sw0(x):z", &["z", "x:z"]),
+            ("z:sw0(x)", &["z", "z:x"]),
+            ("csw0(x, y):z", &["z", "x:z", "x:z+y:z"]),
             ("sw(a, b)/c", &["a+a:c", "b+b:c"]),
             ("(a + sw(x, y)):z", &["a:z+x:z", "a:z+y:z"]),
             ("a + sw(x, y)*z", &["a+x+z+x:z", "a+y+z+y:z"]),
@@ -953,7 +956,9 @@ mod tests {
             ("sw(y1, y2):w ~ x", &["y1:w~x", "y2:w~x"]),
             ("y ~ sw0(x, z)", &["y~1", "y~x", "y~z"]),
             ("y ~ csw0(x, z) - 1", &["y~1-1", "y~x-1", "y~x+z-1"]),
-            ("y ~ sw0(x, z):w", &["y~1", "y~x:w", "y~z:w"]),
+            ("y ~ sw0(x, z):w", &["y~w", "y~x:w", "y~z:w"]),
+            ("y ~ sw0(x):z - 1", &["y~z-1", "y~x:z-1"]),
+            ("y ~ csw0(x, z):w - 1", &["y~w-1", "y~x:w-1", "y~x:w+z:w-1"]),
             ("y ~ sw(a, b)/c", &["y~a+a:c", "y~b+b:c"]),
             ("y ~ sw(1, x - 1)", &["y~1", "y~x-1"]),
         ];
