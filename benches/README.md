@@ -1,11 +1,11 @@
 # Benchmarks
 
-Run in Cargo's optimized benchmark profile. Positional arguments are rows,
-measured samples, and parses per parsing sample (defaults: 1000000, 10, 1000).
+Run in Cargo's optimized benchmark profile. Positional arguments are rows and
+measured samples (defaults: 1000000 and 10).
 
 ```sh
-POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000000 10 1000 > /tmp/base.json
-POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000000 10 1000 > /tmp/candidate.json
+POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000000 10 > /tmp/base.json
+POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000000 10 > /tmp/candidate.json
 cargo run --locked --example compare_benchmarks -- /tmp/base.json /tmp/candidate.json
 ```
 
@@ -30,15 +30,18 @@ the job. A comparable workload whose mean runtime increases by more than 10%
 also fails the job; the full report and artifacts remain available.
 
 The runner writes JSON using the shared types in `results/mod.rs`. Results
-contain raw samples, formulas, operation types, batch sizes, output shapes,
+contain raw samples, formulas, operation types, output shapes,
 row count, and the configured `POLARS_MAX_THREADS` value. The comparator reports
 mean milliseconds per operation ± sample standard deviation, rounded to three
 significant digits. Percentage changes compare means. Candidate-only runs use a
 three-column table without empty baseline or percentage columns. Standard
 deviation is unavailable (`—`) when there is only one sample.
-Operations are parsing, parsing plus fitting (`ParseAndFit`), and evaluation.
+The two operations are parsing plus materialization (`ParseAndFit`) and fitted
+evaluation (`Evaluate`). There is no standalone parsing benchmark. Each sample
+times one operation. Older parsing results remain readable for comparisons
+against earlier revisions.
 Durations are stored as fractional milliseconds to retain submillisecond precision.
-Different formulas, batch sizes, output shapes, row counts, or thread settings
+Different formulas, output shapes, row counts, or thread settings
 are reported as incomparable; added and removed workloads retain their available
 timings, with percentage changes omitted.
 The workflow sets `BENCH_REGRESSION_PERCENT=10` to control the regression
@@ -47,42 +50,28 @@ timings. Candidate-only, added, removed, and incomparable workloads do not
 trigger the regression check. Runner noise can cause false alarms.
 
 Data construction, warm-up, output inspection, serialization, and result
-destruction are outside timing. Parsing samples retain a batch of parsed
-results until timing stops; fit and evaluation samples contain one operation.
+destruction are outside timing.
 Evaluation reuses a model fitted outside timing. The deterministic dataset has
 90% fully finite rows; the remaining rows contain nulls, NaN, or infinities.
 The `categorical` and `integer` workloads apply `C` and `F` to a string column;
 their `_native` counterparts use a categorical copy of the same column.
 Categorical conversion happens during data construction, outside timing.
 
-The `polynomial_raw_degree3`, `polynomial_raw_degree10`,
-`polynomial_orthogonal_degree3`, and `polynomial_orthogonal_degree10` workloads
-apply `poly` to `a`. They measure parsing, parsing plus fitting, and fitted
-evaluation for raw powers and orthogonal bases at degrees 3 and 10. Degree 10
-also exercises the cost of evaluating a longer recurrence. These cases use the
-same mixed dataset: nulls, NaN, and infinities in `a` are excluded from orthogonal
-fitting and produce null polynomial output rows in both modes. The right-hand
-designs have 4 and 11 columns respectively, including the intercept. Use enough
-rows to provide at least 11 distinct finite values for the degree-10 fit
-(for example, the quick run below uses 1,000 rows).
+The nine workloads cover numeric interactions, expression transforms, raw and
+orthogonal degree-3 polynomials, categorical encoding, integer encoding, and
+numeric-by-categorical interactions. Categorical and integer encoding each retain
+string and native-categorical inputs because they exercise different code paths.
 
-The `polynomial_raw_interaction` and `polynomial_orthogonal_interaction`
-workloads use `poly(a, degree=3)*b`, with the corresponding raw setting. The `*`
-operator includes both main effects and their interaction, reusing the polynomial
-factor across terms. Their designs have 8 columns including the intercept.
-The corresponding `_basis_interaction` workloads use
-`poly(a, degree=3)*poly(b, degree=3)`, exercising reuse of both bases and their
-nine pairwise interaction columns, for 16 columns including the intercept.
-All four workloads measure parsing, fitting, and fitted evaluation. The shared
-factor-deduplication tests verify that each distinct polynomial factor is
-fitted once and evaluated once during materialization, then evaluated once
-without refitting during prediction; timings alone cannot guarantee this.
+The two polynomial workloads produce four right-hand columns including the
+intercept. Nulls, NaN, and infinities produce null polynomial rows and are excluded
+from orthogonal fitting. Provide at least four distinct finite training values;
+the quick run below uses 1,000 rows. Higher degrees and polynomial interaction
+combinations can be benchmarked separately when investigating those operations.
 
 ```sh
-POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000 2 10 > /tmp/poly.json
-cargo run --locked --example compare_benchmarks -- - /tmp/poly.json
+POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000 2 > /tmp/bench.json
+cargo run --locked --example compare_benchmarks -- - /tmp/bench.json
 ```
 
-The workflow discovers these workloads through the runner's JSON output, so no
-workflow configuration changes are needed. When the baseline predates these
-cases, they appear as added workloads without a percentage change.
+The workflow discovers workloads through the runner's JSON output. New workloads
+appear as added and old workloads as removed, without percentage changes.

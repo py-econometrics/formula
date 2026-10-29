@@ -1,4 +1,4 @@
-//! Run with `cargo bench --bench benchmark -- [rows] [samples] [parse_batch]`.
+//! Run with `cargo bench --bench benchmark -- [rows] [samples]`.
 
 mod results;
 
@@ -45,39 +45,28 @@ fn sample_data(rows: usize) -> PolarsResult<DataFrame> {
     Ok(data)
 }
 
-fn measure<T>(iterations: usize, run: &mut impl FnMut() -> T) -> (f64, Vec<T>) {
-    // Retain results until after timing to exclude their destruction.
-    let mut outputs = Vec::with_capacity(iterations);
-    let start = Instant::now();
-    for _ in 0..iterations {
-        outputs.push(black_box(run()));
-    }
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
-    (elapsed_ms, outputs)
-}
-
-fn measure_samples<T>(
+fn measure_samples(
     benchmark: &str,
     formula: &str,
     operation: Operation,
     samples: usize,
-    iterations: usize,
-    mut run: impl FnMut() -> T,
-    describe: impl Fn(&T) -> Output,
+    mut run: impl FnMut() -> Models,
 ) -> Vec<Sample> {
-    // One complete, unreported warm-up batch.
-    drop(measure(iterations, &mut run));
+    drop(black_box(run())); // One unreported warm-up.
     (0..samples)
         .map(|sample| {
-            let (elapsed_ms, outputs) = measure(iterations, &mut run);
+            let start = Instant::now();
+            let output = black_box(run());
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            // Inspect and drop the output after timing.
             Sample {
                 benchmark: benchmark.to_owned(),
                 formula: formula.to_owned(),
                 operation,
                 sample,
-                iterations,
+                iterations: 1,
                 elapsed_ms,
-                output: describe(&outputs[0]),
+                output: model_shapes(&output),
             }
         })
         .collect()
@@ -99,7 +88,6 @@ fn main() {
     let mut args = env::args().skip(1).filter(|arg| arg != "--bench");
     let rows = args.next().map_or(1_000_000, |arg| arg.parse().unwrap());
     let samples = args.next().map_or(10, |arg| arg.parse().unwrap());
-    let parse_batch = args.next().map_or(1_000, |arg| arg.parse().unwrap());
 
     let data = sample_data(rows).unwrap();
     let mut results = Results {
@@ -112,27 +100,6 @@ fn main() {
         ("transform", "y ~ log(a) + sqrt(b)"),
         ("polynomial_raw_degree3", "y ~ poly(a, degree=3, raw=true)"),
         ("polynomial_orthogonal_degree3", "y ~ poly(a, degree=3)"),
-        (
-            "polynomial_raw_degree10",
-            "y ~ poly(a, degree=10, raw=true)",
-        ),
-        ("polynomial_orthogonal_degree10", "y ~ poly(a, degree=10)"),
-        (
-            "polynomial_raw_interaction",
-            "y ~ poly(a, degree=3, raw=true)*b",
-        ),
-        (
-            "polynomial_orthogonal_interaction",
-            "y ~ poly(a, degree=3)*b",
-        ),
-        (
-            "polynomial_raw_basis_interaction",
-            "y ~ poly(a, degree=3, raw=true)*poly(b, degree=3, raw=true)",
-        ),
-        (
-            "polynomial_orthogonal_basis_interaction",
-            "y ~ poly(a, degree=3)*poly(b, degree=3)",
-        ),
         ("categorical", "y ~ C(g1)"),
         ("categorical_native", "y ~ C(g_cat)"),
         ("integer", "y ~ F(g1)"),
@@ -142,27 +109,14 @@ fn main() {
         results.samples.extend(measure_samples(
             name,
             source,
-            Operation::Parse,
-            samples,
-            parse_batch,
-            || parse(black_box(source)).unwrap(),
-            |specification| Output::Parsed {
-                formulas: specification.formulas().len(),
-            },
-        ));
-        results.samples.extend(measure_samples(
-            name,
-            source,
             Operation::ParseAndFit,
             samples,
-            1,
             || {
                 parse(black_box(source))
                     .unwrap()
                     .materialize(black_box(&data))
                     .unwrap()
             },
-            model_shapes,
         ));
         let fitted = parse(source).unwrap().materialize(&data).unwrap();
         results.samples.extend(measure_samples(
@@ -170,9 +124,7 @@ fn main() {
             source,
             Operation::Evaluate,
             samples,
-            1,
             || fitted.evaluate(black_box(&data)).unwrap(),
-            model_shapes,
         ));
     }
     println!("{}", serde_json::to_string_pretty(&results).unwrap());

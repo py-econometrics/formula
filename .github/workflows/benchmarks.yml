@@ -30,7 +30,6 @@ jobs:
       POLARS_MAX_THREADS: "1"
       BENCH_ROWS: "1000000"
       BENCH_SAMPLES: "50"
-      BENCH_PARSE_BATCH: "1000"
       BENCH_ROUNDS: "4"
       BENCH_REGRESSION_PERCENT: "10"
     steps:
@@ -97,7 +96,7 @@ jobs:
               echo "Round $round: $revision"
               result="benchmark-results/$revision/round-$round.json"
               cargo bench --locked --manifest-path "$revision/Cargo.toml" --bench benchmark -- \
-                "$BENCH_ROWS" "$BENCH_SAMPLES" "$BENCH_PARSE_BATCH" \
+                "$BENCH_ROWS" "$BENCH_SAMPLES" \
                 > "$result"
               jq empty "$result"
             done
@@ -111,7 +110,7 @@ jobs:
             echo "Base: $(git -C base rev-parse HEAD)"
             echo "Candidate: $(git -C candidate rev-parse HEAD)"
             echo
-            echo "$BENCH_ROWS rows; $POLARS_MAX_THREADS thread(s); $BENCH_ROUNDS rounds; $BENCH_SAMPLES samples per round; $BENCH_PARSE_BATCH parses per sample."
+            echo "$BENCH_ROWS rows; $POLARS_MAX_THREADS thread(s); $BENCH_ROUNDS rounds; $BENCH_SAMPLES samples per round."
             echo
             rustc --version
             echo
