@@ -199,43 +199,35 @@ impl OrthogonalBasis {
 
     fn fit(input: &Column, degree: usize) -> Result<Self, TransformError> {
         let frame = Self::training_frame(input, degree)?;
-        let values = frame.column(argument_column_name(0).as_str())?;
-
-        // Initialise starting polynomials p0 = 1 and p-1 = 0
-        let mut previous = Column::new_scalar("previous".into(), Scalar::from(0.0), frame.height());
-        let mut current = Column::new_scalar("current".into(), Scalar::from(1.0), frame.height());
-        // Initialise values
-        let mut current_norm2 = frame.height() as f64;
-        let mut previous_norm2 = 0.0;
+        let values = frame
+            .column(argument_column_name(0).as_str())?
+            .f64()?
+            .rechunk();
+        let values = values.cont_slice()?;
+        let initial_value = 1.0 / (values.len() as f64).sqrt();
+        let mut previous = vec![0.0; values.len()];
+        let mut current = vec![initial_value; values.len()];
+        let mut beta = 0.0_f64;
         let mut steps = Vec::with_capacity(degree);
 
         for exponent in 1..=degree {
-            let squared = (&current * &current)?;
-            let weighted_values = (values * &squared)?;
-            let weighted_sum = weighted_values.sum_reduce()?.value().try_extract::<f64>()?;
-
-            // Update alpha and beta
-            let alpha = weighted_sum / current_norm2;
-            let beta = if exponent == 1 {
-                0.0
-            } else {
-                current_norm2 / previous_norm2
-            };
+            let alpha = sum_in_lanes(
+                values
+                    .iter()
+                    .zip(&current)
+                    .map(|(value, current)| value * current * current),
+            );
             if !alpha.is_finite() || !beta.is_finite() {
                 return Err(TransformError::NumericalError(format!(
                     "invalid orthogonal polynomial coefficients at degree {exponent}"
                 )));
             }
 
-            // Compute the next unnormalized polynomial using the three-term recurrence.
-            let centered = values - alpha;
-            let leading = (&centered * &current)?;
-            let correction = &previous * beta;
-            let next = (&leading - &correction)?;
-            let next_norm2 = (&next * &next)?
-                .sum_reduce()?
-                .value()
-                .try_extract::<f64>()?;
+            // Overwrite the previous vector with the next recurrence residual
+            for ((previous, current), value) in previous.iter_mut().zip(&current).zip(values) {
+                *previous = (value - alpha) * current - beta * *previous;
+            }
+            let next_norm2 = sum_in_lanes(previous.iter().map(|value| value * value));
 
             if !next_norm2.is_finite() || next_norm2 <= 0.0 {
                 return Err(TransformError::NumericalError(format!(
@@ -243,21 +235,19 @@ impl OrthogonalBasis {
                 )));
             }
 
-            steps.push(RecurrenceStep {
-                alpha,
-                // Convert monic coefficients to the normalized recurrence.
-                beta: beta.sqrt(),
-                norm: next_norm2.sqrt() / current_norm2.sqrt(),
-            });
-
-            previous = current;
-            current = next;
-            previous_norm2 = current_norm2;
-            current_norm2 = next_norm2;
+            let norm = next_norm2.sqrt();
+            steps.push(RecurrenceStep { alpha, beta, norm });
+            // Keep both recurrence vectors normalized between iterations
+            for value in &mut previous {
+                *value /= norm;
+            }
+            // Advance the recurrence by swapping buffers instead of allocating
+            std::mem::swap(&mut previous, &mut current);
+            beta = norm;
         }
 
         Ok(Self {
-            initial_value: 1.0 / (frame.height() as f64).sqrt(),
+            initial_value,
             steps,
         })
     }
@@ -338,6 +328,20 @@ fn finite_values(input: Expr) -> Expr {
     when(input.clone().is_finite())
         .then(input)
         .otherwise(lit(NULL).cast(DataType::Float64))
+}
+
+// Use four partial sums so the CPU can overlap additions.
+fn sum_in_lanes(mut values: impl Iterator<Item = f64>) -> f64 {
+    let mut sums = [0.0; 4];
+    'input: loop {
+        for sum in &mut sums {
+            let Some(value) = values.next() else {
+                break 'input;
+            };
+            *sum += value;
+        }
+    }
+    sums.into_iter().sum()
 }
 
 #[cfg(test)]
@@ -461,18 +465,20 @@ mod tests {
 
     #[test]
     fn orthogonal_training_columns_are_centered_and_orthonormal() -> Result<(), TransformError> {
-        for values in [
-            vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
-            vec![0.0, 0.0, 0.2, 1.0, 2.0, 4.0, 7.0],
-            vec![98.0, 99.0, 100.0, 101.0, 103.0, 105.0],
+        for (degree, values) in [
+            (3, vec![-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0]),
+            (3, vec![0.0, 0.0, 0.2, 1.0, 2.0, 4.0, 7.0]),
+            (3, vec![98.0, 99.0, 100.0, 101.0, 103.0, 105.0]),
+            (10, (0..20).map(|i| i as f64 * 1e20).collect()),
+            (10, (0..20).map(|i| i as f64 * 1e-20).collect()),
         ] {
             let training = [Column::new("x".into(), values)];
             let fitted = Fitted::fit(
-                PolynomialDefinition::new(Some(Scalar::from(3_i64)), Some(Scalar::from(false)))?,
+                PolynomialDefinition::new(Some(Scalar::from(degree as i64)), None)?,
                 &training,
             )?;
             let output = fitted.transform(&training)?;
-            assert_orthogonal_schema(&output, training[0].len(), 3);
+            assert_orthogonal_schema(&output, training[0].len(), degree);
             let columns = output
                 .columns()
                 .iter()
