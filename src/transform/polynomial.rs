@@ -99,20 +99,19 @@ impl PolynomialBasis {
         let argument = finite_values(col(name.clone()));
 
         match self {
-            Self::Raw => Ok(frame
-                .lazy()
-                .select(
-                    (1..=degree)
-                        .map(|exponent| {
-                            argument
-                                .clone()
-                                .pow(lit(exponent as u64))
-                                .alias(exponent.to_string())
-                        })
-                        .collect::<Vec<_>>(),
-                )
-                .collect()?
-                .into_columns()),
+            Self::Raw => {
+                let prepared = frame.lazy().select([argument]).collect()?;
+                let values = prepared.column(name.as_str())?;
+                let mut columns = Vec::with_capacity(degree);
+                columns.push(values.clone());
+
+                // Reuse each power to compute the next with one multiplication.
+                for exponent in 2..=degree {
+                    columns.push((&columns[exponent - 2] * values)?);
+                }
+
+                Ok(columns)
+            }
 
             Self::Orthogonal(basis) => {
                 let prepared = frame.lazy().select([argument]).collect()?;
