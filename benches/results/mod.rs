@@ -10,6 +10,7 @@ pub struct Results {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
+    // Retained so the comparator can read results from older revisions.
     Parse,
     ParseAndFit,
     Evaluate,
@@ -29,6 +30,7 @@ pub struct Sample {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Output {
+    // Retained for older standalone parsing samples.
     Parsed { formulas: usize },
     Materialized { models: Vec<ModelShape> },
 }
