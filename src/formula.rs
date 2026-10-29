@@ -706,7 +706,9 @@ mod tests {
     use super::*;
     use crate::fit::{Definition, Fit};
     use crate::parse::parse_expression;
-    use crate::transform::{CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition};
+    use crate::transform::{
+        CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, PolynomialDefinition,
+    };
     use polars::prelude::Scalar;
     use winnow::Parser;
 
@@ -722,16 +724,16 @@ mod tests {
         #[test]
         fn raw_materialization_and_prediction_preserve_values_and_schema() {
             let training = polars::df!(
-                "y" => [1.0, 2.0, 3.0, 4.0, 5.0],
-                "x" => [Some(2.0), Some(-3.0), None, Some(f64::NAN), Some(f64::INFINITY)],
+                "y" => [1.0, 2.0],
+                "x" => [2.0, -3.0],
             )
             .unwrap();
             let model = materialize("y ~ poly(x, degree=3, raw=true)", &training);
             let expected = polars::df!(
-                "Intercept" => [1.0; 5],
-                "poly(x, degree=3, raw=true)[1]" => [Some(2.0), Some(-3.0), None, None, None],
-                "poly(x, degree=3, raw=true)[2]" => [Some(4.0), Some(9.0), None, None, None],
-                "poly(x, degree=3, raw=true)[3]" => [Some(8.0), Some(-27.0), None, None, None],
+                "Intercept" => [1.0; 2],
+                "poly(x, degree=3, raw=true)[1]" => [2.0, -3.0],
+                "poly(x, degree=3, raw=true)[2]" => [4.0, 9.0],
+                "poly(x, degree=3, raw=true)[3]" => [8.0, -27.0],
             )
             .unwrap();
             assert!(model.right().frame().equals_missing(&expected));
@@ -749,19 +751,14 @@ mod tests {
         }
 
         #[test]
-        fn orthogonal_prediction_reuses_coefficients_and_preserves_missing_rows() {
+        fn orthogonal_prediction_reuses_coefficients_without_refitting() {
             let training = polars::df!(
-                "y" => [1.0; 6],
-                "x" => [Some(-1.0), Some(0.0), Some(1.0), None, Some(f64::NAN), Some(f64::INFINITY)],
-            ).unwrap();
+                "y" => [1.0; 3],
+                "x" => [-1.0, 0.0, 1.0],
+            )
+            .unwrap();
             let model = materialize("y ~ poly(x, degree=2)", &training);
-            assert_eq!(model.right().frame().shape(), (6, 3));
-            for column in &model.right().frame().columns()[1..] {
-                assert_eq!(column.null_count(), 3);
-                for row in 3..6 {
-                    assert_eq!(column.f64().unwrap().get(row), None);
-                }
-            }
+            assert_eq!(model.right().frame().shape(), (3, 3));
 
             let prediction = polars::df!("y" => [2.0, 3.0], "x" => [Some(2.0), None]).unwrap();
             for _ in 0..2 {
@@ -881,26 +878,6 @@ mod tests {
                         Err(EvaluationError::Validation(
                             ValidationError::InvalidTransformComposition
                         ))
-                    ),
-                    "{source}"
-                );
-            }
-        }
-
-        #[test]
-        fn polynomial_calls_require_exactly_one_positional_argument() {
-            let data = polars::df!("y" => [1.0], "x" => [2.0], "z" => [3.0]).unwrap();
-            for (source, count) in [
-                ("y ~ poly()", 0),
-                ("y ~ poly(x, z)", 2),
-                ("y ~ poly(x, 2)", 2),
-            ] {
-                assert!(
-                    matches!(
-                        crate::parse(source).unwrap().materialize(&data),
-                        Err(EvaluationError::Validation(ValidationError::InvalidArgumentCount {
-                            expected: ArgumentCount::Exactly(1), actual, ..
-                        })) if actual == count
                     ),
                     "{source}"
                 );
@@ -1300,6 +1277,10 @@ mod tests {
             (
                 "y ~ F()",
                 "F(): invalid argument count: expected at least 1, received 0",
+            ),
+            (
+                "y ~ poly(x, 2)",
+                "poly(x, 2, degree=1, raw=false): invalid argument count: expected exactly 1, received 2",
             ),
         ] {
             let error = crate::parse(source)
@@ -2148,6 +2129,15 @@ mod tests {
     #[test]
     fn exp_requires_exactly_one_argument() {
         assert_requires_one_argument(|| Transform::Expression(ExpressionTransform::EXP));
+    }
+
+    #[test]
+    fn polynomial_requires_exactly_one_argument() {
+        assert_requires_one_argument(|| {
+            Transform::Poly(Fit::Unfitted(
+                PolynomialDefinition::new(None, None).unwrap(),
+            ))
+        });
     }
 
     #[test]

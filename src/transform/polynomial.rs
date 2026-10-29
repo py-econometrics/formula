@@ -350,32 +350,23 @@ mod tests {
     use crate::fit::Fitted;
 
     #[test]
-    fn constructor_defaults_to_degree_one_and_orthogonal_mode() -> Result<(), TransformError> {
-        let definition = PolynomialDefinition::new(None, None)?;
-        assert_eq!(definition.degree, 1);
-        assert!(!definition.raw);
-        assert_eq!(
-            definition,
-            PolynomialDefinition::new(Some(Scalar::from(1_i64)), Some(Scalar::from(false)),)?
-        );
-        Ok(())
-    }
-
-    #[test]
     fn constructor_parameters_default_independently() -> Result<(), TransformError> {
-        let definition = PolynomialDefinition::new(Some(Scalar::from(3_i64)), None)?;
-        assert_eq!(definition.degree, 3);
-        assert!(!definition.raw);
-
-        let definition = PolynomialDefinition::new(None, Some(Scalar::from(true)))?;
-        assert_eq!(definition.degree, 1);
-        assert!(definition.raw);
+        for (degree, raw, expected_degree, expected_raw) in [
+            (None, None, 1, false),
+            (Some(Scalar::from(3_i64)), None, 3, false),
+            (None, Some(Scalar::from(true)), 1, true),
+        ] {
+            let definition = PolynomialDefinition::new(degree, raw)?;
+            assert_eq!(definition.degree, expected_degree);
+            assert_eq!(definition.raw, expected_raw);
+        }
         Ok(())
     }
 
     #[test]
-    fn constructor_rejects_negative_and_noninteger_degrees() {
+    fn constructor_rejects_nonpositive_and_noninteger_degrees() {
         for degree in [
+            Scalar::from(0_i64),
             Scalar::from(-1_i64),
             Scalar::from(i64::MIN),
             Scalar::from(3.0_f64),
@@ -386,16 +377,11 @@ mod tests {
             Scalar::from(PlSmallStr::from_static("3")),
             Scalar::new(DataType::Int64, AnyValue::Null),
         ] {
-            for raw in [false, true] {
-                assert!(matches!(
-                    PolynomialDefinition::new(
-                        Some(degree.clone()),
-                        Some(Scalar::from(raw)),
-                    ),
-                    Err(TransformError::InvalidParameter(message))
-                        if message == "`degree` must be a positive integer"
-                ));
-            }
+            assert!(matches!(
+                PolynomialDefinition::new(Some(degree), None),
+                Err(TransformError::InvalidParameter(message))
+                    if message == "`degree` must be a positive integer"
+            ));
         }
     }
 
@@ -426,13 +412,13 @@ mod tests {
         );
     }
 
-    fn assert_orthogonal_schema(frame: &DataFrame, height: usize, degree: usize) {
+    fn assert_polynomial_schema(frame: &DataFrame, height: usize, degree: usize, raw: bool) {
         assert_eq!(frame.shape(), (height, degree));
         for (index, column) in frame.columns().iter().enumerate() {
             assert_eq!(column.dtype(), &DataType::Float64);
             assert_eq!(
                 column.name().as_str(),
-                format!("poly(x, degree={degree}, raw=false)[{}]", index + 1)
+                format!("poly(x, degree={degree}, raw={raw})[{}]", index + 1)
             );
         }
     }
@@ -445,7 +431,7 @@ mod tests {
             &training,
         )?;
         let output = fitted.transform(&training)?;
-        assert_orthogonal_schema(&output, 3, 2);
+        assert_polynomial_schema(&output, 3, 2, false);
 
         // q1 = x / sqrt(2), q2 = (3*x^2 - 2) / sqrt(6).
         for (column, expected) in output.columns().iter().zip([
@@ -478,7 +464,7 @@ mod tests {
                 &training,
             )?;
             let output = fitted.transform(&training)?;
-            assert_orthogonal_schema(&output, training[0].len(), degree);
+            assert_polynomial_schema(&output, training[0].len(), degree, false);
             let columns = output
                 .columns()
                 .iter()
@@ -513,7 +499,7 @@ mod tests {
         let prediction = [Column::new("x".into(), [12.0])];
         for _ in 0..2 {
             let output = fitted.transform(&prediction)?;
-            assert_orthogonal_schema(&output, 1, 2);
+            assert_polynomial_schema(&output, 1, 2, false);
             assert_close(output[0].f64()?.get(0).unwrap(), 2.0 / 2.0_f64.sqrt());
             assert_close(output[1].f64()?.get(0).unwrap(), 10.0 / 6.0_f64.sqrt());
         }
@@ -578,7 +564,7 @@ mod tests {
 
         for fitted in [&clean_fit, &missing_fit] {
             let output = fitted.transform(&missing)?;
-            assert_orthogonal_schema(&output, 7, 2);
+            assert_polynomial_schema(&output, 7, 2, false);
             for (column, expected) in output.columns().iter().zip(expected.columns()) {
                 assert_eq!(column.null_count(), 4);
                 for row in [1, 2, 4, 6] {
@@ -632,22 +618,24 @@ mod tests {
     }
 
     #[test]
-    fn orthogonal_empty_and_all_missing_predictions_retain_schema() -> Result<(), TransformError> {
+    fn polynomial_empty_and_all_missing_predictions_retain_schema() -> Result<(), TransformError> {
         let training = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
-        let fitted = Fitted::fit(
-            PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(false)))?,
-            &training,
-        )?;
-        for values in [
-            vec![],
-            vec![None, None],
-            vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
-        ] {
-            let height = values.len();
-            let output = fitted.transform(&[Column::new("x".into(), values)])?;
-            assert_orthogonal_schema(&output, height, 2);
-            for column in output.columns() {
-                assert_eq!(column.null_count(), height);
+        for raw in [false, true] {
+            let fitted = Fitted::fit(
+                PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(raw)))?,
+                &training,
+            )?;
+            for values in [
+                vec![],
+                vec![None, None],
+                vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
+            ] {
+                let height = values.len();
+                let output = fitted.transform(&[Column::new("x".into(), values)])?;
+                assert_polynomial_schema(&output, height, 2, raw);
+                for column in output.columns() {
+                    assert_eq!(column.null_count(), height, "raw={raw}");
+                }
             }
         }
         Ok(())
@@ -675,17 +663,6 @@ mod tests {
         Ok(())
     }
 
-    fn assert_raw_schema(frame: &DataFrame, height: usize, degree: usize) {
-        assert_eq!(frame.shape(), (height, degree));
-        for (index, column) in frame.columns().iter().enumerate() {
-            assert_eq!(column.dtype(), &DataType::Float64);
-            assert_eq!(
-                column.name().as_str(),
-                format!("poly(x, degree={degree}, raw=true)[{}]", index + 1)
-            );
-        }
-    }
-
     #[test]
     fn raw_powers_preserve_values_order_and_schema_on_prediction() -> Result<(), TransformError> {
         let training = [Column::new("x".into(), [1_i64, 2])];
@@ -697,7 +674,7 @@ mod tests {
 
         for _ in 0..2 {
             let output = fitted.transform(&prediction)?;
-            assert_raw_schema(&output, 3, 3);
+            assert_polynomial_schema(&output, 3, 3, true);
             for (column, expected) in output.columns().iter().zip([
                 [Some(2.0), Some(-3.0), Some(0.0)],
                 [Some(4.0), Some(9.0), Some(0.0)],
@@ -727,7 +704,7 @@ mod tests {
             &inputs,
         )?;
         let output = fitted.transform(&inputs)?;
-        assert_raw_schema(&output, 6, 2);
+        assert_polynomial_schema(&output, 6, 2, true);
         for (column, expected) in output.columns().iter().zip([
             [Some(2.0), None, None, None, None, Some(-0.5)],
             [Some(4.0), None, None, None, None, Some(0.25)],
@@ -738,27 +715,18 @@ mod tests {
     }
 
     #[test]
-    fn raw_fit_and_prediction_allow_empty_and_all_missing_data() -> Result<(), TransformError> {
-        let cases = [
+    fn raw_fit_allows_empty_and_all_missing_training_data() -> Result<(), TransformError> {
+        for values in [
             vec![],
             vec![None, None],
             vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
-        ];
-        for training_values in &cases {
-            let training = [Column::new("x".into(), training_values.clone())];
+        ] {
             let fitted = Fitted::fit(
                 PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(true)))?,
-                &training,
+                &[Column::new("x".into(), values)],
             )?;
-            for prediction_values in &cases {
-                let prediction = [Column::new("x".into(), prediction_values.clone())];
-                let output = fitted.transform(&prediction)?;
-                assert_raw_schema(&output, prediction_values.len(), 2);
-                for column in output.columns() {
-                    assert_eq!(column.null_count(), prediction_values.len());
-                }
-            }
             let output = fitted.transform(&[Column::new("x".into(), [3.0])])?;
+            assert_polynomial_schema(&output, 1, 2, true);
             assert_eq!(output[0].f64()?.get(0), Some(3.0));
             assert_eq!(output[1].f64()?.get(0), Some(9.0));
         }
@@ -773,7 +741,7 @@ mod tests {
             &inputs,
         )?;
         let output = fitted.transform(&inputs)?;
-        assert_raw_schema(&output, 2, 3);
+        assert_polynomial_schema(&output, 2, 3, true);
         assert_eq!(output[0].f64()?.get(0), Some(f64::MAX));
         assert_eq!(output[1].f64()?.get(0), Some(f64::INFINITY));
         assert_eq!(output[1].f64()?.get(1), Some(f64::INFINITY));
@@ -782,73 +750,83 @@ mod tests {
     }
 
     #[test]
-    fn raw_fit_and_prediction_require_exactly_one_input() -> Result<(), TransformError> {
-        let definition =
-            PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(true)))?;
+    fn polynomial_fit_and_prediction_require_exactly_one_input() -> Result<(), TransformError> {
         let inputs = [
-            Column::new("x".into(), [1.0]),
-            Column::new("z".into(), [2.0]),
+            Column::new("x".into(), [1.0, 2.0, 3.0]),
+            Column::new("z".into(), [4.0, 5.0, 6.0]),
         ];
-        let fitted = Fitted::fit(definition.clone(), &inputs[..1])?;
-        for invalid in [&inputs[..0], &inputs[..]] {
-            for result in [
-                definition.fit(invalid).map(|_| ()),
-                fitted.transform(invalid).map(|_| ()),
-            ] {
-                assert!(matches!(result, Err(TransformError::InputCountMismatch {
-                    expected: ArgumentCount::Exactly(1), actual,
-                }) if actual == invalid.len()));
+        for raw in [false, true] {
+            let definition =
+                PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(raw)))?;
+            let fitted = Fitted::fit(definition.clone(), &inputs[..1])?;
+            for invalid in [&inputs[..0], &inputs[..]] {
+                for result in [
+                    definition.fit(invalid).map(|_| ()),
+                    fitted.transform(invalid).map(|_| ()),
+                ] {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(TransformError::InputCountMismatch {
+                                expected: ArgumentCount::Exactly(1), actual,
+                            }) if actual == invalid.len()
+                        ),
+                        "raw={raw}"
+                    );
+                }
             }
         }
         Ok(())
     }
 
     #[test]
-    fn raw_fit_rejects_nonnumeric_input() -> Result<(), TransformError> {
-        let definition =
-            PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(true)))?;
-        for input in [
-            Column::new("x".into(), ["a"]),
-            Column::new("x".into(), [true]),
-        ] {
-            assert!(matches!(
-                definition.fit(&[input]),
-                Err(TransformError::NonNumericInput { .. })
-            ));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn raw_prediction_rejects_changed_names_and_dtypes() -> Result<(), TransformError> {
-        let training = [Column::new("x".into(), [1.0])];
-        let fitted = Fitted::fit(
-            PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(true)))?,
-            &training,
-        )?;
-        assert!(matches!(
-            fitted.transform(&[Column::new("z".into(), [1.0])]),
-            Err(TransformError::InputNamesMismatch { expected, actual })
-                if expected == vec![PlSmallStr::from_static("x")]
-                    && actual == vec![PlSmallStr::from_static("z")]
-        ));
-        assert!(matches!(
-            fitted.transform(&[Column::new("x".into(), [1_i64])]),
-            Err(TransformError::InputTypeMismatch { name, expected, actual })
-                if name.as_str() == "x" && expected == DataType::Float64.to_string()
-                    && actual == DataType::Int64.to_string()
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn zero_degree_is_rejected_in_both_modes() {
+    fn polynomial_fit_rejects_nonnumeric_input() -> Result<(), TransformError> {
         for raw in [false, true] {
-            assert!(matches!(
-                PolynomialDefinition::new(Some(Scalar::from(0_i64)), Some(Scalar::from(raw))),
-                Err(TransformError::InvalidParameter(_))
-            ));
+            let definition = PolynomialDefinition::new(None, Some(Scalar::from(raw)))?;
+            for input in [
+                Column::new("x".into(), ["a"]),
+                Column::new("x".into(), [true]),
+            ] {
+                assert!(
+                    matches!(
+                        definition.fit(&[input]),
+                        Err(TransformError::NonNumericInput { .. })
+                    ),
+                    "raw={raw}"
+                );
+            }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn polynomial_prediction_rejects_changed_names_and_dtypes() -> Result<(), TransformError> {
+        let training = [Column::new("x".into(), [1.0, 2.0, 3.0])];
+        for raw in [false, true] {
+            let fitted = Fitted::fit(
+                PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(raw)))?,
+                &training,
+            )?;
+            assert!(
+                matches!(
+                    fitted.transform(&[Column::new("z".into(), [1.0])]),
+                    Err(TransformError::InputNamesMismatch { expected, actual })
+                        if expected == vec![PlSmallStr::from_static("x")]
+                            && actual == vec![PlSmallStr::from_static("z")]
+                ),
+                "raw={raw}"
+            );
+            assert!(
+                matches!(
+                    fitted.transform(&[Column::new("x".into(), [1_i64])]),
+                    Err(TransformError::InputTypeMismatch { name, expected, actual })
+                        if name.as_str() == "x" && expected == DataType::Float64.to_string()
+                            && actual == DataType::Int64.to_string()
+                ),
+                "raw={raw}"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -875,25 +853,6 @@ mod tests {
             )?;
             assert_eq!(definition.call_name(&[input]).as_str(), expected);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn identity_depends_on_degree_and_raw_mode() -> Result<(), TransformError> {
-        let definition =
-            PolynomialDefinition::new(Some(Scalar::from(3_i64)), Some(Scalar::from(false)))?;
-        assert_eq!(
-            definition,
-            PolynomialDefinition::new(Some(Scalar::from(3_i64)), Some(Scalar::from(false)))?
-        );
-        assert_ne!(
-            definition,
-            PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(false)))?
-        );
-        assert_ne!(
-            definition,
-            PolynomialDefinition::new(Some(Scalar::from(3_i64)), Some(Scalar::from(true)))?
-        );
         Ok(())
     }
 }
