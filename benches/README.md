@@ -54,3 +54,35 @@ Evaluation reuses a model fitted outside timing. The deterministic dataset has
 The `categorical` and `integer` workloads apply `C` and `F` to a string column;
 their `_native` counterparts use a categorical copy of the same column.
 Categorical conversion happens during data construction, outside timing.
+
+The `polynomial_raw_degree3`, `polynomial_raw_degree10`,
+`polynomial_orthogonal_degree3`, and `polynomial_orthogonal_degree10` workloads
+apply `poly` to `a`. They measure parsing, parsing plus fitting, and fitted
+evaluation for raw powers and orthogonal bases at degrees 3 and 10. Degree 10
+also exercises the cost of evaluating a longer recurrence. These cases use the
+same mixed dataset: nulls, NaN, and infinities in `a` are excluded from orthogonal
+fitting and produce null polynomial output rows in both modes. The right-hand
+designs have 4 and 11 columns respectively, including the intercept. Use enough
+rows to provide at least 11 distinct finite values for the degree-10 fit
+(for example, the quick run below uses 1,000 rows).
+
+The `polynomial_raw_interaction` and `polynomial_orthogonal_interaction`
+workloads use `poly(a, degree=3)*b`, with the corresponding raw setting. The `*`
+operator includes both main effects and their interaction, reusing the polynomial
+factor across terms. Their designs have 8 columns including the intercept.
+The corresponding `_basis_interaction` workloads use
+`poly(a, degree=3)*poly(b, degree=3)`, exercising reuse of both bases and their
+nine pairwise interaction columns, for 16 columns including the intercept.
+All four workloads measure parsing, fitting, and fitted evaluation. The shared
+factor-deduplication tests verify that each distinct polynomial factor is
+fitted once and evaluated once during materialization, then evaluated once
+without refitting during prediction; timings alone cannot guarantee this.
+
+```sh
+POLARS_MAX_THREADS=1 cargo bench --locked --bench benchmark -- 1000 2 10 > /tmp/poly.json
+cargo run --locked --example compare_benchmarks -- - /tmp/poly.json
+```
+
+The workflow discovers these workloads through the runner's JSON output, so no
+workflow configuration changes are needed. When the baseline predates these
+cases, they appear as added workloads without a percentage change.
