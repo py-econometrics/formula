@@ -3,8 +3,8 @@ use crate::transform::input::{argument_column_name, input_frame, validate_single
 use crate::transform::{TransformDefinition, call_name, validate_numeric_input};
 use crate::{ArgumentCount, TransformError};
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, Expr, Field, IntoLazy, NULL, PlSmallStr, Scalar, col,
-    lit, when,
+    AnyValue, Column, DataFrame, DataType, Expr, Field, Float64Chunked, IntoColumn, IntoLazy, NULL,
+    PlSmallStr, Scalar, col, lit, when,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,9 +83,12 @@ enum PolynomialBasis {
 
 #[derive(Debug)]
 struct OrthogonalBasis {
+    // The fitted constant q0 = 1 / sqrt(number of finite training values).
+    initial_value: f64,
     steps: Vec<RecurrenceStep>,
 }
 
+// q_next = ((x - alpha) * q_current - beta * q_previous) / norm.
 #[derive(Debug)]
 struct RecurrenceStep {
     alpha: f64,
@@ -123,23 +126,55 @@ impl PolynomialBasis {
 
 impl OrthogonalBasis {
     fn evaluate(&self, values: &Column) -> Result<Vec<Column>, TransformError> {
-        let mut previous = Column::new_scalar("previous".into(), Scalar::from(0.0), values.len());
-        let mut current = Column::new_scalar("current".into(), Scalar::from(1.0), values.len());
-        let mut columns = Vec::with_capacity(self.steps.len());
+        let values = values.f64()?.rechunk();
+        let array = values
+            .downcast_iter()
+            .next()
+            .expect("rechunked input has one array");
+        let values = array.values().as_slice();
+        let mut columns: Vec<Float64Chunked> = Vec::with_capacity(self.steps.len());
 
-        for step in &self.steps {
-            let centered = values - step.alpha;
-            let leading = (&centered * &current)?;
-            let correction = &previous * step.beta;
-            let next = (&leading - &correction)?;
+        // Compute on value buffers; apply the input null mask to each output afterward.
+        for (index, step) in self.steps.iter().enumerate() {
+            let degree = index + 1;
+            let next = match degree {
+                1 => values
+                    .iter()
+                    .map(|x| ((x - step.alpha) * self.initial_value) / step.norm)
+                    .collect(),
+                2 => values
+                    .iter()
+                    .zip(columns[0].cont_slice()?)
+                    .map(|(x, current)| {
+                        ((x - step.alpha) * current - step.beta * self.initial_value) / step.norm
+                    })
+                    .collect(),
+                _ => {
+                    let current = columns[degree - 2].cont_slice()?;
+                    let previous = columns[degree - 3].cont_slice()?;
 
-            columns.push(&next / step.norm);
+                    values
+                        .iter()
+                        .zip(current)
+                        .zip(previous)
+                        .map(|((x, current), previous)| {
+                            ((x - step.alpha) * current - step.beta * previous) / step.norm
+                        })
+                        .collect()
+                }
+            };
 
-            previous = current;
-            current = next;
+            columns.push(Float64Chunked::from_vec("".into(), next));
         }
 
-        Ok(columns)
+        Ok(columns
+            .into_iter()
+            .map(|column| {
+                column
+                    .with_validity(array.validity().cloned())
+                    .into_column()
+            })
+            .collect())
     }
 
     fn training_frame(input: &Column, degree: usize) -> Result<DataFrame, TransformError> {
@@ -210,8 +245,9 @@ impl OrthogonalBasis {
 
             steps.push(RecurrenceStep {
                 alpha,
-                beta,
-                norm: next_norm2.sqrt(),
+                // Convert monic coefficients to the normalized recurrence.
+                beta: beta.sqrt(),
+                norm: next_norm2.sqrt() / current_norm2.sqrt(),
             });
 
             previous = current;
@@ -220,7 +256,10 @@ impl OrthogonalBasis {
             current_norm2 = next_norm2;
         }
 
-        Ok(Self { steps })
+        Ok(Self {
+            initial_value: 1.0 / (frame.height() as f64).sqrt(),
+            steps,
+        })
     }
 }
 
@@ -471,6 +510,40 @@ mod tests {
             assert_orthogonal_schema(&output, 1, 2);
             assert_close(output[0].f64()?.get(0).unwrap(), 2.0 / 2.0_f64.sqrt());
             assert_close(output[1].f64()?.get(0).unwrap(), 10.0 / 6.0_f64.sqrt());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_prediction_matches_for_subsets_and_concatenated_batches()
+    -> Result<(), TransformError> {
+        let fitted = Fitted::fit(
+            PolynomialDefinition::new(Some(Scalar::from(3_i64)), None)?,
+            &[Column::new("x".into(), [-2.0, -1.0, 0.0, 1.0, 2.0])],
+        )?;
+        let values = [Some(-1.0), None, Some(0.0), Some(1.0)];
+        let expected = fitted.transform(&[Column::new("x".into(), values)])?;
+        let subset = Column::new(
+            "x".into(),
+            [
+                Some(42.0),
+                Some(-1.0),
+                None,
+                Some(0.0),
+                Some(1.0),
+                Some(42.0),
+            ],
+        )
+        .slice(1, values.len());
+        let mut batches = Column::new("x".into(), [Some(-1.0), None]);
+        batches.append(&Column::new("x".into(), [Some(0.0), Some(1.0)]))?;
+        assert!(batches.as_materialized_series().n_chunks() > 1);
+
+        for (case, input) in [("subset", subset), ("concatenated batches", batches)] {
+            assert!(
+                fitted.transform(&[input])?.equals_missing(&expected),
+                "{case}"
+            );
         }
         Ok(())
     }
