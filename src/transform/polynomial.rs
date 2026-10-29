@@ -178,6 +178,8 @@ impl OrthogonalBasis {
     }
 
     fn training_frame(input: &Column, degree: usize) -> Result<DataFrame, TransformError> {
+        const PREFIX_SIZE: usize = 1_000;
+
         let name = argument_column_name(0);
         let frame = input_frame(std::slice::from_ref(input))?
             .lazy()
@@ -185,7 +187,15 @@ impl OrthogonalBasis {
             .drop_nulls(None)
             .collect()?;
 
-        let distinct = frame.column(name.as_str())?.n_unique()?;
+        let values = frame.column(name.as_str())?;
+        let prefix = values.head(Some(PREFIX_SIZE));
+        let distinct = prefix.n_unique()?;
+        // A sufficient prefix proves success; otherwise count all values before rejecting.
+        let distinct = if distinct <= degree && prefix.len() < values.len() {
+            values.n_unique()?
+        } else {
+            distinct
+        };
 
         if degree >= distinct {
             return Err(TransformError::NumericalError(format!(
@@ -583,15 +593,18 @@ mod tests {
 
     #[test]
     fn orthogonal_fit_rejects_insufficient_distinct_finite_values() -> Result<(), TransformError> {
-        for (degree, values) in [
-            (1, vec![]),
-            (1, vec![None, None]),
+        for (degree, distinct, values) in [
+            (1, 0, vec![]),
+            (1, 0, vec![None, None]),
             (
                 1,
+                0,
                 vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
             ),
-            (1, vec![Some(2.0), Some(2.0), Some(2.0)]),
+            (1, 1, vec![Some(2.0), Some(2.0), Some(2.0)]),
+            (1, 1, vec![Some(0.0), Some(-0.0)]),
             (
+                2,
                 2,
                 vec![
                     Some(0.0),
@@ -611,9 +624,36 @@ mod tests {
                     )?,
                     &[Column::new("x".into(), values)]
                 ),
-                Err(TransformError::NumericalError(_))
+                Err(TransformError::NumericalError(message))
+                    if message == format!(
+                        "orthogonal polynomial degree {degree} requires at least {} distinct finite values; found {distinct}",
+                        degree + 1,
+                    )
             ));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn orthogonal_fit_counts_distinct_values_beyond_prefix() -> Result<(), TransformError> {
+        let training = [Column::new(
+            "x".into(),
+            vec![0.0; 2_000]
+                .into_iter()
+                .chain([-1.0, 1.0])
+                .collect::<Vec<_>>(),
+        )];
+        Fitted::fit(
+            PolynomialDefinition::new(Some(Scalar::from(2_i64)), None)?,
+            &training,
+        )?;
+        assert!(matches!(
+            Fitted::fit(
+                PolynomialDefinition::new(Some(Scalar::from(3_i64)), None)?,
+                &training,
+            ),
+            Err(TransformError::NumericalError(message)) if message.ends_with("found 3")
+        ));
         Ok(())
     }
 
