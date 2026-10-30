@@ -2,6 +2,7 @@ use crate::fit::{Definition, Fit};
 use crate::model::{EvaluationError, Model, Models};
 use crate::transform::{ArgumentCount, Transform, TransformError, validate_numeric_input};
 use polars::prelude::{Column, DataFrame, DataType, PolarsResult, Scalar};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
@@ -16,6 +17,13 @@ fn collect_unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
         push_unique(&mut unique, item);
     }
     unique
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    Dependent,
+    Independent,
+    FixedEffect,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,6 +296,10 @@ impl Expression {
         self.terms.iter().any(Term::is_intercept)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
     pub(crate) fn resolve_intercept(mut self, include: bool) -> Self {
         let include_intercept = !self.suppress_intercept && (include || self.has_intercept());
         self.terms.retain(|term| !term.is_intercept());
@@ -388,23 +400,34 @@ impl Expression {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Formula {
-    pub(crate) left: Expression,
-    pub(crate) right: Expression,
+    pub(crate) expressions: BTreeMap<Role, Expression>,
 }
 
 impl Formula {
     pub(crate) fn validate(&self) -> Result<(), ValidationError> {
-        self.left.validate()?;
-        self.right.validate()
+        self.expressions
+            .iter()
+            .try_for_each(|(_, expression)| expression.validate())
+    }
+
+    fn assemble(&self, height: usize, terms: &[EvaluatedTerm]) -> Result<Model, EvaluationError> {
+        let expressions = self
+            .expressions
+            .iter()
+            .map(|(&role, expression)| {
+                expression
+                    .assemble(height, terms)
+                    .map(|evaluated| (role, evaluated))
+            })
+            .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
+
+        Ok(Model::new(expressions))
     }
 
     pub fn materialize(&self, data: &DataFrame) -> Result<Model, EvaluationError> {
         self.validate()?;
-        let terms = fit_and_evaluate_terms(&[&self.left, &self.right], data)?;
-        let dependent = self.left.assemble(data.height(), &terms)?;
-        let independent = self.right.assemble(data.height(), &terms)?;
-
-        Ok(Model::new(dependent, independent))
+        let terms = fit_and_evaluate_terms(&self.expressions.values().collect::<Vec<_>>(), data)?;
+        self.assemble(data.height(), &terms)
     }
 }
 
@@ -429,7 +452,7 @@ impl Specification {
         let expressions = self
             .formulas
             .iter()
-            .flat_map(|formula| [&formula.left, &formula.right])
+            .flat_map(|formula| formula.expressions.values())
             .collect::<Vec<_>>();
 
         // Fit factors and assemble terms once across every formula
@@ -439,9 +462,8 @@ impl Specification {
             .formulas
             .iter()
             .map(|formula| {
-                let dependent = formula.left.assemble(data.height(), &terms)?;
-                let independent = formula.right.assemble(data.height(), &terms)?;
-                Ok((formula.clone(), Model::new(dependent, independent)))
+                let model = formula.assemble(data.height(), &terms)?;
+                Ok((formula.clone(), model))
             })
             .collect::<Result<Vec<_>, EvaluationError>>()?;
 
@@ -736,7 +758,13 @@ mod tests {
                 "poly(x, degree=3, raw=true)[3]" => [8.0, -27.0],
             )
             .unwrap();
-            assert!(model.right().frame().equals_missing(&expected));
+            assert!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&expected)
+            );
 
             let prediction = polars::df!("y" => [6.0, 7.0], "x" => [Some(4.0), None]).unwrap();
             let output = model.evaluate(&prediction).unwrap();
@@ -747,7 +775,13 @@ mod tests {
                 "poly(x, degree=3, raw=true)[3]" => [Some(64.0), None],
             )
             .unwrap();
-            assert!(output.right().frame().equals_missing(&expected));
+            assert!(
+                output
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&expected)
+            );
         }
 
         #[test]
@@ -758,14 +792,17 @@ mod tests {
             )
             .unwrap();
             let model = materialize("y ~ poly(x, degree=2)", &training);
-            assert_eq!(model.right().frame().shape(), (3, 3));
+            assert_eq!(
+                model.expression(Role::Independent).unwrap().frame().shape(),
+                (3, 3)
+            );
 
             let prediction = polars::df!("y" => [2.0, 3.0], "x" => [Some(2.0), None]).unwrap();
             for _ in 0..2 {
                 TRANSFORM_CALLS.set((0, 0));
                 let output = model.evaluate(&prediction).unwrap();
                 assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
-                let frame = output.right().frame();
+                let frame = output.expression(Role::Independent).unwrap().frame();
                 assert_eq!(
                     frame.get_column_names(),
                     [
@@ -791,11 +828,29 @@ mod tests {
             for source in ["y ~ poly(x, degree=2)", "y ~ poly(x, degree=2, raw=true)"] {
                 let model = materialize(source, &training);
                 let output = model.evaluate(&empty).unwrap();
-                assert_eq!(output.right().frame().shape(), (0, 3));
-                assert_eq!(output.left().frame().shape(), (0, 1));
                 assert_eq!(
-                    output.right().frame().schema(),
-                    model.right().frame().schema()
+                    output
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .shape(),
+                    (0, 3)
+                );
+                assert_eq!(
+                    output.expression(Role::Dependent).unwrap().frame().shape(),
+                    (0, 1)
+                );
+                assert_eq!(
+                    output
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .schema(),
+                    model
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .schema()
                 );
             }
         }
@@ -811,7 +866,11 @@ mod tests {
             let actual = materialize("y ~ poly(log(x), degree=2, raw=true)", &data);
             assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
             assert_eq!(
-                actual.right().frame().get_column_names(),
+                actual
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
                 [
                     "Intercept",
                     "poly(log(x), degree=2, raw=true)[1]",
@@ -819,11 +878,18 @@ mod tests {
                 ]
             );
             for (actual, expected) in actual
-                .right()
+                .expression(Role::Independent)
+                .unwrap()
                 .frame()
                 .columns()
                 .iter()
-                .zip(expected.right().frame().columns())
+                .zip(
+                    expected
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .columns(),
+                )
             {
                 assert_eq!(
                     actual.f64().unwrap().iter().collect::<Vec<_>>(),
@@ -842,7 +908,13 @@ mod tests {
                 "poly(x, degree=2, raw=true)[2]:z" => [20.0, 63.0],
             )
             .unwrap();
-            assert!(model.right().frame().equals_missing(&expected));
+            assert!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&expected)
+            );
         }
 
         #[test]
@@ -860,7 +932,13 @@ mod tests {
                 "poly(x, degree=2, raw=true)[2]:poly(z, degree=2, raw=true)[2]" => [100.0, 441.0],
             )
             .unwrap();
-            assert!(model.right().frame().equals_missing(&expected));
+            assert!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&expected)
+            );
         }
 
         #[test]
@@ -934,23 +1012,30 @@ mod tests {
             let expected = &expected.iter().next().unwrap().1;
             assert!(
                 actual
-                    .left()
+                    .expression(Role::Dependent)
+                    .unwrap()
                     .frame()
-                    .equals_missing(expected.left().frame())
+                    .equals_missing(expected.expression(Role::Dependent).unwrap().frame())
             );
             assert!(
                 actual
-                    .right()
+                    .expression(Role::Independent)
+                    .unwrap()
                     .frame()
-                    .equals_missing(expected.right().frame())
+                    .equals_missing(expected.expression(Role::Independent).unwrap().frame())
             );
             assert_eq!(
-                actual.right().frame().get_column_names(),
+                actual
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
                 ["Intercept", "a", "b", "a:b:c"]
             );
             assert_eq!(
                 actual
-                    .right()
+                    .expression(Role::Independent)
+                    .unwrap()
                     .frame()
                     .column("a:b:c")
                     .unwrap()
@@ -1121,14 +1206,22 @@ mod tests {
         )
         .unwrap();
         let formula = Formula {
-            left: Expression::from(Term::from(Factor::from("y"))),
-            right: Expression::from(Term::from(Factor::Call {
-                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                arguments: ["a", "b"]
-                    .into_iter()
-                    .map(|name| Arc::new(Factor::from(name)))
-                    .collect(),
-            })),
+            expressions: BTreeMap::from([
+                (
+                    Role::Dependent,
+                    Expression::from(Term::from(Factor::from("y"))),
+                ),
+                (
+                    Role::Independent,
+                    Expression::from(Term::from(Factor::Call {
+                        transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+                        arguments: ["a", "b"]
+                            .into_iter()
+                            .map(|name| Arc::new(Factor::from(name)))
+                            .collect(),
+                    })),
+                ),
+            ]),
         };
         let models = Specification::new(vec![formula])
             .materialize(&data)
@@ -1141,9 +1234,19 @@ mod tests {
                 .next()
                 .unwrap()
                 .1
-                .right()
+                .expression(Role::Independent)
+                .unwrap()
                 .frame()
-                .equals_missing(evaluated.iter().next().unwrap().1.right().frame())
+                .equals_missing(
+                    evaluated
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .1
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                )
         );
 
         let missing = data.select(["y", "a"]).unwrap();
@@ -1214,7 +1317,10 @@ mod tests {
                 .materialize(&training)
                 .unwrap();
             let (_, model) = models.iter().next().unwrap();
-            assert_eq!(model.right().frame()[0].dtype(), &output_dtype);
+            assert_eq!(
+                model.expression(Role::Independent).unwrap().frame()[0].dtype(),
+                &output_dtype
+            );
             assert!(models.evaluate(&training).is_ok());
 
             for input in &changed {
@@ -1222,7 +1328,11 @@ mod tests {
                 for result in [
                     models.evaluate(input).map(|_| ()),
                     model.evaluate(input).map(|_| ()),
-                    model.right().evaluate(input).map(|_| ()),
+                    model
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .evaluate(input)
+                        .map(|_| ()),
                 ] {
                     let Err(EvaluationError::Fit(crate::FitError::Evaluation(
                         error @ TransformError::InputTypeMismatch { .. },
@@ -1383,9 +1493,19 @@ mod tests {
             for ((formula, model), &(source, response, names)) in collection.iter().zip(cases) {
                 let expected_formula = crate::parse(source).unwrap();
                 assert_eq!(formula, &expected_formula.formulas()[0], "{source}");
-                assert_eq!(model.left().frame().get_column_names(), [response]);
-                assert!(model.left().frame()[0].equals_missing(data.column(response).unwrap()));
-                let frame = model.right().frame();
+                assert_eq!(
+                    model
+                        .expression(Role::Dependent)
+                        .unwrap()
+                        .frame()
+                        .get_column_names(),
+                    [response]
+                );
+                assert!(
+                    model.expression(Role::Dependent).unwrap().frame()[0]
+                        .equals_missing(data.column(response).unwrap())
+                );
+                let frame = model.expression(Role::Independent).unwrap().frame();
                 assert_eq!(frame.get_column_names(), names);
                 for name in names {
                     assert!(
@@ -1434,15 +1554,36 @@ mod tests {
                     .as_ptr()
             };
             assert_eq!(
-                values_ptr(first.right().frame().column("x:z").unwrap()),
-                values_ptr(second.right().frame().column("x:z").unwrap()),
+                values_ptr(
+                    first
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .column("x:z")
+                        .unwrap()
+                ),
+                values_ptr(
+                    second
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .column("x:z")
+                        .unwrap()
+                ),
             );
             assert_eq!(
-                values_ptr(&first.left().frame()[0]),
-                values_ptr(&second.left().frame()[0])
+                values_ptr(&first.expression(Role::Dependent).unwrap().frame()[0]),
+                values_ptr(&second.expression(Role::Dependent).unwrap().frame()[0])
             );
             assert_eq!(
-                values_ptr(second.right().frame().column("x").unwrap()),
+                values_ptr(
+                    second
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .column("x")
+                        .unwrap()
+                ),
                 values_ptr(data.column("x").unwrap())
             );
         }
@@ -1494,7 +1635,9 @@ mod tests {
 
                 for models in [&collection, &applied] {
                     assert_eq!(models.len(), 2);
-                    let mut models = models.iter().map(|(_, model)| model.right().frame());
+                    let mut models = models
+                        .iter()
+                        .map(|(_, model)| model.expression(Role::Independent).unwrap().frame());
                     let first = models.next().unwrap();
                     let second = models.next().unwrap();
                     assert_eq!(first.shape(), (4, width), "{source}");
@@ -1530,7 +1673,14 @@ mod tests {
             .unwrap();
             let specification = crate::parse("y ~ C(g) + sw0(x)").unwrap();
             let collection = specification.materialize(&data).unwrap();
-            let retained = (&collection).into_iter().next().unwrap().1.right().clone();
+            let retained = (&collection)
+                .into_iter()
+                .next()
+                .unwrap()
+                .1
+                .expression(Role::Independent)
+                .unwrap()
+                .clone();
             drop(specification);
             drop(collection);
             drop(data);
@@ -1643,8 +1793,13 @@ mod tests {
         // sqrt(g) and exp(sqrt(g)) each fit and transform once, across both sides.
         assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
 
-        let sqrt = &model.left().expression().terms[0].factors[0];
-        let independent = model.right().expression();
+        let sqrt = &model
+            .expression(Role::Dependent)
+            .unwrap()
+            .expression()
+            .terms[0]
+            .factors[0];
+        let independent = model.expression(Role::Independent).unwrap().expression();
         assert!(Arc::ptr_eq(sqrt, &independent.terms[0].factors[0]));
         let Factor::Call { arguments, .. } = independent.terms[1].factors[0].as_ref() else {
             panic!("expected exp call");
@@ -1658,15 +1813,30 @@ mod tests {
         assert_eq!(TRANSFORM_CALLS.get(), (0, 2));
         assert!(Arc::ptr_eq(
             sqrt,
-            &applied.left().expression().terms[0].factors[0],
+            &applied
+                .expression(Role::Dependent)
+                .unwrap()
+                .expression()
+                .terms[0]
+                .factors[0],
         ));
         assert!(Arc::ptr_eq(
             &independent.terms[1].factors[0],
-            &applied.right().expression().terms[1].factors[0],
+            &applied
+                .expression(Role::Independent)
+                .unwrap()
+                .expression()
+                .terms[1]
+                .factors[0],
         ));
         assert!(Arc::ptr_eq(
             sqrt,
-            &applied.right().expression().terms[0].factors[0],
+            &applied
+                .expression(Role::Independent)
+                .unwrap()
+                .expression()
+                .terms[0]
+                .factors[0],
         ));
 
         let expected_dependent = polars::df!("sqrt(g)" => [Some(1.0), Some(0.0), None]).unwrap();
@@ -1675,10 +1845,17 @@ mod tests {
             "exp(sqrt(g))" => [Some(std::f64::consts::E), Some(1.0), None],
         )
         .unwrap();
-        assert!(applied.left().frame().equals_missing(&expected_dependent));
         assert!(
             applied
-                .right()
+                .expression(Role::Dependent)
+                .unwrap()
+                .frame()
+                .equals_missing(&expected_dependent)
+        );
+        assert!(
+            applied
+                .expression(Role::Independent)
+                .unwrap()
                 .frame()
                 .equals_missing(&expected_independent)
         );
@@ -1782,7 +1959,7 @@ mod tests {
             .clone()
             .materialize(&training)
             .unwrap();
-        let independent = model.right().clone();
+        let independent = model.expression(Role::Independent).unwrap().clone();
         drop(model);
 
         let input = polars::df!("g" => ["b", "unseen", "a"]).unwrap();
@@ -1828,18 +2005,22 @@ mod tests {
             ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2, 0),
         ] {
             let formula = crate::parse(source).unwrap().formulas()[0].clone();
-            let scheduled = schedule_factors(&[&formula.left, &formula.right]);
+            let scheduled = schedule_factors(&[
+                &formula.expressions[&Role::Dependent],
+                &formula.expressions[&Role::Independent],
+            ]);
 
             assert_eq!(scheduled.len(), count, "{source}");
             assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
             assert_eq!(
-                formula.left.terms[0].factors[0], formula.right.terms[0].factors[right_index],
+                formula.expressions[&Role::Dependent].terms[0].factors[0],
+                formula.expressions[&Role::Independent].terms[0].factors[right_index],
                 "{source}"
             );
-            for factor in formula.left.terms[0]
+            for factor in formula.expressions[&Role::Dependent].terms[0]
                 .factors
                 .iter()
-                .chain(&formula.right.terms[0].factors)
+                .chain(&formula.expressions[&Role::Independent].terms[0].factors)
             {
                 assert_eq!(
                     scheduled.iter().filter(|entry| *entry == factor).count(),
@@ -1922,11 +2103,14 @@ mod tests {
             .unwrap()
             .formulas()[0]
             .clone();
-        let scheduled = schedule_factors(&[&formula.left, &formula.right]);
+        let scheduled = schedule_factors(&[
+            &formula.expressions[&Role::Dependent],
+            &formula.expressions[&Role::Independent],
+        ]);
 
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
-        assert!(schedule_factors(&[&formula.right]).is_empty());
+        assert!(schedule_factors(&[&formula.expressions[&Role::Independent]]).is_empty());
     }
 
     #[test]
@@ -1962,13 +2146,20 @@ mod tests {
                 .clone()
                 .materialize(&data)
                 .unwrap();
-            let frame = model.right().frame();
+            let frame = model.expression(Role::Independent).unwrap().frame();
             assert_eq!(frame.get_column_names(), ["Intercept", "x"]);
             assert_eq!(
                 frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
                 vec![Some(1.0), Some(1.0)]
             );
-            assert_eq!(model.left().frame().get_column_names(), ["y"]);
+            assert_eq!(
+                model
+                    .expression(Role::Dependent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                ["y"]
+            );
         }
     }
 
@@ -1980,7 +2171,15 @@ mod tests {
                 .clone()
                 .materialize(&data)
                 .unwrap();
-            assert_eq!(model.right().frame().get_column_names(), ["x"], "{source}");
+            assert_eq!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                ["x"],
+                "{source}"
+            );
         }
     }
 
@@ -1992,7 +2191,15 @@ mod tests {
                 .clone()
                 .materialize(&data)
                 .unwrap();
-            assert_eq!(model.right().frame().get_column_names(), ["x"], "{source}");
+            assert_eq!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                ["x"],
+                "{source}"
+            );
         }
     }
 
@@ -2011,7 +2218,10 @@ mod tests {
             .clone()
             .materialize(&data)
             .unwrap();
-        assert_eq!(model.right().frame(), &data.select(["Intercept"]).unwrap());
+        assert_eq!(
+            model.expression(Role::Independent).unwrap().frame(),
+            &data.select(["Intercept"]).unwrap()
+        );
     }
 
     #[test]
@@ -2025,7 +2235,7 @@ mod tests {
             let height = values.len();
             let input = polars::df!("y" => values).unwrap();
             let output = model.evaluate(&input).unwrap();
-            let frame = output.right().frame();
+            let frame = output.expression(Role::Independent).unwrap().frame();
             assert_eq!(frame.shape(), (height, 1));
             assert_eq!(
                 frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
@@ -2041,8 +2251,11 @@ mod tests {
             let height = values.len();
             let data = polars::df!("y" => values.clone(), "x" => values).unwrap();
             let model = specification.materialize(&data).unwrap();
-            assert_eq!(model.left().frame().shape(), (height, 1));
-            assert_eq!(model.right().frame().shape(), (height, 0));
+            assert_eq!(
+                model.expression(Role::Dependent).unwrap().frame().shape(),
+                (height, 1)
+            );
+            assert!(model.expression(Role::Independent).is_none());
         }
     }
 
@@ -2201,18 +2414,26 @@ mod tests {
         )
         .unwrap();
         let specification = Formula {
-            left: Expression::from(Term::from(Factor::from("y"))),
-            right: Expression::from(Term::from(Factor::Call {
-                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                arguments: ["f1", "f2"]
-                    .into_iter()
-                    .map(|name| Arc::new(Factor::from(name)))
-                    .collect(),
-            })),
+            expressions: BTreeMap::from([
+                (
+                    Role::Dependent,
+                    Expression::from(Term::from(Factor::from("y"))),
+                ),
+                (
+                    Role::Independent,
+                    Expression::from(Term::from(Factor::Call {
+                        transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+                        arguments: ["f1", "f2"]
+                            .into_iter()
+                            .map(|name| Arc::new(Factor::from(name)))
+                            .collect(),
+                    })),
+                ),
+            ]),
         };
         let model = specification.materialize(&training).unwrap();
         let evaluated = model.evaluate(&input).unwrap();
-        let output = evaluated.right().frame();
+        let output = evaluated.expression(Role::Independent).unwrap().frame();
 
         assert_eq!(output.width(), 1);
         assert_eq!(output[0].name().as_str(), "F(f1, f2)");
@@ -2221,15 +2442,24 @@ mod tests {
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),
             vec![Some(2), Some(1), Some(0), None]
         );
-        assert_eq!(evaluated.left().frame()[0].len(), 4);
+        assert_eq!(
+            evaluated.expression(Role::Dependent).unwrap().frame()[0].len(),
+            4
+        );
 
-        let original = model.right().frame()[0]
+        let original = model.expression(Role::Independent).unwrap().frame()[0]
             .u32()
             .unwrap()
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(original, vec![Some(0), Some(1), Some(2)]);
-        assert_eq!(model.right().expression(), evaluated.right().expression());
+        assert_eq!(
+            model.expression(Role::Independent).unwrap().expression(),
+            evaluated
+                .expression(Role::Independent)
+                .unwrap()
+                .expression()
+        );
     }
 
     #[test]
@@ -2253,7 +2483,13 @@ mod tests {
         let inner = ExpressionTransform::ADD.fit();
         let outer = ExpressionTransform::EXP.fit();
 
-        for (data, design) in [(&training, model.right()), (&input, rematerialized.right())] {
+        for (data, design) in [
+            (&training, model.expression(Role::Independent).unwrap()),
+            (
+                &input,
+                rematerialized.expression(Role::Independent).unwrap(),
+            ),
+        ] {
             let inputs = [
                 data.column("f1").unwrap().clone(),
                 data.column("f2").unwrap().clone(),

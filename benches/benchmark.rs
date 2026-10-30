@@ -2,7 +2,7 @@
 
 mod results;
 
-use formula::{Models, parse};
+use formula::{Models, Role, parse};
 use polars::prelude::*;
 use results::{ModelShape, Operation, Output, Results, Sample};
 use std::env;
@@ -77,8 +77,16 @@ fn model_shapes(models: &Models) -> Output {
         models: models
             .iter()
             .map(|(_, model)| ModelShape {
-                left: model.left().frame().shape(),
-                right: model.right().frame().shape(),
+                left: model
+                    .expression(Role::Dependent)
+                    .expect("benchmark has a dependent expression")
+                    .frame()
+                    .shape(),
+                right: model
+                    .expression(Role::Independent)
+                    .expect("benchmark has an independent expression")
+                    .frame()
+                    .shape(),
             })
             .collect(),
     }
