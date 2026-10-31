@@ -1,15 +1,51 @@
 # formula
 
-`formula` is a Rust implementation of Wilkinson formulas powered by [
-`Polars`](https://pola.rs). `formula` provides a simple interface to parse formula strings
-and materialize data for regression analysis. It is currently narrowly focused on [
-`PyFixest`](https://github.com/py-econometrics/pyfixest).
+`formula` is  [`Polars`](https://pola.rs)-powerd implementation of Wilkinson formulas in Rust with a Python API. It parses formula strings and materializes data for regression
+analysis. It is primarily designed for [`PyFixest`](https://github.com/py-econometrics/pyfixest).
 
 > [!NOTE]
 > `formula` is in early development and its scope, syntax, API is subject to change. It is
 not ready for production use.
 
-## Quickstart
+## Python API
+
+```python
+import polars
+
+import formula
+
+data = polars.DataFrame(
+    {
+        "y": [1.0, 2.0, 3.0],
+        "x": [4.0, 5.0, 6.0],
+        "z": [7.0, 8.0, 9.0],
+        "firm": ["a", "b", "a"],
+    }
+)
+
+specification = formula.parse("y ~ sw(x, z) | firm")  # Parse into a specification
+models = specification.materialize(data)  # Materialize specification given input data
+model = models[0]  # Integer indexing follows expansion order
+same_model = models[model.formula]  # Look up an expanded model by its formula
+
+# Access materialized data by their role
+dependent = model.frame(formula.Role.Dependent)
+independent = model.frame(formula.Role.Independent)
+fixed_effects = model.frame(formula.Role.FixedEffect)
+
+# Select roles before evaluating data that has no dependent column.
+predictors = models.select([formula.Role.Independent, formula.Role.FixedEffect])
+new_data = polars.DataFrame({"x": [8.0], "z": [9.0], "firm": ["a"]})
+predicted = predictors.evaluate(new_data)
+```
+
+`parse` accepts one formula string or a sequence of strings and returns a
+`Specification`. Its `materialize` method returns one model per expanded formula.
+Each `frame(role)` returns a Polars `DataFrame`. `select` and `evaluate` return new models and retain fitted
+transform state. The returned frames preserve the input row count; callers decide
+which rows to retain.
+
+## Rust API
 
 ```rust
 use formula::{Role, parse};
@@ -44,8 +80,8 @@ fn main() {
         .materialize(&data)
         .expect("successful materialization");
 
-    for (formula, model) in &models {
-        println!("Model {formula:?}");
+    for model in &models {
+        println!("Model {}", model.formula());
         if let Some(dependent) = model.expression(Role::Dependent) {
             println!("Dependent design:\n{}", dependent.frame());
         }
@@ -58,22 +94,6 @@ fn main() {
     }
 }
 ```
-
-## Main API
-
-| Type or method                     | Description                                                                                                      |
-|------------------------------------|------------------------------------------------------------------------------------------------------------------|
-| `parse(source)`                    | Parse one formula string into a `Specification`.                                                                 |
-| `parse_many(sources)`              | Parse several formula strings into a `Specification`.                                                            |
-| `Specification::materialize(data)` | Evaluate the formulas against a Polars `DataFrame` and return `Models`.                                          |
-| `Models`                           | A collection `Vec<(Formula, Model)>` storing all `Formula`-`Model` pairs materialized by a given `Specification` |
-| `Model::expression(role)`          | Borrow the evaluated expression for a role, or return `None` if no terms are assigned to it.                     |
-| `EvaluatedExpression::frame()`     | Borrow the materialized Polars `DataFrame` for an expression.                                                    |
-| `Model::evaluate(data)`            | Evaluate all roles on new data using their fitted transform state.                                               |
-
-Use `Role::Dependent` for the response, `Role::Independent` for predictors, and
-`Role::FixedEffect` for integer-encoded fixed-effect groups.
-A role with terms can be present even when its encoding produces zero columns.
 
 ## Formula syntax
 
@@ -102,8 +122,9 @@ y ~ 1 + x | firm         # Fixed effects suppress even an explicitly requested i
 ```
 
 Each grouping term produces one integer-coded column, available through
-`model.expression(Role::FixedEffect)`. Column names preserve the input column names and
-factor order: `firm:year` and `year:firm` retain their respective order.
+`model.frame(formula.Role.FixedEffect)` in Python or
+`model.expression(Role::FixedEffect)` in Rust. Column names preserve the input column
+names and factor order: `firm:year` and `year:firm` retain their respective order.
 
 The pipe accepts column references, parentheses, formula operators, and stepwise
 expansion. Transform calls such as `log(x)`, `C(firm)`, and `poly(x)` are rejected

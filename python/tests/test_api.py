@@ -27,7 +27,9 @@ def data() -> polars.DataFrame:
     ],
 )
 def test_parse_and_materialize(formulas, expected_columns, data):
-    models = formula.parse(formulas).materialize(data)
+    specification = formula.parse(formulas)
+    assert isinstance(specification, formula.Specification)
+    models = specification.materialize(data)
 
     assert len(models) == len(expected_columns)
     for index, column in enumerate(expected_columns):
