@@ -1,11 +1,15 @@
 use crate::fit::{Definition, Fit};
 use crate::model::{EvaluationError, Model, Models};
+use crate::parse::{
+    FIXED_EFFECT_SEPARATOR, FORMULA_SEPARATOR, is_identifier_character, parse_scalar,
+};
 use crate::transform::{
     ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
 };
-use polars::prelude::{Column, DataFrame, DataType, PolarsResult, Scalar};
+use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use winnow::Parser;
 
 pub(crate) fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
@@ -19,6 +23,18 @@ fn collect_unique<T: PartialEq>(items: impl IntoIterator<Item = T>) -> Vec<T> {
         push_unique(&mut unique, item);
     }
     unique
+}
+
+pub(crate) fn render_column_name(name: &str) -> String {
+    let can_be_bare = !name.is_empty()
+        && name.chars().all(is_identifier_character)
+        && parse_scalar.parse(name).is_err();
+
+    if can_be_bare {
+        name.to_owned()
+    } else {
+        format!("`{}`", name.replace('`', "``"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -96,7 +112,7 @@ impl Factor {
 
                 if !expected.accepts(arguments.len()) {
                     return Err(ValidationError::InvalidArgumentCount {
-                        call: self.label(),
+                        call: self.render(),
                         expected,
                         actual: arguments.len(),
                     });
@@ -116,17 +132,21 @@ impl Factor {
         }
     }
 
-    fn label(&self) -> String {
+    fn render(&self) -> String {
         match self {
-            Self::Variable(variable) => variable.definition().name.clone(),
-            Self::Literal(value) => value.as_any_value().to_string(),
+            Self::Variable(variable) => render_column_name(&variable.definition().name),
+            Self::Literal(value) => match value.as_any_value() {
+                AnyValue::Int64(value) => value.to_string(),
+                AnyValue::Float64(value) => format!("{value:?}"),
+                _ => unreachable!("formula arguments contain only numeric literals"),
+            },
             Self::Call {
                 transform,
                 arguments,
             } => {
                 let arguments = arguments
                     .iter()
-                    .map(|argument| argument.label())
+                    .map(|argument| argument.render())
                     .collect::<Vec<_>>();
                 let names = arguments.iter().map(String::as_str).collect::<Vec<_>>();
                 transform.call_name(&names).to_string()
@@ -175,11 +195,25 @@ impl From<Factor> for Term {
 
 impl Term {
     const INTERCEPT_COLUMN_NAME: &'static str = "Intercept";
+
     pub(crate) fn intercept() -> Self {
         Self { factors: vec![] }
     }
+
     fn is_intercept(&self) -> bool {
         self.factors.is_empty()
+    }
+
+    fn render(&self) -> String {
+        if self.is_intercept() {
+            return "1".to_owned();
+        }
+
+        self.factors
+            .iter()
+            .map(|factor| factor.render())
+            .collect::<Vec<_>>()
+            .join(":")
     }
 
     fn interact(&self, right: &Term) -> Term {
@@ -294,6 +328,22 @@ impl From<Term> for Expression {
 }
 
 impl Expression {
+    fn render(&self) -> String {
+        let terms = self
+            .terms
+            .iter()
+            .map(Term::render)
+            .collect::<Vec<_>>()
+            .join(" + ");
+
+        if !self.suppress_intercept {
+            terms
+        } else if terms.is_empty() {
+            "-1".to_owned()
+        } else {
+            format!("{terms} - 1")
+        }
+    }
     fn has_intercept(&self) -> bool {
         self.terms.iter().any(Term::is_intercept)
     }
@@ -428,13 +478,38 @@ impl Formula {
             })
             .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
 
-        Ok(Model::new(expressions))
+        Ok(Model::new(self.clone(), expressions))
     }
 
     pub fn materialize(&self, data: &DataFrame) -> Result<Model, EvaluationError> {
         self.validate()?;
         let terms = fit_and_evaluate_terms(&self.expressions.values().collect::<Vec<_>>(), data)?;
         self.assemble(data.height(), &terms)
+    }
+}
+
+impl std::fmt::Display for Formula {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dependent = &self.expressions[&Role::Dependent];
+        let independent = &self.expressions[&Role::Independent];
+        let fixed_effects = &self.expressions[&Role::FixedEffect];
+
+        write!(
+            f,
+            "{} {FORMULA_SEPARATOR} {}",
+            dependent.render(),
+            independent.render()
+        )?;
+
+        if !fixed_effects.is_empty() {
+            write!(
+                f,
+                " {FIXED_EFFECT_SEPARATOR} {}",
+                render_fixed_effects(fixed_effects)
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -468,10 +543,7 @@ impl Specification {
         let entries = self
             .formulas
             .iter()
-            .map(|formula| {
-                let model = formula.assemble(data.height(), &terms)?;
-                Ok((formula.clone(), model))
-            })
+            .map(|formula| formula.assemble(data.height(), &terms))
             .collect::<Result<Vec<_>, EvaluationError>>()?;
 
         Ok(Models::new(entries))
@@ -562,10 +634,10 @@ fn fit_and_evaluate_factors(
                 }
 
                 let transform = transform.fit(&inputs).map_err(|error| {
-                    EvaluationError::TransformCall(format!("{}: {error}", factor.label()))
+                    EvaluationError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
                 let output = transform.transform(&inputs).map_err(|error| {
-                    EvaluationError::TransformCall(format!("{}: {error}", factor.label()))
+                    EvaluationError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
 
                 EvaluatedFactor {
@@ -612,7 +684,7 @@ fn evaluate_factors(
                 transform
                     .transform(&inputs)
                     .map_err(|error| {
-                        EvaluationError::TransformCall(format!("{}: {error}", factor.label()))
+                        EvaluationError::TransformCall(format!("{}: {error}", factor.render()))
                     })?
                     .into_columns()
             }
@@ -722,6 +794,32 @@ pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
         .collect()
 }
 
+fn render_fixed_effects(expression: &Expression) -> String {
+    expression
+        .terms
+        .iter()
+        .map(|term| {
+            let [factor] = term.factors.as_slice() else {
+                unreachable!("fixed-effect terms contain one encoded factor");
+            };
+            let Factor::Call {
+                transform: Transform::F(_),
+                arguments,
+            } = factor.as_ref()
+            else {
+                unreachable!("fixed-effect terms use F encoding");
+            };
+
+            arguments
+                .iter()
+                .map(|argument| argument.render())
+                .collect::<Vec<_>>()
+                .join(":")
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -755,13 +853,56 @@ mod tests {
     use polars::prelude::Scalar;
     use winnow::Parser;
 
+    #[test]
+    fn factor_labels_round_trip_through_the_parser() {
+        for source in [
+            "log(x)",
+            "log(`firm name`)",
+            "log(`a``b`)",
+            "log(`1`)",
+            "add(x, 2)",
+            "add(x, 2.0)",
+            "C(`group name`, reference='a')",
+        ] {
+            let original = parse_expression.parse(source).unwrap();
+            let label = original[0].terms[0].factors[0].render();
+            assert_eq!(
+                parse_expression.parse(&label).unwrap(),
+                original,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn formula_display_round_trips_expanded_formulas() {
+        for source in [
+            "y ~ x",
+            "y ~ x - 1",
+            "y ~ C(`group name`, reference='a') + poly(x, degree=2)",
+            "`outcome value` ~ log(`1`) + add(x, 2.0)",
+            "y ~ x | firm:year",
+            "y ~ sw(x, z) | `firm name`",
+        ] {
+            for formula in crate::parse(source).unwrap().formulas() {
+                let rendered = formula.to_string();
+                let parsed = crate::parse(&rendered).unwrap();
+                assert_eq!(
+                    parsed.formulas(),
+                    std::slice::from_ref(formula),
+                    "{rendered}"
+                );
+            }
+        }
+    }
+
     mod polynomial {
         use super::*;
         use crate::transform::TRANSFORM_CALLS;
 
         fn materialize(source: &str, data: &DataFrame) -> crate::Model {
             let models = crate::parse(source).unwrap().materialize(data).unwrap();
-            models.iter().next().unwrap().1.clone()
+            models.iter().next().unwrap().clone()
         }
 
         #[test]
@@ -1029,8 +1170,8 @@ mod tests {
             (&nested, &expanded, vec![Some(40.0), None]),
             (&evaluated_nested, &evaluated_expanded, vec![Some(192.0)]),
         ] {
-            let actual = &actual.iter().next().unwrap().1;
-            let expected = &expected.iter().next().unwrap().1;
+            let actual = actual.iter().next().unwrap();
+            let expected = expected.iter().next().unwrap();
             assert!(
                 actual
                     .expression(Role::Dependent)
@@ -1214,7 +1355,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "C(group name, reference=\"missing\"): `reference` value is not among the fitted levels",
+            "C(`group name`, reference='missing'): `reference` value is not among the fitted levels",
         );
     }
 
@@ -1254,7 +1395,6 @@ mod tests {
                 .iter()
                 .next()
                 .unwrap()
-                .1
                 .expression(Role::Independent)
                 .unwrap()
                 .frame()
@@ -1263,7 +1403,6 @@ mod tests {
                         .iter()
                         .next()
                         .unwrap()
-                        .1
                         .expression(Role::Independent)
                         .unwrap()
                         .frame()
@@ -1337,7 +1476,7 @@ mod tests {
                 .unwrap()
                 .materialize(&training)
                 .unwrap();
-            let (_, model) = models.iter().next().unwrap();
+            let model = models.iter().next().unwrap();
             assert_eq!(
                 model.expression(Role::Independent).unwrap().frame()[0].dtype(),
                 &output_dtype
@@ -1407,7 +1546,7 @@ mod tests {
             ),
             (
                 "y ~ C(x, x, reference='a')",
-                "C(x, x, reference=\"a\"): invalid argument count: expected exactly 1, received 2",
+                "C(x, x, reference='a'): invalid argument count: expected exactly 1, received 2",
             ),
             (
                 "y ~ poly(x, 2)",
@@ -1511,9 +1650,9 @@ mod tests {
                 .unwrap();
             expected_columns.with_column(expected_interaction).unwrap();
 
-            for ((formula, model), &(source, response, names)) in collection.iter().zip(cases) {
+            for (model, &(source, response, names)) in collection.iter().zip(cases) {
                 let expected_formula = crate::parse(source).unwrap();
-                assert_eq!(formula, &expected_formula.formulas()[0], "{source}");
+                assert_eq!(model.formula(), &expected_formula.formulas()[0], "{source}");
                 assert_eq!(
                     model
                         .expression(Role::Dependent)
@@ -1561,7 +1700,7 @@ mod tests {
             let specification = crate::parse("y ~ x:z + sw0(x)").unwrap();
             let collection = specification.materialize(&data).unwrap();
             assert_eq!(collection.len(), 2);
-            let mut models = collection.iter().map(|(_, model)| model);
+            let mut models = collection.iter();
             let first = models.next().unwrap();
             let second = models.next().unwrap();
             let values_ptr = |column: &polars::prelude::Column| {
@@ -1658,7 +1797,7 @@ mod tests {
                     assert_eq!(models.len(), 2);
                     let mut models = models
                         .iter()
-                        .map(|(_, model)| model.expression(Role::Independent).unwrap().frame());
+                        .map(|model| model.expression(Role::Independent).unwrap().frame());
                     let first = models.next().unwrap();
                     let second = models.next().unwrap();
                     assert_eq!(first.shape(), (4, width), "{source}");
@@ -1698,7 +1837,6 @@ mod tests {
                 .into_iter()
                 .next()
                 .unwrap()
-                .1
                 .expression(Role::Independent)
                 .unwrap()
                 .clone();
@@ -2047,7 +2185,7 @@ mod tests {
                     scheduled.iter().filter(|entry| *entry == factor).count(),
                     1,
                     "{source}: {}",
-                    factor.label()
+                    factor.render()
                 );
             }
         }

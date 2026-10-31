@@ -30,8 +30,8 @@ fn main() {
         .materialize(&data)
         .expect("successful materialization");
 
-    for (formula, model) in &models {
-        println!("Model {formula:?}");
+    for model in &models {
+        println!("Model {:?}", model.formula());
         if let Some(dependent) = model.expression(Role::Dependent) {
             println!("Dependent design:\n{}", dependent.frame());
         }

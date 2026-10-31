@@ -59,6 +59,8 @@ def test_model_indexing(data):
 
     by_formula = models["y ~ x - 1"]
     assert isinstance(by_formula, formula.Model)
+    assert by_formula.formula == models[0].formula == "y ~ x - 1"
+    assert models[" y~x -1 "].formula == by_formula.formula
     independent = by_formula.frame(formula.Role.Independent)
     assert independent is not None
     assert_frame_equal(independent, data.select("x"))
@@ -77,6 +79,19 @@ def test_model_indexing(data):
         models["y ~ missing"]
     with pytest.raises(SyntaxError, match="exactly one formula"):
         models["y ~ sw(x, z)"]
+
+
+def test_expanded_models_can_be_looked_up_by_their_formula(data):
+    models = formula.parse("y ~ sw(x, z)").materialize(data)
+
+    for index in range(len(models)):
+        model = models[index]
+        found = models[model.formula]
+        expected = model.frame(formula.Role.Independent)
+        actual = found.frame(formula.Role.Independent)
+        assert expected is not None
+        assert actual is not None
+        assert_frame_equal(actual, expected)
 
 
 def test_model_owns_its_data_and_returns_independent_frames(data):

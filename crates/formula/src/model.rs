@@ -13,12 +13,20 @@ use winnow::error::{ContextError, StrContext, StrContextValue};
 
 #[derive(Clone, Debug)]
 pub struct Model {
+    formula: Formula,
     expressions: BTreeMap<Role, EvaluatedExpression>,
 }
 
 impl Model {
-    pub(crate) fn new(expressions: BTreeMap<Role, EvaluatedExpression>) -> Self {
-        Self { expressions }
+    pub(crate) fn new(formula: Formula, expressions: BTreeMap<Role, EvaluatedExpression>) -> Self {
+        Self {
+            formula,
+            expressions,
+        }
+    }
+
+    pub fn formula(&self) -> &Formula {
+        &self.formula
     }
 
     fn assemble(&self, height: usize, terms: &[EvaluatedTerm]) -> Result<Self, EvaluationError> {
@@ -33,7 +41,7 @@ impl Model {
             })
             .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
 
-        Ok(Self::new(expressions))
+        Ok(Self::new(self.formula.clone(), expressions))
     }
 
     pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
@@ -68,20 +76,20 @@ impl Model {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        Ok(Self::new(expressions))
+        Ok(Self::new(self.formula.clone(), expressions))
     }
 }
 
 pub struct Models {
-    entries: Vec<(Formula, Model)>,
+    entries: Vec<Model>,
 }
 
 impl Models {
-    pub(crate) fn new(entries: Vec<(Formula, Model)>) -> Self {
+    pub(crate) fn new(entries: Vec<Model>) -> Self {
         Self { entries }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, (Formula, Model)> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Model> {
         self.entries.iter()
     }
 
@@ -94,9 +102,7 @@ impl Models {
     }
 
     pub fn get(&self, formula: &Formula) -> Option<&Model> {
-        self.entries
-            .iter()
-            .find_map(|(key, model)| (key == formula).then_some(model))
+        self.entries.iter().find(|model| model.formula() == formula)
     }
 
     pub fn get_by_str<'a>(&self, source: &'a str) -> ParseResult<'a, Option<&Model>> {
@@ -115,7 +121,7 @@ impl Models {
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
-        self.iter().flat_map(|(_, model)| {
+        self.iter().flat_map(|model| {
             model
                 .expressions
                 .values()
@@ -129,10 +135,7 @@ impl Models {
 
         let entries = self
             .iter()
-            .map(|(formula, model)| {
-                let evaluated = model.assemble(data.height(), &terms)?;
-                Ok((formula.clone(), evaluated))
-            })
+            .map(|model| model.assemble(data.height(), &terms))
             .collect::<Result<Vec<_>, EvaluationError>>()?;
 
         Ok(Self { entries })
@@ -145,11 +148,7 @@ impl Models {
 
         let entries = self
             .iter()
-            .map(|(formula, model)| {
-                model
-                    .select(roles)
-                    .map(|selected| (formula.clone(), selected))
-            })
+            .map(|model| model.select(roles))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self::new(entries))
@@ -157,8 +156,8 @@ impl Models {
 }
 
 impl<'a> IntoIterator for &'a Models {
-    type Item = &'a (Formula, Model);
-    type IntoIter = std::slice::Iter<'a, (Formula, Model)>;
+    type Item = &'a Model;
+    type IntoIter = std::slice::Iter<'a, Model>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()
@@ -237,7 +236,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        let model = &models.iter().next().unwrap().1;
+        let model = models.iter().next().unwrap();
 
         for (role, column, excluded) in [
             (Role::Dependent, "y", Role::Independent),
@@ -245,6 +244,7 @@ mod tests {
         ] {
             let training = model.expression(role).unwrap().frame().clone();
             let selected = model.select(&[role]).unwrap();
+            assert_eq!(selected.formula(), model.formula());
             assert!(selected.expression(excluded).is_none());
             assert!(
                 selected
@@ -256,6 +256,7 @@ mod tests {
 
             let input = data.select([column]).unwrap().slice(1, 1);
             let evaluated = selected.evaluate(&input).unwrap();
+            assert_eq!(evaluated.formula(), model.formula());
             assert!(evaluated.expression(excluded).is_none());
             assert!(
                 evaluated
@@ -292,14 +293,12 @@ mod tests {
 
         assert_eq!(selected.len(), models.len());
         assert_eq!(evaluated.len(), models.len());
-        for (
-            ((formula, original), (selected_formula, selected_model)),
-            (evaluated_formula, applied),
-        ) in models.iter().zip(selected.iter()).zip(evaluated.iter())
+        for ((original, selected_model), applied) in
+            models.iter().zip(selected.iter()).zip(evaluated.iter())
         {
-            assert_eq!(selected_formula, formula);
-            assert_eq!(evaluated_formula, formula);
-            assert!(selected.get(formula).is_some());
+            assert_eq!(selected_model.formula(), original.formula());
+            assert_eq!(applied.formula(), original.formula());
+            assert!(selected.get(original.formula()).is_some());
             assert!(selected_model.expression(Role::Dependent).is_none());
             assert!(applied.expression(Role::Dependent).is_none());
             let training = original.expression(Role::Independent).unwrap().frame();
@@ -330,7 +329,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        let model = &models.iter().nth(1).unwrap().1;
+        let model = models.iter().nth(1).unwrap();
         let roles = [Role::Independent, Role::FixedEffect];
         assert!(matches!(
             model.select(&roles),
@@ -370,7 +369,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        let model = &models.iter().next().unwrap().1;
+        let model = models.iter().next().unwrap();
 
         assert_eq!(
             model
@@ -404,7 +403,7 @@ mod tests {
         let applied = models.evaluate(&input).unwrap();
 
         for models in [&models, &applied] {
-            for ((_, model), expected) in models
+            for (model, expected) in models
                 .iter()
                 .zip([vec!["firm name", "firm name:f2"], vec!["f2:firm name"]])
             {
@@ -427,7 +426,7 @@ mod tests {
             .unwrap()
             .materialize(&data)
             .unwrap();
-        let model = &models.iter().next().unwrap().1;
+        let model = models.iter().next().unwrap();
 
         assert!(model.expression(Role::FixedEffect).is_none());
         assert_eq!(
@@ -446,8 +445,8 @@ mod tests {
         let expected = crate::parse_many(["y ~ x", "y ~ z"]).unwrap();
         assert_eq!(models.len(), 2);
         assert!(!models.is_empty());
-        for ((formula, model), expected) in models.iter().zip(expected.formulas()) {
-            assert_eq!(formula, expected);
+        for (model, expected) in models.iter().zip(expected.formulas()) {
+            assert_eq!(model.formula(), expected);
             assert_eq!(
                 model
                     .expression(Role::Dependent)
@@ -467,7 +466,7 @@ mod tests {
         let specification = crate::parse("y ~ sw(x, z)").unwrap();
         let models = specification.materialize(&data).unwrap();
 
-        for ((_, expected), formula) in models.iter().zip(specification.formulas()) {
+        for (expected, formula) in models.iter().zip(specification.formulas()) {
             assert!(std::ptr::eq(models.get(formula).unwrap(), expected));
         }
         for source in ["y ~ x + z", "y ~ x - 1"] {
@@ -488,7 +487,7 @@ mod tests {
             let query = String::from(" y~ x ");
             models.get_by_str(&query).unwrap().unwrap()
         };
-        let (_, first) = models.iter().next().unwrap();
+        let first = models.iter().next().unwrap();
         assert!(std::ptr::eq(found, first));
         assert!(models.get_by_str("y ~ z").unwrap().is_some());
         assert!(models.get_by_str("y ~ x + z").unwrap().is_none());

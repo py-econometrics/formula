@@ -78,7 +78,7 @@ fn model_shapes(models: &Models) -> Output {
     Output::Materialized {
         models: models
             .iter()
-            .map(|(_, model)| ModelShape {
+            .map(|model| ModelShape {
                 left: model
                     .expression(Role::Dependent)
                     .expect("benchmark has a dependent expression")

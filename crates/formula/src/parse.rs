@@ -14,9 +14,12 @@ use winnow::combinator::{
     alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat, separated,
     terminated,
 };
-use winnow::error::{ContextError, StrContext, StrContextValue};
+use winnow::error::{ContextError, ParseError, StrContext, StrContextValue};
 use winnow::token::{one_of, take_while};
 use winnow::{ModalParser, ModalResult, Parser};
+
+pub(crate) const FORMULA_SEPARATOR: char = '~';
+pub(crate) const FIXED_EFFECT_SEPARATOR: char = '|';
 
 #[derive(Debug)]
 struct TransformCall {
@@ -82,7 +85,7 @@ impl std::fmt::Display for TransformCallError {
 
 impl std::error::Error for TransformCallError {}
 
-fn is_identifier_character(c: char) -> bool {
+pub(crate) fn is_identifier_character(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
@@ -94,7 +97,7 @@ fn parse_bare_token<'i>(cursor: &mut &'i str) -> ModalResult<&'i str> {
     take_while(1.., |c: char| !is_argument_boundary(c)).parse_next(cursor)
 }
 
-fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
+pub(crate) fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
     terminated(
         alt((
             parse_literal_string,
@@ -167,6 +170,7 @@ fn parse_literal_number(cursor: &mut &str) -> ModalResult<Scalar> {
         parse_bare_token
             .verify(|token: &str| has_float_marker(token))
             .try_map(str::parse::<f64>)
+            .verify(|value: &f64| value.is_finite())
             .map(Scalar::from),
     ))
     .parse_next(cursor)
@@ -469,8 +473,10 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
         .context(StrContext::Label("left-hand expression"))
         .parse_next(cursor)?;
 
-    '~'.context(StrContext::Expected(StrContextValue::CharLiteral('~')))
-        .parse_next(cursor)?;
+    '~'.context(StrContext::Expected(StrContextValue::CharLiteral(
+        FORMULA_SEPARATOR,
+    )))
+    .parse_next(cursor)?;
 
     multispace0.parse_next(cursor)?;
 
@@ -478,7 +484,7 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
         .parse_next(cursor)?;
 
     let fixed_effects = opt(preceded(
-        '|',
+        FIXED_EFFECT_SEPARATOR,
         cut_err(parse_fixed_effects.context(StrContext::Label("fixed-effect expression"))),
     ))
     .parse_next(cursor)?
@@ -516,8 +522,7 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     Ok(formulas)
 }
 
-pub(crate) type ParseResult<'i, T> =
-    std::result::Result<T, winnow::error::ParseError<&'i str, winnow::error::ContextError>>;
+pub(crate) type ParseResult<'i, T> = Result<T, ParseError<&'i str, ContextError>>;
 
 pub fn parse(source: &str) -> ParseResult<'_, Specification> {
     parse_many(std::iter::once(source))

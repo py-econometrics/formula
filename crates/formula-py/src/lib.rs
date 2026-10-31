@@ -58,7 +58,6 @@ impl Models {
 
                 index
                     .and_then(|index| self.inner.iter().nth(index))
-                    .map(|(_, model)| model)
                     .ok_or_else(|| PyIndexError::new_err("model index out of range"))?
             }
             ModelKey::Formula(source) => self
@@ -99,6 +98,11 @@ struct Model {
 
 #[pymethods]
 impl Model {
+    #[getter]
+    fn formula(&self) -> String {
+        self.inner.formula().to_string()
+    }
+
     fn frame(&self, role: Role) -> Option<PyDataFrame> {
         self.inner
             .expression(role.into())

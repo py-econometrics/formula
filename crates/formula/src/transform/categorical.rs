@@ -118,8 +118,8 @@ impl TransformDefinition for CategoricalDefinition {
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
         let reference_argument = self.reference.as_ref().map(|reference| {
             let value = match reference.as_any_value() {
-                AnyValue::String(value) => format!("{value:?}"),
-                AnyValue::StringOwned(value) => format!("{:?}", value.as_str()),
+                AnyValue::String(value) => format!("'{value}'"),
+                AnyValue::StringOwned(value) => format!("'{}'", value.as_str()),
                 _ => Self::level_name(reference),
             };
 
@@ -322,7 +322,7 @@ mod tests {
                 Column::new("x".into(), [Some("b"), Some("a"), None, Some("d")]).cast(&dtype)?,
             ];
             let output = fitted.transform(&input)?;
-            assert_eq!(output.get_column_names(), ["C(x, reference=\"b\")[T.d]"]);
+            assert_eq!(output.get_column_names(), ["C(x, reference='b')[T.d]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
