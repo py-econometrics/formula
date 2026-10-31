@@ -1,6 +1,8 @@
 use crate::fit::{Definition, Fit};
 use crate::model::{EvaluationError, Model, Models};
-use crate::transform::{ArgumentCount, Transform, TransformError, validate_numeric_input};
+use crate::transform::{
+    ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
+};
 use polars::prelude::{Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -307,6 +309,11 @@ impl Expression {
             self.terms.insert(0, Term::intercept());
         }
         self
+    }
+
+    pub(crate) fn without_intercept(mut self) -> Self {
+        self.suppress_intercept = true;
+        self.resolve_intercept(false)
     }
 
     fn validate(&self) -> Result<(), ValidationError> {
@@ -699,6 +706,20 @@ fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a Evaluated
         .iter()
         .find(|entry| &entry.term == term)
         .expect("every term must have an evaluated entry")
+}
+
+pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
+    expression
+        .terms
+        .into_iter()
+        .filter(|term| !term.is_intercept())
+        .map(|term| {
+            Term::from(Factor::Call {
+                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+                arguments: term.factors,
+            })
+        })
+        .collect()
 }
 
 impl std::fmt::Display for ValidationError {
