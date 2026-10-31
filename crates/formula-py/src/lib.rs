@@ -47,19 +47,30 @@ impl Models {
         self.inner.len()
     }
 
-    fn __getitem__(&self, index: isize) -> PyResult<Model> {
-        let index = if index < 0 {
-            self.inner.len().checked_add_signed(index)
-        } else {
-            Some(index as usize)
+    fn __getitem__(&self, key: ModelKey) -> PyResult<Model> {
+        let inner = match key {
+            ModelKey::Index(index) => {
+                let index = if index < 0 {
+                    self.inner.len().checked_add_signed(index)
+                } else {
+                    Some(index as usize)
+                };
+
+                index
+                    .and_then(|index| self.inner.iter().nth(index))
+                    .map(|(_, model)| model)
+                    .ok_or_else(|| PyIndexError::new_err("model index out of range"))?
+            }
+            ModelKey::Formula(source) => self
+                .inner
+                .get_by_str(&source)
+                .map_err(|error| PySyntaxError::new_err(error.to_string()))?
+                .ok_or_else(|| PyKeyError::new_err(source))?,
         };
 
-        index
-            .and_then(|index| self.inner.iter().nth(index))
-            .map(|(_, inner)| Model {
-                inner: inner.clone(),
-            })
-            .ok_or_else(|| PyIndexError::new_err("model index out of range"))
+        Ok(Model {
+            inner: inner.clone(),
+        })
     }
 
     fn evaluate(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
@@ -129,4 +140,10 @@ impl From<Role> for formula::Role {
             Role::FixedEffect => Self::FixedEffect,
         }
     }
+}
+
+#[derive(FromPyObject)]
+enum ModelKey {
+    Index(isize),
+    Formula(String),
 }

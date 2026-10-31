@@ -7,6 +7,9 @@ use crate::parse::{ParseResult, parse};
 use crate::transform::TransformError;
 use polars::prelude::DataFrame;
 use std::collections::BTreeMap;
+use winnow::Parser;
+use winnow::combinator::fail;
+use winnow::error::{ContextError, StrContext, StrContextValue};
 
 #[derive(Clone, Debug)]
 pub struct Model {
@@ -98,10 +101,17 @@ impl Models {
 
     pub fn get_by_str<'a>(&self, source: &'a str) -> ParseResult<'a, Option<&Model>> {
         let specification = parse(source)?;
-        Ok(match specification.formulas() {
-            [formula] => self.get(formula),
-            _ => None,
-        })
+
+        if let [formula] = specification.formulas() {
+            return Ok(self.get(formula));
+        }
+
+        // A formula string expanding to multiple formulas is not supported
+        fail::<_, _, ContextError>
+            .context(StrContext::Expected(StrContextValue::Description(
+                "exactly one formula",
+            )))
+            .parse(source)
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
@@ -484,7 +494,8 @@ mod tests {
         assert!(models.get_by_str("y ~ x + z").unwrap().is_none());
         assert!(models.get_by_str("y ~ x - 1").unwrap().is_none());
         assert!(models.get_by_str("y ~").is_err());
-        assert!(models.get_by_str("y ~ sw(x, z)").unwrap().is_none());
+        let error = models.get_by_str("y ~ sw(x, z)").unwrap_err();
+        assert!(error.to_string().contains("expected exactly one formula"));
         assert!(models.get_by_str("y ~ sw(x, x)").unwrap().is_some());
     }
 }

@@ -57,6 +57,12 @@ def test_role_frames_preserve_rows_and_nulls(data):
 def test_model_indexing(data):
     models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).materialize(data)
 
+    by_formula = models["y ~ x - 1"]
+    assert isinstance(by_formula, formula.Model)
+    independent = by_formula.frame(formula.Role.Independent)
+    assert independent is not None
+    assert_frame_equal(independent, data.select("x"))
+
     first = models[-2].frame(formula.Role.Independent)
     last = models[-1].frame(formula.Role.Independent)
     assert first is not None
@@ -66,6 +72,11 @@ def test_model_indexing(data):
     for index in (2, -3):
         with pytest.raises(IndexError, match="model index out of range"):
             models[index]
+
+    with pytest.raises(KeyError, match="y ~ missing"):
+        models["y ~ missing"]
+    with pytest.raises(SyntaxError, match="exactly one formula"):
+        models["y ~ sw(x, z)"]
 
 
 def test_model_owns_its_data_and_returns_independent_frames(data):
