@@ -21,26 +21,33 @@ env:
 
 jobs:
   check:
-    name: Formatting, Clippy, and examples
+    name: Rust and Python checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: prefix-dev/setup-pixi@v0.11.2
         with:
-          components: rustfmt, clippy
+          cache: true
+          cache-write: ${{ github.ref == 'refs/heads/main' }}
+      - name: Rust formatting
+        run: pixi run --locked cargo fmt --all -- --check
+      - name: Ruff
+        run: pixi run --locked lint
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: pixi run --locked ruff format --check python
+      - name: Type checking
+        run: pixi run --locked typecheck
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: pixi run --locked cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Compile examples
-        run: cargo check --examples --locked
+        run: pixi run --locked cargo check --examples --locked
 
   test:
-    name: Rust tests and Python build (${{ matrix.os }})
+    name: Rust and Python tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -58,10 +65,5 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Rust tests
         run: pixi run --locked cargo test --locked
-      - name: Check Python
-        run: |
-          pixi run --locked lint
-          pixi run --locked ruff format --check python
-          pixi run --locked typecheck
       - name: Build Python extension
         run: pixi run --locked develop

@@ -162,7 +162,10 @@ pixi run --locked lint     # Check Python lint rules
 pixi run --locked format   # Format the Python sources
 pixi run --locked typecheck
 pixi run --locked cargo test --locked
+pixi run --locked pre-commit run --all-files
 ```
+
+Run `pixi run --locked pre-commit install` to enable the local commit hooks.
 
 The development environment uses Python 3.12. The package requires Python 3.11
 or newer, matching its Polars dependency. Python Polars is initially pinned to

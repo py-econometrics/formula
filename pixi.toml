@@ -24,6 +24,7 @@ polars = "==2.1.0"
 ruff = "*"
 ty = "*"
 pixi-pycharm = "*"
+pre-commit = ">=4"
 
 [environments]
 default = { features = ["dev"] }
