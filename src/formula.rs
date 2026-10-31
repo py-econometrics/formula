@@ -2457,7 +2457,7 @@ mod tests {
         let output = evaluated.expression(Role::Independent).unwrap().frame();
 
         assert_eq!(output.width(), 1);
-        assert_eq!(output[0].name().as_str(), "F(f1, f2)");
+        assert_eq!(output[0].name().as_str(), "f1:f2");
         assert_eq!(output[0].dtype(), &DataType::UInt32);
         assert_eq!(
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),

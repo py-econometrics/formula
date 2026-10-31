@@ -188,7 +188,42 @@ mod tests {
         );
         let fixed_effects = model.expression(Role::FixedEffect).unwrap().frame();
         assert_eq!(fixed_effects.shape(), (4, 1));
+        assert_eq!(fixed_effects.get_column_names(), ["f1:f2"]);
         assert_eq!(fixed_effects[0].n_unique().unwrap(), 3);
+    }
+
+    #[test]
+    fn fixed_effect_names_preserve_input_names_and_factor_order() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0], "x" => [3.0, 4.0],
+            "firm name" => ["a", "b"], "f2" => ["u", "v"],
+        )
+        .unwrap();
+        let models = crate::parse_many([
+            "y ~ x | `firm name` + `firm name` : f2",
+            "y ~ x | f2 : `firm name`",
+        ])
+        .unwrap()
+        .materialize(&data)
+        .unwrap();
+        let input = data.select(["f2", "firm name", "x", "y"]).unwrap();
+        let applied = models.evaluate(&input).unwrap();
+
+        for models in [&models, &applied] {
+            for ((_, model), expected) in models
+                .iter()
+                .zip([vec!["firm name", "firm name:f2"], vec!["f2:firm name"]])
+            {
+                assert_eq!(
+                    model
+                        .expression(Role::FixedEffect)
+                        .unwrap()
+                        .frame()
+                        .get_column_names(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
