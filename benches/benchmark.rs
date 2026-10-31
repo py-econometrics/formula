@@ -33,6 +33,8 @@ fn sample_data(rows: usize) -> PolarsResult<DataFrame> {
                 Some("second")
             }
         }).collect::<Vec<_>>(),
+        "firm" => (0..rows).map(|i| format!("firm_{}", i % 10_000)).collect::<Vec<_>>(),
+        "year" => (0..rows).map(|i| 2000 + ((i / 10_000) % 20) as i32).collect::<Vec<_>>(),
     )?;
     let categorical = data
         .column("g1")?
@@ -87,6 +89,9 @@ fn model_shapes(models: &Models) -> Output {
                     .expect("benchmark has an independent expression")
                     .frame()
                     .shape(),
+                fixed_effects: model
+                    .expression(Role::FixedEffect)
+                    .map(|expression| expression.frame().shape()),
             })
             .collect(),
     }
@@ -110,7 +115,10 @@ fn main() {
         ("polynomial_orthogonal_degree3", "y ~ poly(a, degree=3)"),
         ("categorical", "y ~ C(g1)"),
         ("categorical_native", "y ~ C(g_cat)"),
+        ("integer", "y ~ a | g1"),
+        ("integer_native", "y ~ a | g_cat"),
         ("interaction", "y ~ a:C(g1)"),
+        ("fixed_effects", "y ~ a*b + log(a) | firm + year:g1"),
     ] {
         results.samples.extend(measure_samples(
             name,

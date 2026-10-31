@@ -205,7 +205,7 @@ mod tests {
 
         let transform = transform.fit(&inputs)?;
         let output = transform.transform(&inputs).unwrap();
-        assert_eq!(output.get_column_names(), ["F(group)"]);
+        assert_eq!(output.get_column_names(), ["group"]);
         assert_eq!(
             output[0].u32()?.iter().collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(0)]

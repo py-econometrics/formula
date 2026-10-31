@@ -39,4 +39,6 @@ pub enum Output {
 pub struct ModelShape {
     pub left: (usize, usize),
     pub right: (usize, usize),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_effects: Option<(usize, usize)>,
 }

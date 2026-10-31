@@ -1,5 +1,7 @@
 use crate::fit::Fit;
-use crate::formula::{Expression, Factor, Formula, Role, Specification, Term, push_unique};
+use crate::formula::{
+    Expression, Factor, Formula, Role, Specification, Term, encode_fixed_effects, push_unique,
+};
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
 };
@@ -9,11 +11,12 @@ use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    alt, cut_err, delimited, eof, expression, fail, peek, preceded, repeat, separated, terminated,
+    alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat, separated,
+    terminated,
 };
-use winnow::error::{StrContext, StrContextValue};
+use winnow::error::{ContextError, StrContext, StrContextValue};
 use winnow::token::{one_of, take_while};
-use winnow::{ModalResult, Parser};
+use winnow::{ModalParser, ModalResult, Parser};
 
 #[derive(Debug)]
 struct TransformCall {
@@ -275,70 +278,87 @@ fn combine_expressions(
 }
 
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    expression(parse_operand)
-        .infix(alt((
-            '+'.value(Left(
-                10,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.add(right)
-                    }))
-                },
-            )),
-            '-'.value(Left(
-                10,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.subtract(right)
-                    }))
-                },
-            )),
-            '*'.value(Left(
-                20,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.interact_fully(right)
-                    }))
-                },
-            )),
-            '/'.value(Left(
-                20,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.nest(right)
-                    }))
-                },
-            )),
-            ':'.value(Right(
-                30,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.interact(&right)
-                    }))
-                },
-            )),
-        )))
-        .parse_next(cursor)
+    parse_expression_with_context(ParseContext::Formula).parse_next(cursor)
 }
 
-fn parse_stepwise_arguments(cursor: &mut &str) -> ModalResult<Vec<Vec<Expression>>> {
-    multispace0.parse_next(cursor)?;
+fn parse_expression_with_context<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    // Wrap parser factory in closure for deferred evaluation
+    move |cursor: &mut &'i str| {
+        expression(parse_operand(context))
+            .infix(alt((
+                '+'.value(Left(
+                    10,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.add(right)
+                        }))
+                    },
+                )),
+                '-'.value(Left(
+                    10,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.subtract(right)
+                        }))
+                    },
+                )),
+                '*'.value(Left(
+                    20,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.interact_fully(right)
+                        }))
+                    },
+                )),
+                '/'.value(Left(
+                    20,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.nest(right)
+                        }))
+                    },
+                )),
+                ':'.value(Right(
+                    30,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.interact(&right)
+                        }))
+                    },
+                )),
+            )))
+            .parse_next(cursor)
+    }
+}
 
-    let arguments = separated(
-        1..,
-        cut_err(parse_expression),
-        (multispace0, ',', multispace0),
-    )
-    .parse_next(cursor)?;
+fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
+    parse_expression_with_context(ParseContext::FixedEffects).parse_next(cursor)
+}
 
-    multispace0.parse_next(cursor)?;
+fn parse_stepwise_arguments<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Vec<Expression>>, ContextError> {
+    move |cursor: &mut &'i str| {
+        multispace0.parse_next(cursor)?;
 
-    ')'.context(StrContext::Expected(StrContextValue::Description(
-        "',' or ')' after an expression",
-    )))
-    .parse_next(cursor)?;
+        let arguments = separated(
+            1..,
+            cut_err(parse_expression_with_context(context)),
+            (multispace0, ',', multispace0),
+        )
+        .parse_next(cursor)?;
 
-    Ok(arguments)
+        multispace0.parse_next(cursor)?;
+
+        ')'.context(StrContext::Expected(StrContextValue::Description(
+            "',' or ')' after an expression",
+        )))
+        .parse_next(cursor)?;
+
+        Ok(arguments)
+    }
 }
 
 fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
@@ -361,68 +381,85 @@ enum Stepwise {
     Csw0,
 }
 
-fn parse_stepwise(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    let operator = terminated(
-        alt((
-            "sw0".value(Stepwise::Sw0),
-            "sw".value(Stepwise::Sw),
-            "csw0".value(Stepwise::Csw0),
-            "csw".value(Stepwise::Csw),
-        )),
-        '(',
-    )
-    .parse_next(cursor)?;
-
-    let arguments = cut_err(parse_stepwise_arguments).parse_next(cursor)?;
-
-    let mut expressions = match operator {
-        Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
-        Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
-    };
-
-    if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
-        expressions.insert(0, Expression::from(Term::intercept()));
-    }
-
-    Ok(expressions)
-}
-
-fn parse_expression_parenthesized(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    '('.parse_next(cursor)?;
-
-    let expressions = cut_err(parse_expression).parse_next(cursor)?;
-
-    cut_err(
-        ')'.context(StrContext::Expected(StrContextValue::Description(
-            "')' to close the parenthesized expression",
-        ))),
-    )
-    .parse_next(cursor)?;
-
-    Ok(expressions)
-}
-
-fn parse_operand(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    delimited(
-        multispace0,
-        alt((
-            parse_expression_parenthesized,
-            parse_stepwise,
+fn parse_stepwise<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    move |cursor: &mut &'i str| {
+        let operator = terminated(
             alt((
-                parse_suppressed_intercept,
-                parse_intercept,
-                parse_factor.map(Term::from).map(Expression::from),
-            ))
-            .map(|expression| vec![expression]),
-            cut_err(
-                fail.context(StrContext::Expected(StrContextValue::Description(
-                    "an expression",
-                ))),
-            ),
-        )),
-        multispace0,
-    )
-    .parse_next(cursor)
+                "sw0".value(Stepwise::Sw0),
+                "sw".value(Stepwise::Sw),
+                "csw0".value(Stepwise::Csw0),
+                "csw".value(Stepwise::Csw),
+            )),
+            '(',
+        )
+        .parse_next(cursor)?;
+
+        let arguments = cut_err(parse_stepwise_arguments(context)).parse_next(cursor)?;
+
+        let mut expressions = match operator {
+            Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
+            Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
+        };
+
+        if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
+            expressions.insert(0, Expression::from(Term::intercept()));
+        }
+
+        Ok(expressions)
+    }
+}
+
+fn parse_expression_parenthesized<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    move |cursor: &mut &'i str| {
+        '('.parse_next(cursor)?;
+
+        let expressions = cut_err(parse_expression_with_context(context)).parse_next(cursor)?;
+
+        cut_err(
+            ')'.context(StrContext::Expected(StrContextValue::Description(
+                "')' to close the parenthesized expression",
+            ))),
+        )
+        .parse_next(cursor)?;
+
+        Ok(expressions)
+    }
+}
+
+fn parse_operand<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    move |cursor: &mut &'i str| {
+        let factor = |cursor: &mut &str| match context {
+            ParseContext::Formula => parse_factor(cursor),
+            ParseContext::FixedEffects => parse_column(cursor),
+        };
+
+        delimited(
+            multispace0,
+            alt((
+                parse_expression_parenthesized(context),
+                parse_stepwise(context),
+                alt((
+                    parse_suppressed_intercept,
+                    parse_intercept,
+                    factor.map(Term::from).map(Expression::from),
+                ))
+                .map(|expression| vec![expression]),
+                cut_err(
+                    fail.context(StrContext::Expected(StrContextValue::Description(
+                        "an expression",
+                    ))),
+                ),
+            )),
+            multispace0,
+        )
+        .parse_next(cursor)
+    }
 }
 
 fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
@@ -440,28 +477,39 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     let right = cut_err(parse_expression.context(StrContext::Label("right-hand expression")))
         .parse_next(cursor)?;
 
+    let fixed_effects = opt(preceded(
+        '|',
+        cut_err(parse_fixed_effects.context(StrContext::Label("fixed-effect expression"))),
+    ))
+    .parse_next(cursor)?
+    .unwrap_or_else(|| vec![Expression::from_iter([])])
+    .into_iter()
+    .map(encode_fixed_effects)
+    .collect::<Vec<_>>();
+
     let left = left
         .into_iter()
         // By default no intercept on the left-hand expression of a formula
         .map(|expression| expression.resolve_intercept(false))
         .collect::<Vec<_>>();
 
-    let right = right
-        .into_iter()
-        // By default add intercept on the right-hand expression of a formula
-        .map(|expression| expression.resolve_intercept(true))
-        .collect::<Vec<_>>();
-
     let mut formulas = Vec::new();
     for left in &left {
         for right in &right {
-            let formula = Formula {
-                expressions: BTreeMap::from([
+            for fixed_effects in &fixed_effects {
+                let right = if fixed_effects.is_empty() {
+                    right.clone().resolve_intercept(true)
+                } else {
+                    // Suppress intercept in fixed-effect specifications
+                    right.clone().without_intercept()
+                };
+                let expressions = BTreeMap::from([
                     (Role::Dependent, left.clone()),
-                    (Role::Independent, right.clone()),
-                ]),
-            };
-            formulas.push(formula);
+                    (Role::Independent, right),
+                    (Role::FixedEffect, fixed_effects.clone()),
+                ]);
+                formulas.push(Formula { expressions });
+            }
         }
     }
 
@@ -595,9 +643,69 @@ fn reject_keywords(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ParseContext {
+    Formula,
+    FixedEffects,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_effect_expressions_preserve_grouping_and_stepwise_expansion() {
+        for (source, expected) in [
+            ("f1 + f1:f2", vec![expression(&[&["f1"], &["f1", "f2"]])]),
+            (
+                "(f1 + f2):f3",
+                vec![expression(&[&["f1", "f3"], &["f2", "f3"]])],
+            ),
+            (
+                "sw0(f1):f2",
+                vec![expression(&[&["f2"]]), expression(&[&["f1", "f2"]])],
+            ),
+            ("`log(x)`", vec![expression(&[&["log(x)"]])]),
+        ] {
+            assert_eq!(
+                parse_fixed_effects.parse(source).unwrap(),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_effect_expressions_reject_transform_calls_before_expansion() {
+        for source in [
+            "log(x)",
+            "(f + log(x))",
+            "sw(f, log(x))",
+            "f + log(x) - log(x)",
+        ] {
+            assert!(parse_fixed_effects.parse(source).is_err(), "{source}");
+            let formula = format!("y ~ x | {source}");
+            assert!(parse(&formula).is_err(), "{formula}");
+        }
+    }
+
+    #[test]
+    fn fixed_effect_pipe_expands_stepwise_alternatives_across_roles() {
+        let cases: &[(&str, &[&str])] = &[
+            ("y ~ x | sw0(f)", &["y ~ x", "y ~ x | f"]),
+            (
+                "y ~ sw(x, z) | sw0(f1):f2",
+                &["y ~ x | f2", "y ~ x | f1:f2", "y ~ z | f2", "y ~ z | f1:f2"],
+            ),
+        ];
+        for &(source, expanded) in cases {
+            assert_eq!(
+                parse(source).unwrap(),
+                parse_many(expanded.iter().copied()).unwrap(),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn polynomial_defaults_and_keyword_order_preserve_identity() {
@@ -817,6 +925,7 @@ mod tests {
                         expressions: BTreeMap::from([
                             (Role::Dependent, expression(&[&["outcome value"]])),
                             (Role::Independent, right.resolve_intercept(true)),
+                            (Role::FixedEffect, Expression::from_iter([])),
                         ]),
                     })
                     .collect(),
@@ -1109,6 +1218,7 @@ mod tests {
                         Role::Independent,
                         expression(&[&["csw0"], &["sw0x"]]).resolve_intercept(true),
                     ),
+                    (Role::FixedEffect, Expression::from_iter([])),
                 ]),
             }]),
         );
@@ -1232,6 +1342,7 @@ mod tests {
             expressions: BTreeMap::from([
                 (Role::Dependent, expression(&[&["y"]])),
                 (Role::Independent, expression(&[&[], &["x"], &["z"]])),
+                (Role::FixedEffect, Expression::from_iter([])),
             ]),
         };
 
@@ -1658,6 +1769,8 @@ mod tests {
                 "y ~ x ?",
                 "y ~ a/",
                 "y ~ /a",
+                "y ~ x |",
+                "y ~ x | f | g",
             ] {
                 assert!(parse(source).is_err(), "{source:?}");
             }

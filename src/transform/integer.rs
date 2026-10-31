@@ -1,5 +1,5 @@
 use super::input::{argument_column_name, input_frame};
-use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use super::{ArgumentCount, TransformDefinition, TransformError};
 use crate::fit::Definition;
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
@@ -137,7 +137,12 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         inputs: &[Column],
     ) -> Result<DataFrame, TransformError> {
         let input_frame = input_frame(inputs)?;
-        let output_name = call_name("F", state.fields.iter().map(|field| field.name().as_str()));
+        let output_name = state
+            .fields
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>()
+            .join(":");
 
         match &state.encoding {
             IntegerEncoding::Native(levels) => {
@@ -298,7 +303,7 @@ mod tests {
             let output = definition.transform(&transform, &input)?;
             // Codes are returned in order input data
             assert_integer_output(&output, &[Some(3), Some(2), Some(1), Some(0), None]);
-            assert_eq!(output.columns()[0].name().as_str(), "F(f1, f2)");
+            assert_eq!(output.columns()[0].name().as_str(), "f1:f2");
             assert_eq!(transform.fields, fitted_fields);
             assert!(mapping.equals_missing(&fitted_mapping));
         }
@@ -325,7 +330,7 @@ mod tests {
             .cast(&dtype)?];
             let output = fitted.transform(&input)?;
             assert_integer_output(&output, &[Some(1), None, None, Some(3), None, Some(1)]);
-            assert_eq!(output.columns()[0].name().as_str(), "F(x)");
+            assert_eq!(output.columns()[0].name().as_str(), "x");
         }
         Ok(())
     }

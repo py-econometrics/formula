@@ -53,14 +53,20 @@ Data construction, warm-up, output inspection, serialization, and result
 destruction are outside timing.
 Evaluation reuses a model fitted outside timing. The deterministic dataset has
 90% fully finite rows; the remaining rows contain nulls, NaN, or infinities.
-The `categorical` and `integer` workloads apply `C` and `F` to a string column;
-their `_native` counterparts use a categorical copy of the same column.
+The `categorical` workload applies `C` to a string column; `integer` encodes it
+as a fixed effect using pipe syntax. Their `_native` counterparts use a
+categorical copy of the same column.
 Categorical conversion happens during data construction, outside timing.
 
-The nine workloads cover numeric interactions, expression transforms, raw and
+The ten workloads cover numeric interactions, expression transforms, raw and
 orthogonal degree-3 polynomials, categorical encoding, integer encoding, and
 numeric-by-categorical interactions. Categorical and integer encoding each retain
 string and native-categorical inputs because they exercise different code paths.
+The `fixed_effects` workload combines numeric controls, their interaction, and a
+log transform with firm and year-by-group fixed effects:
+`y ~ a*b + log(a) | firm + year:g1`. The panel-like inputs contain up to 10,000
+string-valued firms and 20 numeric calendar years. Fixed-effect output shapes are
+recorded alongside the dependent and independent shapes.
 
 The two polynomial workloads produce four right-hand columns including the
 intercept. Nulls, NaN, and infinities produce null polynomial rows and are excluded

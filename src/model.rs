@@ -164,6 +164,69 @@ mod tests {
     use super::Role;
 
     #[test]
+    fn fixed_effect_pipe_materializes_joint_groups_without_intercept() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0, 4.0],
+            "x" => [5.0, 6.0, 7.0, 8.0],
+            "f1" => ["a", "b", "a", "a"],
+            "f2" => ["u", "u", "v", "u"],
+        )
+        .unwrap();
+        let models = crate::parse("y ~ 1 + x | f1:f2")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        let model = &models.iter().next().unwrap().1;
+
+        assert_eq!(
+            model
+                .expression(Role::Independent)
+                .unwrap()
+                .frame()
+                .get_column_names(),
+            ["x"]
+        );
+        let fixed_effects = model.expression(Role::FixedEffect).unwrap().frame();
+        assert_eq!(fixed_effects.shape(), (4, 1));
+        assert_eq!(fixed_effects.get_column_names(), ["f1:f2"]);
+        assert_eq!(fixed_effects[0].n_unique().unwrap(), 3);
+    }
+
+    #[test]
+    fn fixed_effect_names_preserve_input_names_and_factor_order() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0], "x" => [3.0, 4.0],
+            "firm name" => ["a", "b"], "f2" => ["u", "v"],
+        )
+        .unwrap();
+        let models = crate::parse_many([
+            "y ~ x | `firm name` + `firm name` : f2",
+            "y ~ x | f2 : `firm name`",
+        ])
+        .unwrap()
+        .materialize(&data)
+        .unwrap();
+        let input = data.select(["f2", "firm name", "x", "y"]).unwrap();
+        let applied = models.evaluate(&input).unwrap();
+
+        for models in [&models, &applied] {
+            for ((_, model), expected) in models
+                .iter()
+                .zip([vec!["firm name", "firm name:f2"], vec!["f2:firm name"]])
+            {
+                assert_eq!(
+                    model
+                        .expression(Role::FixedEffect)
+                        .unwrap()
+                        .frame()
+                        .get_column_names(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn role_queries_distinguish_absence_from_zero_column_output() {
         let data = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
         let models = crate::parse("y ~ C(g, reference='a') - 1")

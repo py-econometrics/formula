@@ -1,8 +1,9 @@
 # formula
 
-`formula` is a Rust implementation of Wilkinson formulas. `formula` provides an interface
-to parse formula strings and materialize data as a design
-matrix for regression analysis.
+`formula` is a Rust implementation of Wilkinson formulas powered by [
+`Polars`](https://pola.rs). `formula` provides a simple interface to parse formula strings
+and materialize data for regression analysis. It is currently narrowly focused on [
+`PyFixest`](https://github.com/py-econometrics/pyfixest).
 
 > [!NOTE]
 > `formula` is in early development and its scope, syntax, API is subject to change. It is
@@ -22,11 +23,16 @@ fn sample_data(n: usize) -> PolarsResult<DataFrame> {
         "x2" => Float64Chunked::rand_uniform("x2".into(), n, 1.0, 10.0),
         "category" => Series::new("category".into(), ["a", "b"])
             .sample_n(n, true, None, Some(1))?,
+        "firm" => Series::new("firm".into(), ["firm_a", "firm_b", "firm_c"])
+            .sample_n(n, true, None, Some(2))?,
+        "year" => Series::new("year".into(), [2020, 2021, 2022])
+            .sample_n(n, true, None, Some(3))?,
     )
 }
 
 fn main() {
-    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a'))";
+    let formula =
+        "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year";
 
     // Stores all specifications associated with a formula
     let specification = parse(formula).expect("valid formula");
@@ -46,6 +52,9 @@ fn main() {
         if let Some(independent) = model.expression(Role::Independent) {
             println!("Independent design:\n{}", independent.frame());
         }
+        if let Some(fixed_effects) = model.expression(Role::FixedEffect) {
+            println!("Fixed effects:\n{}", fixed_effects.frame());
+        }
     }
 }
 ```
@@ -58,11 +67,12 @@ fn main() {
 | `parse_many(sources)`              | Parse several formula strings into a `Specification`.                                                            |
 | `Specification::materialize(data)` | Evaluate the formulas against a Polars `DataFrame` and return `Models`.                                          |
 | `Models`                           | A collection `Vec<(Formula, Model)>` storing all `Formula`-`Model` pairs materialized by a given `Specification` |
-| `Model::expression(role)`         | Borrow the evaluated expression for a role, or return `None` if no terms are assigned to it.                     |
-| `EvaluatedExpression::frame()`    | Borrow the materialized Polars `DataFrame` for an expression.                                                    |
-| `Model::evaluate(data)`           | Evaluate all roles on new data using their fitted transform state.                                               |
+| `Model::expression(role)`          | Borrow the evaluated expression for a role, or return `None` if no terms are assigned to it.                     |
+| `EvaluatedExpression::frame()`     | Borrow the materialized Polars `DataFrame` for an expression.                                                    |
+| `Model::evaluate(data)`            | Evaluate all roles on new data using their fitted transform state.                                               |
 
-Use `Role::Dependent` for the response and `Role::Independent` for predictors.
+Use `Role::Dependent` for the response, `Role::Independent` for predictors, and
+`Role::FixedEffect` for integer-encoded fixed-effect groups.
 A role with terms can be present even when its encoding produces zero columns.
 
 ## Formula syntax
@@ -81,17 +91,35 @@ y ~ log(x) - 1  # transform x and omit the intercept
 Use backticks `` ` `` to escape column names containing spaces, punctuation or special
 characters, for example ``y ~ `household income` ``.
 
+### Fixed effects
+
+Use `|` to specify fixed effects separately from ordinary predictors:
+
+```text
+y ~ x | firm + year      # Separate firm and year fixed effects
+y ~ x | firm:year        # One fixed effect for observed firm-year combinations
+y ~ 1 + x | firm         # Fixed effects suppress even an explicitly requested intercept
+```
+
+Each grouping term produces one integer-coded column, available through
+`model.expression(Role::FixedEffect)`. Column names preserve the input column names and
+factor order: `firm:year` and `year:firm` retain their respective order.
+
+The pipe accepts column references, parentheses, formula operators, and stepwise
+expansion. Transform calls such as `log(x)`, `C(firm)`, and `poly(x)` are rejected
+after the pipe.
+
 ### Transformations
 
 `formula` supports symbolic transformations that will be applied to the data provided
 during formula materialization:
 
-| Function                                                                     | Description                                                                                                            |
-|------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.              |
-| `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                                    |
-| `C(group, reference=...)`                                                    | Create categorical indicator columns for `group`; the optional `reference` argument sets the reference level.          |
-| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                             |
+| Function                                                                     | Description                                                                                                   |
+|------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.     |
+| `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                           |
+| `C(group, reference=...)`                                                    | Create categorical indicator columns for `group`; the optional `reference` argument sets the reference level. |
+| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
 
 Numeric arguments are supported inside transformation calls:
 
