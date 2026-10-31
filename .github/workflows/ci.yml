@@ -58,5 +58,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run Rust tests
         run: pixi run --locked cargo test --locked
+      - name: Check Python
+        run: |
+          pixi run --locked lint
+          pixi run --locked ruff format --check python
+          pixi run --locked typecheck
       - name: Build Python extension
         run: pixi run --locked develop

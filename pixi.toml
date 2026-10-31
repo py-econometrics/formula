@@ -8,6 +8,9 @@ version = "0.1.0"
 [tasks]
 develop = "maturin develop --uv --locked"
 build = "maturin build --release --locked --out dist"
+lint = "ruff check python"
+format = "ruff format python"
+typecheck = "ty check"
 
 [dependencies]
 python = "3.12.*"
@@ -16,3 +19,11 @@ maturin = ">=1.7,<2"
 uv = ">=0.4"
 pytest = ">=8"
 polars = "==2.1.0"
+
+[feature.dev.dependencies]
+ruff = "*"
+ty = "*"
+pixi-pycharm = "*"
+
+[environments]
+default = { features = ["dev"] }

@@ -16,3 +16,12 @@ python-source = "python"
 module-name = "formula._formula"
 manifest-path = "crates/formula-py/Cargo.toml"
 features = ["pyo3/extension-module"]
+
+[tool.ruff]
+src = ["python"]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ty.src]
+include = ["python"]

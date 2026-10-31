@@ -5,6 +5,7 @@ __pycache__
 *.so
 /dist
 .pytest_cache
+.ruff_cache
 # pixi environments
 .pixi/*
 !.pixi/config.toml
