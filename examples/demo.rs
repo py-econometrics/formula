@@ -9,11 +9,16 @@ fn sample_data(n: usize) -> PolarsResult<DataFrame> {
         "x2" => Float64Chunked::rand_uniform("x2".into(), n, 1.0, 10.0),
         "category" => Series::new("category".into(), ["a", "b"])
             .sample_n(n, true, None, Some(1))?,
+        "firm" => Series::new("firm".into(), ["firm_a", "firm_b", "firm_c"])
+            .sample_n(n, true, None, Some(2))?,
+        "year" => Series::new("year".into(), [2020, 2021, 2022])
+            .sample_n(n, true, None, Some(3))?,
     )
 }
 
 fn main() {
-    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a'))";
+    let formula =
+        "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year";
 
     // Stores all specifications associated with a formula
     let specification = parse(formula).expect("valid formula");
@@ -32,6 +37,9 @@ fn main() {
         }
         if let Some(independent) = model.expression(Role::Independent) {
             println!("Independent design:\n{}", independent.frame());
+        }
+        if let Some(fixed_effects) = model.expression(Role::FixedEffect) {
+            println!("Fixed effects:\n{}", fixed_effects.frame());
         }
     }
 }
