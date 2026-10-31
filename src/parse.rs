@@ -1,8 +1,7 @@
 use crate::fit::Fit;
 use crate::formula::{Expression, Factor, Formula, Specification, Term, push_unique};
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, PolynomialDefinition,
-    Transform,
+    CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -555,10 +554,6 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("C", keywords)?;
                 Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
             }
-            "F" => {
-                reject_keywords("F", keywords)?;
-                Transform::F(Fit::Unfitted(IntegerEncodingDefinition))
-            }
             "poly" => {
                 let degree = keywords.remove("degree");
                 let raw = keywords.remove("raw");
@@ -781,10 +776,6 @@ mod tests {
             )))),
             vec![Factor::from("group name")],
         );
-        let integer = call(
-            Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-            vec![Factor::from("income-growth"), Factor::from("tax.rate")],
-        );
 
         for (source, right) in [
             (
@@ -798,10 +789,6 @@ mod tests {
             (
                 "`outcome value` ~ C(`group name`, reference='a')",
                 vec![Expression::from(Term::from(categorical))],
-            ),
-            (
-                "`outcome value` ~ F(`income-growth`, `tax.rate`)",
-                vec![Expression::from(Term::from(integer))],
             ),
             (
                 "`outcome value` ~ `income-growth`:`tax.rate` + `income-growth`*`a+b`",
@@ -1118,45 +1105,6 @@ mod tests {
     }
 
     #[test]
-    fn integer_encoding_preserves_all_positional_arguments() {
-        let cases = [
-            ("F(x)", vec![Factor::from("x")]),
-            ("F(x, x)", vec![Factor::from("x"), Factor::from("x")]),
-            (
-                "F(f1, f2, f3, f4)",
-                vec![
-                    Factor::from("f1"),
-                    Factor::from("f2"),
-                    Factor::from("f3"),
-                    Factor::from("f4"),
-                ],
-            ),
-            (
-                "F(log(x), z)",
-                vec![
-                    Factor::Call {
-                        transform: Transform::Expression(ExpressionTransform::LOG),
-                        arguments: vec![Arc::new(Factor::from("x"))],
-                    },
-                    Factor::from("z"),
-                ],
-            ),
-        ];
-
-        for (source, arguments) in cases {
-            let expected = Factor::Call {
-                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                arguments: arguments.into_iter().map(Arc::new).collect(),
-            };
-            assert_eq!(
-                parse_factor.parse(source).expect(source),
-                expected,
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
     fn expression_operators_preserve_precedence_grouping_and_deduplication() {
         let cases = [
             ("x*y", expression(&[&["x"], &["y"], &["x", "y"]])),
@@ -1409,7 +1357,6 @@ mod tests {
         fn unsupported_keywords_preserve_the_transform_and_keyword_names() {
             for (source, transform, keyword) in [
                 ("y ~ C(x, unknown=1)", "C", "unknown"),
-                ("y ~ F(x, reference=1)", "F", "reference"),
                 ("y ~ poly(x, unknown=1)", "poly", "unknown"),
                 ("y ~ C(log(x, base=2))", "log", "base"),
             ] {
@@ -1517,7 +1464,7 @@ mod tests {
                 "C(x, unknown=1)",
                 "C(x, reference=1 2)",
                 "C(x, reference=tr ue)",
-                "F(x, unknown=1)",
+                "F(x)",
             ] {
                 assert!(parse_expression.parse(source).is_err(), "{source}");
             }

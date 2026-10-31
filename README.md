@@ -22,15 +22,11 @@ fn sample_data(n: usize) -> PolarsResult<DataFrame> {
         "x2" => Float64Chunked::rand_uniform("x2".into(), n, 1.0, 10.0),
         "category" => Series::new("category".into(), ["a", "b"])
             .sample_n(n, true, None, Some(1))?,
-        "f1" => Series::new("f1".into(), [1, 2, 3])
-            .sample_n(n, true, None, Some(2))?,
-        "f2" => Series::new("f2".into(), ["x", "y", "z"])
-            .sample_n(n, true, None, Some(3))?,
     )
 }
 
 fn main() {
-    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) + F(f1, f2)";
+    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a'))";
 
     // Stores all specifications associated with a formula
     let specification = parse(formula).expect("valid formula");
@@ -85,7 +81,6 @@ during formula materialization:
 | `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.              |
 | `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                                    |
 | `C(group, reference=...)`                                                    | Create categorical indicator columns for `group`; the optional `reference` argument sets the reference level.          |
-| `F(group)`                                                                   | Encode observed levels as integer codes. Multiple inputs, such as `F(firm, year)`, encode their observed combinations. |
 | `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                             |
 
 Numeric arguments are supported inside transformation calls:

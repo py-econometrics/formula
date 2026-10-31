@@ -9,15 +9,11 @@ fn sample_data(n: usize) -> PolarsResult<DataFrame> {
         "x2" => Float64Chunked::rand_uniform("x2".into(), n, 1.0, 10.0),
         "category" => Series::new("category".into(), ["a", "b"])
             .sample_n(n, true, None, Some(1))?,
-        "f1" => Series::new("f1".into(), [1, 2, 3])
-            .sample_n(n, true, None, Some(2))?,
-        "f2" => Series::new("f2".into(), ["x", "y", "z"])
-            .sample_n(n, true, None, Some(3))?,
     )
 }
 
 fn main() {
-    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) + F(f1, f2)";
+    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a'))";
 
     // Stores all specifications associated with a formula
     let specification = parse(formula).expect("valid formula");

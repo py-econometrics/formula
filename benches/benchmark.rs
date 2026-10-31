@@ -102,8 +102,6 @@ fn main() {
         ("polynomial_orthogonal_degree3", "y ~ poly(a, degree=3)"),
         ("categorical", "y ~ C(g1)"),
         ("categorical_native", "y ~ C(g_cat)"),
-        ("integer", "y ~ F(g1)"),
-        ("integer_native", "y ~ F(g_cat)"),
         ("interaction", "y ~ a:C(g1)"),
     ] {
         results.samples.extend(measure_samples(
