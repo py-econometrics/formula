@@ -1,4 +1,4 @@
-use formula::parse;
+use formula::{Role, parse};
 use polars::df;
 use polars::prelude::{DataFrame, Float64Chunked, NamedFrom, PolarsResult, Series};
 
@@ -27,7 +27,11 @@ fn main() {
 
     for (formula, model) in &models {
         println!("Model {formula:?}");
-        println!("Dependent design:\n{}", model.left().frame());
-        println!("Independent design:\n{}", model.right().frame());
+        if let Some(dependent) = model.expression(Role::Dependent) {
+            println!("Dependent design:\n{}", dependent.frame());
+        }
+        if let Some(independent) = model.expression(Role::Independent) {
+            println!("Independent design:\n{}", independent.frame());
+        }
     }
 }

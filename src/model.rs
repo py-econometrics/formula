@@ -1,35 +1,53 @@
 use crate::Formula;
 use crate::fit::FitError;
-use crate::formula::{EvaluatedExpression, Expression, ValidationError, evaluate_terms};
+use crate::formula::{
+    EvaluatedExpression, EvaluatedTerm, Expression, Role, ValidationError, evaluate_terms,
+};
 use crate::parse::{ParseResult, parse};
 use crate::transform::TransformError;
 use polars::prelude::DataFrame;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct Model {
-    left: EvaluatedExpression,
-    right: EvaluatedExpression,
+    expressions: BTreeMap<Role, EvaluatedExpression>,
 }
 
 impl Model {
-    pub(crate) fn new(left: EvaluatedExpression, right: EvaluatedExpression) -> Self {
-        Self { left, right }
+    pub(crate) fn new(expressions: BTreeMap<Role, EvaluatedExpression>) -> Self {
+        Self { expressions }
     }
 
-    pub fn left(&self) -> &EvaluatedExpression {
-        &self.left
-    }
+    fn assemble(&self, height: usize, terms: &[EvaluatedTerm]) -> Result<Self, EvaluationError> {
+        let expressions = self
+            .expressions
+            .iter()
+            .map(|(&role, evaluated)| {
+                evaluated
+                    .expression()
+                    .assemble(height, terms)
+                    .map(|expression| (role, expression))
+            })
+            .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
 
-    pub fn right(&self) -> &EvaluatedExpression {
-        &self.right
+        Ok(Self::new(expressions))
     }
 
     pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
-        let terms = evaluate_terms(&[self.left().expression(), self.right().expression()], data)?;
-        let left = self.left().expression().assemble(data.height(), &terms)?;
-        let right = self.right().expression().assemble(data.height(), &terms)?;
+        let expressions = self
+            .expressions
+            .values()
+            .map(EvaluatedExpression::expression)
+            .collect::<Vec<_>>();
 
-        Ok(Model::new(left, right))
+        let terms = evaluate_terms(&expressions, data)?;
+        self.assemble(data.height(), &terms)
+    }
+
+    pub fn expression(&self, role: Role) -> Option<&EvaluatedExpression> {
+        self.expressions
+            .get(&role)
+            .filter(|evaluated| !evaluated.expression().is_empty())
     }
 }
 
@@ -69,8 +87,12 @@ impl Models {
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
-        self.iter()
-            .flat_map(|(_, model)| [model.left.expression(), model.right.expression()])
+        self.iter().flat_map(|(_, model)| {
+            model
+                .expressions
+                .values()
+                .map(EvaluatedExpression::expression)
+        })
     }
 
     pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
@@ -80,11 +102,11 @@ impl Models {
         let entries = self
             .iter()
             .map(|(formula, model)| {
-                let left = model.left().expression().assemble(data.height(), &terms)?;
-                let right = model.right().expression().assemble(data.height(), &terms)?;
-                Ok((formula.clone(), Model::new(left, right)))
+                let evaluated = model.assemble(data.height(), &terms)?;
+                Ok((formula.clone(), evaluated))
             })
             .collect::<Result<Vec<_>, EvaluationError>>()?;
+
         Ok(Self { entries })
     }
 }
@@ -139,6 +161,23 @@ impl std::error::Error for EvaluationError {}
 
 #[cfg(test)]
 mod tests {
+    use super::Role;
+
+    #[test]
+    fn role_queries_distinguish_absence_from_zero_column_output() {
+        let data = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
+        let models = crate::parse("y ~ C(g, reference='a') - 1")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        let model = &models.iter().next().unwrap().1;
+
+        assert!(model.expression(Role::FixedEffect).is_none());
+        assert_eq!(
+            model.expression(Role::Independent).unwrap().frame().shape(),
+            (2, 0)
+        );
+    }
 
     #[test]
     fn models_iterate_in_expansion_order() {
@@ -152,7 +191,14 @@ mod tests {
         assert!(!models.is_empty());
         for ((formula, model), expected) in models.iter().zip(expected.formulas()) {
             assert_eq!(formula, expected);
-            assert_eq!(model.left().frame().get_column_names(), ["y"]);
+            assert_eq!(
+                model
+                    .expression(Role::Dependent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                ["y"]
+            );
         }
         // Borrowed iteration remains available alongside the explicit iterator.
         assert_eq!((&models).into_iter().count(), models.len());

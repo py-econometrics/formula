@@ -11,7 +11,7 @@ not ready for production use.
 ## Quickstart
 
 ```rust
-use formula::parse;
+use formula::{Role, parse};
 use polars::df;
 use polars::prelude::{DataFrame, Float64Chunked, NamedFrom, PolarsResult, Series};
 
@@ -40,8 +40,12 @@ fn main() {
 
     for (formula, model) in &models {
         println!("Model {formula:?}");
-        println!("Dependent design:\n{}", model.left().frame());
-        println!("Independent design:\n{}", model.right().frame());
+        if let Some(dependent) = model.expression(Role::Dependent) {
+            println!("Dependent design:\n{}", dependent.frame());
+        }
+        if let Some(independent) = model.expression(Role::Independent) {
+            println!("Independent design:\n{}", independent.frame());
+        }
     }
 }
 ```
@@ -54,6 +58,12 @@ fn main() {
 | `parse_many(sources)`              | Parse several formula strings into a `Specification`.                                                            |
 | `Specification::materialize(data)` | Evaluate the formulas against a Polars `DataFrame` and return `Models`.                                          |
 | `Models`                           | A collection `Vec<(Formula, Model)>` storing all `Formula`-`Model` pairs materialized by a given `Specification` |
+| `Model::expression(role)`         | Borrow the evaluated expression for a role, or return `None` if no terms are assigned to it.                     |
+| `EvaluatedExpression::frame()`    | Borrow the materialized Polars `DataFrame` for an expression.                                                    |
+| `Model::evaluate(data)`           | Evaluate all roles on new data using their fitted transform state.                                               |
+
+Use `Role::Dependent` for the response and `Role::Independent` for predictors.
+A role with terms can be present even when its encoding produces zero columns.
 
 ## Formula syntax
 

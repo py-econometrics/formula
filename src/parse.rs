@@ -1,5 +1,5 @@
 use crate::fit::Fit;
-use crate::formula::{Expression, Factor, Formula, Specification, Term, push_unique};
+use crate::formula::{Expression, Factor, Formula, Role, Specification, Term, push_unique};
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
 };
@@ -455,10 +455,13 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     let mut formulas = Vec::new();
     for left in &left {
         for right in &right {
-            formulas.push(Formula {
-                left: left.clone(),
-                right: right.clone(),
-            });
+            let formula = Formula {
+                expressions: BTreeMap::from([
+                    (Role::Dependent, left.clone()),
+                    (Role::Independent, right.clone()),
+                ]),
+            };
+            formulas.push(formula);
         }
     }
 
@@ -811,8 +814,10 @@ mod tests {
                 right
                     .into_iter()
                     .map(|right| Formula {
-                        left: expression(&[&["outcome value"]]),
-                        right: right.resolve_intercept(true),
+                        expressions: BTreeMap::from([
+                            (Role::Dependent, expression(&[&["outcome value"]])),
+                            (Role::Independent, right.resolve_intercept(true)),
+                        ]),
                     })
                     .collect(),
             );
@@ -1098,8 +1103,13 @@ mod tests {
         assert_eq!(
             parse("sw ~ csw0 + sw0x").unwrap(),
             Specification::new(vec![Formula {
-                left: expression(&[&["sw"]]),
-                right: expression(&[&["csw0"], &["sw0x"]]).resolve_intercept(true),
+                expressions: BTreeMap::from([
+                    (Role::Dependent, expression(&[&["sw"]])),
+                    (
+                        Role::Independent,
+                        expression(&[&["csw0"], &["sw0x"]]).resolve_intercept(true),
+                    ),
+                ]),
             }]),
         );
     }
@@ -1194,7 +1204,7 @@ mod tests {
             let actual = parse(source).unwrap();
             assert_eq!(actual, parse(expanded).unwrap(), "{source}");
             assert_eq!(
-                actual.formulas()[0].right,
+                actual.formulas()[0].expressions[&Role::Independent],
                 expression(&[&["a"], &["a", "b"]]).subtract(Expression::from(Term::intercept())),
                 "{source}"
             );
@@ -1217,10 +1227,12 @@ mod tests {
     }
 
     #[test]
-    fn formulas_keep_dependent_and_independent_expressions_separate() {
+    fn formulas_assign_roles_to_expressions() {
         let expected = Formula {
-            left: expression(&[&["y"]]),
-            right: expression(&[&[], &["x"], &["z"]]),
+            expressions: BTreeMap::from([
+                (Role::Dependent, expression(&[&["y"]])),
+                (Role::Independent, expression(&[&[], &["x"], &["z"]])),
+            ]),
         };
 
         for source in ["y~x+z", "y ~ x + z", " \n y \t~\n x + z \t"] {
