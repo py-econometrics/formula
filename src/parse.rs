@@ -11,9 +11,9 @@ use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
     alt, cut_err, delimited, eof, expression, fail, peek, preceded, repeat, separated, terminated,
 };
-use winnow::error::{StrContext, StrContextValue};
+use winnow::error::{ContextError, StrContext, StrContextValue};
 use winnow::token::{one_of, take_while};
-use winnow::{ModalResult, Parser};
+use winnow::{ModalParser, ModalResult, Parser};
 
 #[derive(Debug)]
 struct TransformCall {
@@ -275,70 +275,83 @@ fn combine_expressions(
 }
 
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    expression(parse_operand)
-        .infix(alt((
-            '+'.value(Left(
-                10,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.add(right)
-                    }))
-                },
-            )),
-            '-'.value(Left(
-                10,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.subtract(right)
-                    }))
-                },
-            )),
-            '*'.value(Left(
-                20,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.interact_fully(right)
-                    }))
-                },
-            )),
-            '/'.value(Left(
-                20,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.nest(right)
-                    }))
-                },
-            )),
-            ':'.value(Right(
-                30,
-                |_, left: Vec<Expression>, right: Vec<Expression>| {
-                    Ok(combine_expressions(&left, &right, |left, right| {
-                        left.interact(&right)
-                    }))
-                },
-            )),
-        )))
-        .parse_next(cursor)
+    parse_expression_with_context(ParseContext::Formula).parse_next(cursor)
 }
 
-fn parse_stepwise_arguments(cursor: &mut &str) -> ModalResult<Vec<Vec<Expression>>> {
-    multispace0.parse_next(cursor)?;
+fn parse_expression_with_context<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    // Wrap parser factory in closure for deferred evaluation
+    move |cursor: &mut &'i str| {
+        expression(parse_operand(context))
+            .infix(alt((
+                '+'.value(Left(
+                    10,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.add(right)
+                        }))
+                    },
+                )),
+                '-'.value(Left(
+                    10,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.subtract(right)
+                        }))
+                    },
+                )),
+                '*'.value(Left(
+                    20,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.interact_fully(right)
+                        }))
+                    },
+                )),
+                '/'.value(Left(
+                    20,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.nest(right)
+                        }))
+                    },
+                )),
+                ':'.value(Right(
+                    30,
+                    |_, left: Vec<Expression>, right: Vec<Expression>| {
+                        Ok(combine_expressions(&left, &right, |left, right| {
+                            left.interact(&right)
+                        }))
+                    },
+                )),
+            )))
+            .parse_next(cursor)
+    }
+}
 
-    let arguments = separated(
-        1..,
-        cut_err(parse_expression),
-        (multispace0, ',', multispace0),
-    )
-    .parse_next(cursor)?;
+fn parse_stepwise_arguments<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Vec<Expression>>, ContextError> {
+    move |cursor: &mut &'i str| {
+        multispace0.parse_next(cursor)?;
 
-    multispace0.parse_next(cursor)?;
+        let arguments = separated(
+            1..,
+            cut_err(parse_expression_with_context(context)),
+            (multispace0, ',', multispace0),
+        )
+        .parse_next(cursor)?;
 
-    ')'.context(StrContext::Expected(StrContextValue::Description(
-        "',' or ')' after an expression",
-    )))
-    .parse_next(cursor)?;
+        multispace0.parse_next(cursor)?;
 
-    Ok(arguments)
+        ')'.context(StrContext::Expected(StrContextValue::Description(
+            "',' or ')' after an expression",
+        )))
+        .parse_next(cursor)?;
+
+        Ok(arguments)
+    }
 }
 
 fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
@@ -361,68 +374,85 @@ enum Stepwise {
     Csw0,
 }
 
-fn parse_stepwise(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    let operator = terminated(
-        alt((
-            "sw0".value(Stepwise::Sw0),
-            "sw".value(Stepwise::Sw),
-            "csw0".value(Stepwise::Csw0),
-            "csw".value(Stepwise::Csw),
-        )),
-        '(',
-    )
-    .parse_next(cursor)?;
-
-    let arguments = cut_err(parse_stepwise_arguments).parse_next(cursor)?;
-
-    let mut expressions = match operator {
-        Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
-        Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
-    };
-
-    if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
-        expressions.insert(0, Expression::from(Term::intercept()));
-    }
-
-    Ok(expressions)
-}
-
-fn parse_expression_parenthesized(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    '('.parse_next(cursor)?;
-
-    let expressions = cut_err(parse_expression).parse_next(cursor)?;
-
-    cut_err(
-        ')'.context(StrContext::Expected(StrContextValue::Description(
-            "')' to close the parenthesized expression",
-        ))),
-    )
-    .parse_next(cursor)?;
-
-    Ok(expressions)
-}
-
-fn parse_operand(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    delimited(
-        multispace0,
-        alt((
-            parse_expression_parenthesized,
-            parse_stepwise,
+fn parse_stepwise<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    move |cursor: &mut &'i str| {
+        let operator = terminated(
             alt((
-                parse_suppressed_intercept,
-                parse_intercept,
-                parse_factor.map(Term::from).map(Expression::from),
-            ))
-            .map(|expression| vec![expression]),
-            cut_err(
-                fail.context(StrContext::Expected(StrContextValue::Description(
-                    "an expression",
-                ))),
-            ),
-        )),
-        multispace0,
-    )
-    .parse_next(cursor)
+                "sw0".value(Stepwise::Sw0),
+                "sw".value(Stepwise::Sw),
+                "csw0".value(Stepwise::Csw0),
+                "csw".value(Stepwise::Csw),
+            )),
+            '(',
+        )
+        .parse_next(cursor)?;
+
+        let arguments = cut_err(parse_stepwise_arguments(context)).parse_next(cursor)?;
+
+        let mut expressions = match operator {
+            Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
+            Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
+        };
+
+        if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
+            expressions.insert(0, Expression::from(Term::intercept()));
+        }
+
+        Ok(expressions)
+    }
+}
+
+fn parse_expression_parenthesized<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    move |cursor: &mut &'i str| {
+        '('.parse_next(cursor)?;
+
+        let expressions = cut_err(parse_expression_with_context(context)).parse_next(cursor)?;
+
+        cut_err(
+            ')'.context(StrContext::Expected(StrContextValue::Description(
+                "')' to close the parenthesized expression",
+            ))),
+        )
+        .parse_next(cursor)?;
+
+        Ok(expressions)
+    }
+}
+
+fn parse_operand<'i>(
+    context: ParseContext,
+) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
+    move |cursor: &mut &'i str| {
+        let factor = |cursor: &mut &str| match context {
+            ParseContext::Formula => parse_factor(cursor),
+            ParseContext::FixedEffects => parse_column(cursor),
+        };
+
+        delimited(
+            multispace0,
+            alt((
+                parse_expression_parenthesized(context),
+                parse_stepwise(context),
+                alt((
+                    parse_suppressed_intercept,
+                    parse_intercept,
+                    factor.map(Term::from).map(Expression::from),
+                ))
+                .map(|expression| vec![expression]),
+                cut_err(
+                    fail.context(StrContext::Expected(StrContextValue::Description(
+                        "an expression",
+                    ))),
+                ),
+            )),
+            multispace0,
+        )
+        .parse_next(cursor)
+    }
 }
 
 fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
@@ -593,6 +623,12 @@ fn reject_keywords(
             keywords: keywords.into_keys().collect(),
         })
     }
+}
+
+#[derive(Clone, Copy)]
+enum ParseContext {
+    Formula,
+    FixedEffects,
 }
 
 #[cfg(test)]
