@@ -1,4 +1,4 @@
-use pyo3::exceptions::{PyIndexError, PySyntaxError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyKeyError, PySyntaxError, PyValueError};
 use pyo3::prelude::*;
 use pyo3_polars::PyDataFrame;
 
@@ -67,6 +67,18 @@ impl Models {
             .map(|inner| Self { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
+
+    fn select(&self, roles: Vec<Role>) -> PyResult<Self> {
+        let roles = roles.into_iter().map(Into::into).collect::<Vec<_>>();
+
+        self.inner
+            .select(&roles)
+            .map(|inner| Self { inner })
+            .map_err(|error| match &error {
+                formula::SelectionError::EmptySelection => PyValueError::new_err(error.to_string()),
+                formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
+            })
+    }
 }
 
 #[pyclass(frozen, module = "formula")]
@@ -86,6 +98,18 @@ impl Model {
         py.detach(|| self.inner.evaluate(&data.0))
             .map(|inner| Self { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    fn select(&self, roles: Vec<Role>) -> PyResult<Self> {
+        let roles = roles.into_iter().map(Into::into).collect::<Vec<_>>();
+
+        self.inner
+            .select(&roles)
+            .map(|inner| Self { inner })
+            .map_err(|error| match &error {
+                formula::SelectionError::EmptySelection => PyValueError::new_err(error.to_string()),
+                formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
+            })
     }
 }
 

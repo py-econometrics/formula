@@ -113,6 +113,29 @@ def test_models_evaluate_preserves_model_order_and_fitted_state(data):
         assert_frame_equal(independent, training.slice(1, 1))
 
 
+def test_select_accepts_role_sequences(data):
+    models = formula.parse("y ~ x - 1").materialize(data)
+    selected_model = models[0].select((formula.Role.Independent,))
+    selected_models = models.select([formula.Role.Independent])
+    assert isinstance(selected_model, formula.Model)
+    assert isinstance(selected_models, formula.Models)
+
+    new_data = data.select("x")
+    for model in (selected_model, selected_models[0]):
+        frame = model.evaluate(new_data).frame(formula.Role.Independent)
+        assert frame is not None
+        assert_frame_equal(frame, new_data)
+
+
+def test_select_rejects_missing_roles_and_empty_selections(data):
+    models = formula.parse("y ~ x").materialize(data)
+    for target in (models, models[0]):
+        with pytest.raises(KeyError, match="FixedEffect"):
+            target.select([formula.Role.FixedEffect])
+        with pytest.raises(ValueError, match="at least one role"):
+            target.select([])
+
+
 @pytest.mark.parametrize("formulas", [42, b"y ~ x", ["y ~ x", 42]])
 def test_parse_rejects_invalid_python_arguments(formulas):
     with pytest.raises(TypeError):

@@ -49,6 +49,24 @@ impl Model {
             .get(&role)
             .filter(|evaluated| !evaluated.expression().is_empty())
     }
+
+    pub fn select(&self, roles: &[Role]) -> Result<Self, SelectionError> {
+        if roles.is_empty() {
+            return Err(SelectionError::EmptySelection);
+        }
+
+        let expressions = roles
+            .iter()
+            .map(|&role| {
+                self.expression(role)
+                    .cloned()
+                    .map(|expression| (role, expression))
+                    .ok_or(SelectionError::MissingRole(role))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+        Ok(Self::new(expressions))
+    }
 }
 
 pub struct Models {
@@ -109,6 +127,23 @@ impl Models {
 
         Ok(Self { entries })
     }
+
+    pub fn select(&self, roles: &[Role]) -> Result<Self, SelectionError> {
+        if roles.is_empty() {
+            return Err(SelectionError::EmptySelection);
+        }
+
+        let entries = self
+            .iter()
+            .map(|(formula, model)| {
+                model
+                    .select(roles)
+                    .map(|selected| (formula.clone(), selected))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self::new(entries))
+    }
 }
 
 impl<'a> IntoIterator for &'a Models {
@@ -159,9 +194,158 @@ impl std::fmt::Display for EvaluationError {
 
 impl std::error::Error for EvaluationError {}
 
+#[derive(Debug)]
+pub enum SelectionError {
+    EmptySelection,
+    MissingRole(Role),
+}
+
+impl std::fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptySelection => f.write_str("select at least one role"),
+            Self::MissingRole(role) => {
+                write!(f, "model does not contain role {role:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
 #[cfg(test)]
 mod tests {
-    use super::Role;
+    use super::{Role, SelectionError};
+
+    #[test]
+    fn model_select_evaluates_only_selected_roles() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "a"],
+        )
+        .unwrap();
+        let models = crate::parse("y ~ C(g) - 1")
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        let model = &models.iter().next().unwrap().1;
+
+        for (role, column, excluded) in [
+            (Role::Dependent, "y", Role::Independent),
+            (Role::Independent, "g", Role::Dependent),
+        ] {
+            let training = model.expression(role).unwrap().frame().clone();
+            let selected = model.select(&[role]).unwrap();
+            assert!(selected.expression(excluded).is_none());
+            assert!(
+                selected
+                    .expression(role)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&training)
+            );
+
+            let input = data.select([column]).unwrap().slice(1, 1);
+            let evaluated = selected.evaluate(&input).unwrap();
+            assert!(evaluated.expression(excluded).is_none());
+            assert!(
+                evaluated
+                    .expression(role)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&training.slice(1, 1))
+            );
+            assert!(
+                model
+                    .expression(role)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&training)
+            );
+            assert!(model.expression(excluded).is_some());
+        }
+    }
+
+    #[test]
+    fn models_select_preserves_formula_keys_order_and_fitted_state() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+            "g" => ["a", "b", "a"],
+        )
+        .unwrap();
+        let models = crate::parse_many(["y ~ C(g) - 1", "y ~ x - 1"])
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        let selected = models.select(&[Role::Independent]).unwrap();
+        let input = data.select(["g", "x"]).unwrap().slice(1, 1);
+        let evaluated = selected.evaluate(&input).unwrap();
+
+        assert_eq!(selected.len(), models.len());
+        assert_eq!(evaluated.len(), models.len());
+        for (
+            ((formula, original), (selected_formula, selected_model)),
+            (evaluated_formula, applied),
+        ) in models.iter().zip(selected.iter()).zip(evaluated.iter())
+        {
+            assert_eq!(selected_formula, formula);
+            assert_eq!(evaluated_formula, formula);
+            assert!(selected.get(formula).is_some());
+            assert!(selected_model.expression(Role::Dependent).is_none());
+            assert!(applied.expression(Role::Dependent).is_none());
+            let training = original.expression(Role::Independent).unwrap().frame();
+            assert!(
+                applied
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&training.slice(1, 1))
+            );
+            assert!(
+                original
+                    .expression(Role::Dependent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&data.select(["y"]).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn select_rejects_missing_roles_and_empty_selections() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"],
+        )
+        .unwrap();
+        let models = crate::parse_many(["y ~ x | g", "y ~ x - 1"])
+            .unwrap()
+            .materialize(&data)
+            .unwrap();
+        let model = &models.iter().nth(1).unwrap().1;
+        let roles = [Role::Independent, Role::FixedEffect];
+        assert!(matches!(
+            model.select(&roles),
+            Err(SelectionError::MissingRole(Role::FixedEffect))
+        ));
+        // The role exists in the first model, but must exist in every model.
+        assert!(matches!(
+            models.select(&roles),
+            Err(SelectionError::MissingRole(Role::FixedEffect))
+        ));
+        assert!(matches!(
+            model.select(&[]),
+            Err(SelectionError::EmptySelection)
+        ));
+        assert!(matches!(
+            models.select(&[]),
+            Err(SelectionError::EmptySelection)
+        ));
+
+        let empty = crate::parse_many([]).unwrap().materialize(&data).unwrap();
+        assert!(matches!(
+            empty.select(&[]),
+            Err(SelectionError::EmptySelection)
+        ));
+    }
 
     #[test]
     fn fixed_effect_pipe_materializes_joint_groups_without_intercept() {
