@@ -8,11 +8,6 @@ mod _formula {
     use super::{Model, Models, Role, Specification, parse, parse_many};
 }
 
-#[pyclass(frozen, module = "formula")]
-struct Specification {
-    inner: formula::Specification,
-}
-
 #[pyfunction]
 fn parse(formulas: &str) -> PyResult<Specification> {
     formula::parse(formulas)
@@ -28,8 +23,8 @@ fn parse_many(formulas: Vec<String>) -> PyResult<Specification> {
 }
 
 #[pyclass(frozen, module = "formula")]
-struct Models {
-    inner: formula::Models,
+struct Specification {
+    inner: formula::Specification,
 }
 
 #[pymethods]
@@ -39,6 +34,11 @@ impl Specification {
             .map(|inner| Models { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
+}
+
+#[pyclass(frozen, module = "formula")]
+struct Models {
+    inner: formula::Models,
 }
 
 #[pymethods]
@@ -61,6 +61,12 @@ impl Models {
             })
             .ok_or_else(|| PyIndexError::new_err("model index out of range"))
     }
+
+    fn evaluate(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
+        py.detach(|| self.inner.evaluate(&data.0))
+            .map(|inner| Self { inner })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
 }
 
 #[pyclass(frozen, module = "formula")]
@@ -74,6 +80,12 @@ impl Model {
         self.inner
             .expression(role.into())
             .map(|expression| PyDataFrame(expression.frame().clone()))
+    }
+
+    fn evaluate(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
+        py.detach(|| self.inner.evaluate(&data.0))
+            .map(|inner| Self { inner })
+            .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 }
 

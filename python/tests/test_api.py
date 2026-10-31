@@ -80,6 +80,39 @@ def test_model_owns_its_data_and_returns_independent_frames(data):
     assert_frame_equal(original, data.select("x"))
 
 
+def test_model_evaluate_reuses_fitted_categories(data):
+    model = formula.parse("y ~ C(firm) - 1").materialize(data)[0]
+    training = model.frame(formula.Role.Independent)
+    assert training is not None
+
+    # Only one training category occurs in the new data; retain both columns.
+    evaluated = model.evaluate(data.slice(1, 1))
+    independent = evaluated.frame(formula.Role.Independent)
+    dependent = evaluated.frame(formula.Role.Dependent)
+    assert independent is not None
+    assert dependent is not None
+    assert_frame_equal(independent, training.slice(1, 1))
+    assert_frame_equal(dependent, data.select("y").slice(1, 1))
+
+    original = model.frame(formula.Role.Independent)
+    assert original is not None
+    assert_frame_equal(original, training)
+
+
+def test_models_evaluate_preserves_model_order_and_fitted_state(data):
+    models = formula.parse(["y ~ C(firm) - 1", "y ~ x - 1"]).materialize(data)
+    evaluated = models.evaluate(data.slice(1, 1))
+
+    assert len(evaluated) == len(models) == 2
+    for index in range(len(models)):
+        training = models[index].frame(formula.Role.Independent)
+        independent = evaluated[index].frame(formula.Role.Independent)
+        assert training is not None
+        assert independent is not None
+        assert training.height == data.height
+        assert_frame_equal(independent, training.slice(1, 1))
+
+
 @pytest.mark.parametrize("formulas", [42, b"y ~ x", ["y ~ x", 42]])
 def test_parse_rejects_invalid_python_arguments(formulas):
     with pytest.raises(TypeError):
@@ -92,3 +125,10 @@ def test_rust_errors_become_python_exceptions(data):
 
     with pytest.raises(ValueError, match="missing"):
         formula.parse("y ~ missing").materialize(data)
+
+    models = formula.parse("y ~ x").materialize(data)
+    prediction = data.drop("x")
+    with pytest.raises(ValueError, match="x"):
+        models.evaluate(prediction)
+    with pytest.raises(ValueError, match="x"):
+        models[0].evaluate(prediction)
