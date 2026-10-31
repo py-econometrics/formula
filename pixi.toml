@@ -1,0 +1,18 @@
+[workspace]
+authors = ["leostimpfle <leonardstimpfle@icloud.com>"]
+channels = ["conda-forge"]
+name = "formula"
+platforms = ["linux-64", "win-64", "osx-arm64", "osx-64"]
+version = "0.1.0"
+
+[tasks]
+develop = "maturin develop --uv --locked"
+build = "maturin build --release --locked --out dist"
+
+[dependencies]
+python = "3.12.*"
+rust = ">=1.85"
+maturin = ">=1.7,<2"
+uv = ">=0.4"
+pytest = ">=8"
+polars = "==2.1.0"
