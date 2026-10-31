@@ -73,7 +73,7 @@ jobs:
         shell: bash
         run: |
           revisions="candidate"
-          if [[ -f base/benches/benchmark.rs ]]; then
+          if [[ -f base/benches/benchmark.rs || -f base/crates/formula/benches/benchmark.rs ]]; then
             revisions="base candidate"
           fi
           echo "BENCH_REVISIONS=$revisions" >> "$GITHUB_ENV"
