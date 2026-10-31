@@ -158,6 +158,7 @@ Use [Pixi](https://pixi.sh) to build the Python package and run the Rust tests:
 ```sh
 pixi run --locked develop  # Build and install the extension in the Pixi environment
 pixi run --locked build    # Build a release wheel in dist/
+pixi run --locked test     # Build the extension and run the Python tests
 pixi run --locked lint     # Check Python lint rules
 pixi run --locked format   # Format the Python sources
 pixi run --locked typecheck

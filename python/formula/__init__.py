@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from . import _formula
 from ._formula import Model, Models, Role, Specification
 
-__all__ = ["Models", "Model", "Role", "Specification", "parse"]
+__all__ = ["Model", "Models", "Role", "Specification", "parse"]
 
 
 def parse(formulas: str | Sequence[str]) -> Specification:
