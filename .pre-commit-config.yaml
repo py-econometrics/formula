@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        args: ["--all", "--", "--check"]
+        pass_filenames: false
+      - id: clippy
+        args: ["--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+        files: ^python/
+      - id: ruff-format
+        files: ^python/
+        types_or: [python, pyi]
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty
+        entry: pixi run --locked typecheck
+        language: system
+        pass_filenames: false
+        always_run: true

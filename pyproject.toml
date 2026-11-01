@@ -1,0 +1,27 @@
+[project]
+name = "formula-py"
+dynamic = ["version"]
+description = "Wilkinson formulas powered by Polars"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["polars==2.1.0"]
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+module-name = "formula._formula"
+manifest-path = "crates/formula-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[tool.ruff]
+src = ["python"]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ty.src]
+include = ["python"]

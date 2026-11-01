@@ -147,3 +147,26 @@ multiple model specifications from a single formula. For example, the formula
 | `sw0(x, z, w, ...)`  | An empty expression, then one model per argument: `1`, `x`, `z`, `w`, and so on.        |
 | `csw(x, z, w, ...)`  | Cumulative models: `x`, then `x + z`, then `x + z + w`, and so on.                      |
 | `csw0(x, z, w, ...)` | An empty expression, then cumulative models: `1`, `x`, `x + z`, `x + z + w`, and so on. |
+
+## Development
+
+The Rust workspace contains the core crate in `crates/formula` and the Python
+binding in `crates/formula-py`. The Python package lives in `python/formula`.
+
+Use [Pixi](https://pixi.sh) to build the Python package and run the Rust tests:
+
+```sh
+pixi run --locked develop  # Build and install the extension in the Pixi environment
+pixi run --locked build    # Build a release wheel in dist/
+pixi run --locked lint     # Check Python lint rules
+pixi run --locked format   # Format the Python sources
+pixi run --locked typecheck
+pixi run --locked cargo test --locked
+pixi run --locked pre-commit run --all-files
+```
+
+Run `pixi run --locked pre-commit install` to enable the local commit hooks.
+
+The development environment uses Python 3.12. The package requires Python 3.11
+or newer, matching its Polars dependency. Python Polars is initially pinned to
+the verified version, 2.1.0.

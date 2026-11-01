@@ -1,0 +1,14 @@
+[package]
+name = "formula-py"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_formula"
+crate-type = ["cdylib"]
+
+[dependencies]
+formula = { path = "../formula" }
+pyo3 = "0.29"
+pyo3-polars = { version = "0.28", default-features = false, features = ["dtype-categorical"] }

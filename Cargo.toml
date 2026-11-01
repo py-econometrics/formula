@@ -1,4 +1,4 @@
 [workspace]
-members = ["crates/formula"]
+members = ["crates/formula", "crates/formula-py"]
 default-members = ["crates/formula"]
 resolver = "3"
