@@ -13,7 +13,7 @@ pub enum Operation {
     // Retained so the comparator can read results from older revisions.
     Parse,
     ParseAndFit,
-    Evaluate,
+    Transform,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,7 +32,7 @@ pub struct Sample {
 pub enum Output {
     // Retained for older standalone parsing samples.
     Parsed { formulas: usize },
-    Materialized { models: Vec<ModelShape> },
+    Fitted { models: Vec<ModelShape> },
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]

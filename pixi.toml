@@ -8,6 +8,7 @@ version = "0.1.0"
 [tasks]
 develop = "maturin develop --uv --locked"
 build = "maturin build --release --locked --out dist"
+test = { cmd = "python -m pytest python/tests", depends-on = ["develop"] }
 lint = "ruff check python"
 format = "ruff format python"
 typecheck = "ty check"

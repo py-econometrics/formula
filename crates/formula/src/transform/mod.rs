@@ -24,7 +24,7 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Transform {
+pub(crate) enum Transform {
     Expression(ExpressionTransform),
     C(Fit<CategoricalDefinition, CategoricalState>),
     F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
@@ -86,7 +86,7 @@ impl Transform {
 
         match self {
             Self::Expression(expression) => {
-                expression.transform(inputs).map_err(FitError::Evaluation)
+                expression.transform(inputs).map_err(FitError::Transform)
             }
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),

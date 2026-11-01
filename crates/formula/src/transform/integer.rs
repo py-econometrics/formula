@@ -743,7 +743,7 @@ mod tests {
             &transform.transform(&input).unwrap(),
             &[None, Some(0), Some(1)],
         );
-        let Err(crate::FitError::Evaluation(error @ TransformError::InputNamesMismatch { .. })) =
+        let Err(crate::FitError::Transform(error @ TransformError::InputNamesMismatch { .. })) =
             transform.transform(&first)
         else {
             panic!("expected InputNamesMismatch");

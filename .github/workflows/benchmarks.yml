@@ -73,7 +73,12 @@ jobs:
         shell: bash
         run: |
           revisions="candidate"
-          if [[ -f base/benches/benchmark.rs || -f base/crates/formula/benches/benchmark.rs ]]; then
+          base_schema="base/crates/formula/benches/results/mod.rs"
+          if [[ ! -f "$base_schema" ]]; then
+            base_schema="base/benches/results/mod.rs"
+          fi
+          if [[ -f base/benches/benchmark.rs || -f base/crates/formula/benches/benchmark.rs ]] &&
+             cmp -s "$base_schema" candidate/crates/formula/benches/results/mod.rs; then
             revisions="base candidate"
           fi
           echo "BENCH_REVISIONS=$revisions" >> "$GITHUB_ENV"
@@ -119,7 +124,7 @@ jobs:
             if [[ -d benchmark-results/base ]]; then
               candidate/target/release/examples/compare_benchmarks benchmark-results/base benchmark-results/candidate
             else
-              echo 'Baseline unavailable: this revision predates the benchmark harness.'
+              echo 'Baseline skipped: benchmark harness unavailable or result definitions differ.'
               echo
               candidate/target/release/examples/compare_benchmarks - benchmark-results/candidate
             fi

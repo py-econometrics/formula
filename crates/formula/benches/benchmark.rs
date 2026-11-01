@@ -75,23 +75,26 @@ fn measure_samples(
 }
 
 fn model_shapes(models: &Models) -> Output {
-    Output::Materialized {
+    Output::Fitted {
         models: models
             .iter()
-            .map(|(_, model)| ModelShape {
+            .map(|model| ModelShape {
                 left: model
-                    .expression(Role::Dependent)
+                    .select(&[Role::Dependent])
                     .expect("benchmark has a dependent expression")
                     .frame()
+                    .expect("valid dependent frame")
                     .shape(),
                 right: model
-                    .expression(Role::Independent)
+                    .select(&[Role::Independent])
                     .expect("benchmark has an independent expression")
                     .frame()
+                    .expect("valid independent frame")
                     .shape(),
                 fixed_effects: model
-                    .expression(Role::FixedEffect)
-                    .map(|expression| expression.frame().shape()),
+                    .select(&[Role::FixedEffect])
+                    .ok()
+                    .map(|model| model.frame().expect("valid fixed-effect frame").shape()),
             })
             .collect(),
     }
@@ -128,17 +131,17 @@ fn main() {
             || {
                 parse(black_box(source))
                     .unwrap()
-                    .materialize(black_box(&data))
+                    .fit(black_box(&data))
                     .unwrap()
             },
         ));
-        let fitted = parse(source).unwrap().materialize(&data).unwrap();
+        let fitted = parse(source).unwrap().fit(&data).unwrap();
         results.samples.extend(measure_samples(
             name,
             source,
-            Operation::Evaluate,
+            Operation::Transform,
             samples,
-            || fitted.evaluate(black_box(&data)).unwrap(),
+            || fitted.transform(black_box(&data)).unwrap(),
         ));
     }
     println!("{}", serde_json::to_string_pretty(&results).unwrap());
