@@ -1481,6 +1481,13 @@ mod tests {
                         .transform(input)
                         .map(|_| ()),
                 ] {
+                    let expected_message = format!(
+                        "input `x`: expected {}, received {}",
+                        DataType::Int32,
+                        input.column("x").unwrap().dtype(),
+                    );
+                    // Check the public ModelError, including its FitError wrapper.
+                    assert_eq!(result.as_ref().unwrap_err().to_string(), expected_message);
                     let Err(ModelError::Fit(crate::FitError::Transform(
                         error @ TransformError::InputTypeMismatch { .. },
                     ))) = result
@@ -1488,14 +1495,7 @@ mod tests {
                         panic!("expected InputTypeMismatch for `{source}`");
                     };
 
-                    assert_eq!(
-                        error.to_string(),
-                        format!(
-                            "input `x`: expected {}, received {}",
-                            DataType::Int32,
-                            input.column("x").unwrap().dtype(),
-                        ),
-                    );
+                    assert_eq!(error.to_string(), expected_message);
                 }
             }
         }

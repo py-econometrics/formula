@@ -246,6 +246,82 @@ mod tests {
     use super::{Role, SelectionError};
 
     #[test]
+    fn model_frame_combines_roles_and_preserves_prediction_values() {
+        let data = polars::df!(
+            "z" => [7.0, 8.0, 9.0],
+            "x" => [4.0, 5.0, 6.0],
+            "y" => [1.0, 2.0, 3.0],
+        )
+        .unwrap();
+        let models = crate::parse("y ~ x + z - 1").unwrap().fit(&data).unwrap();
+        let model = models.iter().next().unwrap();
+        let expected = data.select(["y", "x", "z"]).unwrap();
+        assert!(model.frame().unwrap().equals_missing(&expected));
+
+        let selected = model.select(&[Role::Independent]).unwrap();
+        assert!(
+            selected
+                .frame()
+                .unwrap()
+                .equals_missing(&data.select(["x", "z"]).unwrap())
+        );
+
+        let prediction = polars::df!(
+            "z" => [30.0, 40.0], "x" => [10.0, 20.0], "y" => [50.0, 60.0],
+        )
+        .unwrap();
+        assert!(
+            model
+                .transform(&prediction)
+                .unwrap()
+                .frame()
+                .unwrap()
+                .equals_missing(&prediction.select(["y", "x", "z"]).unwrap())
+        );
+        // Producing prediction frames must not alter the fitted training frame.
+        assert!(model.frame().unwrap().equals_missing(&expected));
+    }
+
+    #[test]
+    fn model_frame_preserves_rows_with_no_columns_and_empty_predictions() {
+        let data = polars::df!("y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0]).unwrap();
+        let models = crate::parse("y ~ x - x - 1").unwrap().fit(&data).unwrap();
+        let model = models.iter().next().unwrap();
+        assert!(
+            model
+                .frame()
+                .unwrap()
+                .equals_missing(&data.select(["y"]).unwrap())
+        );
+        assert_eq!(
+            model
+                .transform(&data.head(Some(0)))
+                .unwrap()
+                .frame()
+                .unwrap()
+                .shape(),
+            (0, 1)
+        );
+
+        // An empty formula still carries the input height through the public API.
+        let models = crate::parse("y - y ~ x - x - 1")
+            .unwrap()
+            .fit(&data)
+            .unwrap();
+        let model = models.iter().next().unwrap();
+        assert_eq!(model.frame().unwrap().shape(), (3, 0));
+        assert_eq!(
+            model
+                .transform(&data.head(Some(2)))
+                .unwrap()
+                .frame()
+                .unwrap()
+                .shape(),
+            (2, 0)
+        );
+    }
+
+    #[test]
     fn model_select_transforms_only_selected_roles() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "a"],
@@ -347,24 +423,24 @@ mod tests {
             .unwrap();
         let model = models.iter().nth(1).unwrap();
         let roles = [Role::Independent, Role::FixedEffect];
-        assert!(matches!(
-            model.select(&roles),
-            Err(SelectionError::MissingRole(Role::FixedEffect))
-        ));
         // The role exists in the first model, but must exist in every model.
-        assert!(matches!(
-            models.select(&roles),
-            Err(SelectionError::MissingRole(Role::FixedEffect))
-        ));
-        assert!(matches!(
-            model.select(&[]),
-            Err(SelectionError::EmptySelection)
-        ));
-        assert!(matches!(
-            models.select(&[]),
-            Err(SelectionError::EmptySelection)
-        ));
-
+        for error in [
+            model.select(&roles).err().unwrap(),
+            models.select(&roles).err().unwrap(),
+        ] {
+            assert!(matches!(
+                error,
+                SelectionError::MissingRole(Role::FixedEffect)
+            ));
+            assert_eq!(error.to_string(), "model does not contain role FixedEffect");
+        }
+        for error in [
+            model.select(&[]).err().unwrap(),
+            models.select(&[]).err().unwrap(),
+        ] {
+            assert!(matches!(error, SelectionError::EmptySelection));
+            assert_eq!(error.to_string(), "select at least one role");
+        }
         let empty = crate::parse_many([]).unwrap().fit(&data).unwrap();
         assert!(matches!(
             empty.select(&[]),
