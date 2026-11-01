@@ -1,0 +1,72 @@
+name: Coverage
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Keep Polars build artifacts manageable, as in the test workflow.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  coverage:
+    name: Rust coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
+          workspaces: . -> target/llvm-cov-target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Inline unit tests remain in the totals. This measures Rust tests of the
+      # core crate; Python-driven execution and doctests are not included.
+      - name: Run tests with coverage
+        run: cargo llvm-cov -p formula --locked --no-report
+      - name: Coverage summary
+        shell: bash
+        run: |
+          mkdir -p target/llvm-cov
+          cargo llvm-cov report -p formula --color never | tee target/llvm-cov/summary.txt
+          {
+            echo '## Rust coverage'
+            echo
+            echo 'Includes inline unit tests. No minimum coverage threshold is enforced.'
+            echo
+            echo '```text'
+            cat target/llvm-cov/summary.txt
+            echo '```'
+            echo
+            echo 'Download the rust-coverage artifact and open html/index.html for source details.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate HTML and LCOV reports
+        run: |
+          cargo llvm-cov report -p formula --html
+          cargo llvm-cov report -p formula --lcov --output-path target/llvm-cov/lcov.info
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rust-coverage
+          path: target/llvm-cov/
+          if-no-files-found: error
+          retention-days: 14
