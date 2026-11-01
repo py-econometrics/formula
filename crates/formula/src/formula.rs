@@ -554,7 +554,7 @@ pub(crate) struct EvaluatedTerm {
 }
 
 #[derive(Clone, Debug)]
-pub struct EvaluatedExpression {
+pub(crate) struct EvaluatedExpression {
     expression: Expression,
     frame: DataFrame,
 }
@@ -566,7 +566,7 @@ impl EvaluatedExpression {
     pub(crate) fn expression(&self) -> &Expression {
         &self.expression
     }
-    pub fn frame(&self) -> &DataFrame {
+    pub(crate) fn frame(&self) -> &DataFrame {
         &self.frame
     }
 }

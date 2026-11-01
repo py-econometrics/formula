@@ -80,18 +80,21 @@ fn model_shapes(models: &Models) -> Output {
             .iter()
             .map(|model| ModelShape {
                 left: model
-                    .expression(Role::Dependent)
+                    .select(&[Role::Dependent])
                     .expect("benchmark has a dependent expression")
                     .frame()
+                    .expect("valid dependent frame")
                     .shape(),
                 right: model
-                    .expression(Role::Independent)
+                    .select(&[Role::Independent])
                     .expect("benchmark has an independent expression")
                     .frame()
+                    .expect("valid independent frame")
                     .shape(),
                 fixed_effects: model
-                    .expression(Role::FixedEffect)
-                    .map(|expression| expression.frame().shape()),
+                    .select(&[Role::FixedEffect])
+                    .ok()
+                    .map(|model| model.frame().expect("valid fixed-effect frame").shape()),
             })
             .collect(),
     }

@@ -78,7 +78,7 @@ impl Model {
         self.assemble(data.height(), &terms)
     }
 
-    pub fn expression(&self, role: Role) -> Option<&EvaluatedExpression> {
+    pub(crate) fn expression(&self, role: Role) -> Option<&EvaluatedExpression> {
         self.expressions
             .get(&role)
             .filter(|evaluated| !evaluated.expression().is_empty())

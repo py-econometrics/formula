@@ -31,15 +31,14 @@ fn main() {
         .expect("successful materialization");
 
     for model in &models {
-        println!("Model {:?}", model.formula());
-        if let Some(dependent) = model.expression(Role::Dependent) {
-            println!("Dependent design:\n{}", dependent.frame());
-        }
-        if let Some(independent) = model.expression(Role::Independent) {
-            println!("Independent design:\n{}", independent.frame());
-        }
-        if let Some(fixed_effects) = model.expression(Role::FixedEffect) {
-            println!("Fixed effects:\n{}", fixed_effects.frame());
+        println!("Model {}", model.formula());
+        for (role, label) in [
+            (Role::Dependent, "Dependent design"),
+            (Role::Independent, "Independent design"),
+            (Role::FixedEffect, "Fixed effects"),
+        ] {
+            let selected = model.select(&[role]).expect("role exists in the formula");
+            println!("{label}:\n{}", selected.frame().expect("valid frame"));
         }
     }
 }
