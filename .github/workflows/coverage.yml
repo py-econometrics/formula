@@ -19,6 +19,8 @@ env:
   # Keep Polars build artifacts manageable, as in the test workflow.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
+  # Share instrumented dependencies between the PR and base builds.
+  CARGO_LLVM_COV_TARGET_DIR: ${{ github.workspace }}/target/llvm-cov-target
 
 jobs:
   coverage:
@@ -28,6 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
+      - name: Check out PR base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: coverage-base
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -52,7 +61,7 @@ jobs:
           {
             echo '## Rust coverage'
             echo
-            echo 'Includes inline unit tests. No minimum coverage threshold is enforced.'
+            echo 'Includes inline unit tests. PRs must not decrease function coverage relative to the base revision.'
             echo
             echo '```text'
             cat target/llvm-cov/summary.txt
@@ -64,7 +73,37 @@ jobs:
         run: |
           cargo llvm-cov report -p formula --html
           cargo llvm-cov report -p formula --lcov --output-path target/llvm-cov/lcov.info
+          cargo llvm-cov report -p formula --json --summary-only --output-path target/llvm-cov/candidate.json
+      - name: Measure PR base coverage
+        if: github.event_name == 'pull_request'
+        working-directory: coverage-base
+        run: |
+          cargo llvm-cov -p formula --locked --no-report
+          cargo llvm-cov report -p formula --json --summary-only --output-path ../target/llvm-cov/base.json
+      - name: Reject function coverage regressions
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          jq -ser '
+            if length != 2 or any(.[]; (.data | length) != 1) then
+              error("Expected one coverage dataset per revision")
+            else map(.data[0].totals.functions) end
+            | if all(.[];
+                (.count | type) == "number" and (.covered | type) == "number"
+                and .count > 0 and .covered >= 0 and .covered <= .count)
+              then . else error("Invalid or empty function coverage") end
+            | .[0] as $base | .[1] as $pr
+            | "## Function coverage comparison\n",
+              "Base: \($base.covered)/\($base.count) functions covered.",
+              "PR: \($pr.covered)/\($pr.count) functions covered.\n",
+              # Compare counts directly to avoid rounding percentages.
+              (if $pr.covered * $base.count >= $base.covered * $pr.count
+               then "Function coverage check passed."
+               else "Function coverage decreased.", false end)
+          ' target/llvm-cov/base.json target/llvm-cov/candidate.json \
+            | tee -a "$GITHUB_STEP_SUMMARY" target/llvm-cov/comparison.md
       - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
         with:
           name: rust-coverage
           path: target/llvm-cov/
