@@ -4,9 +4,7 @@ mod model;
 mod parse;
 mod transform;
 
-pub use self::formula::{
-    EvaluatedExpression, Expression, Formula, Role, Specification, ValidationError,
-};
+pub use self::formula::{EvaluatedExpression, Formula, Role, Specification, ValidationError};
 pub use fit::FitError;
 pub use model::{EvaluationError, Model, Models, SelectionError};
 pub use parse::{parse, parse_many};

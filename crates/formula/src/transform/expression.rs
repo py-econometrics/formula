@@ -185,6 +185,14 @@ mod tests {
     use crate::transform::Transform;
     use winnow::Parser;
 
+    fn materialize(source: &str, data: &DataFrame) -> crate::Model {
+        let models = crate::parse(&format!("x ~ {source} - 1"))
+            .unwrap()
+            .materialize(data)
+            .unwrap();
+        models.iter().next().unwrap().clone()
+    }
+
     fn assert_numeric_output(actual: &DataFrame, name: &str, expected: &[Option<f64>]) {
         assert_eq!(actual.shape(), (expected.len(), 1));
         let column = &actual.columns()[0];
@@ -222,13 +230,12 @@ mod tests {
             ("add(x, -2)", [Some(4.0), None, Some(-5.0)]),
             ("mul(add(x, -2), 3)", [Some(12.0), None, Some(-15.0)]),
         ] {
-            let [expression]: [_; 1] = parse_expression
-                .parse(source)
-                .unwrap()
-                .try_into()
-                .expect("expected one expression");
-            let output = expression.materialize(&data).unwrap();
-            assert_numeric_output(output.frame(), source, &expected);
+            let output = materialize(source, &data);
+            assert_numeric_output(
+                output.expression(crate::Role::Independent).unwrap().frame(),
+                source,
+                &expected,
+            );
         }
     }
 
@@ -242,35 +249,45 @@ mod tests {
             ("add(2, 3)", 5.0),
             ("mul(add(2, -1), 3)", 3.0),
         ] {
-            let [expression]: [_; 1] = parse_expression
-                .parse(source)
-                .unwrap()
-                .try_into()
-                .expect("expected one expression");
-            let fitted = expression.materialize(&training).unwrap();
+            let fitted = materialize(source, &training);
             for height in [0, 1, 4] {
                 let input = polars::df!("x" => vec![4.0; height]).unwrap();
                 let expected = vec![Some(expected_value); height];
                 let evaluated = fitted.evaluate(&input).unwrap();
-                assert_numeric_output(evaluated.frame(), source, &expected);
+                assert_numeric_output(
+                    evaluated
+                        .expression(crate::Role::Independent)
+                        .unwrap()
+                        .frame(),
+                    source,
+                    &expected,
+                );
 
-                let materialized = expression.materialize(&input).unwrap();
-                assert_numeric_output(materialized.frame(), source, &expected);
+                let materialized = materialize(source, &input);
+                assert_numeric_output(
+                    materialized
+                        .expression(crate::Role::Independent)
+                        .unwrap()
+                        .frame(),
+                    source,
+                    &expected,
+                );
             }
         }
     }
 
     #[test]
     fn scalar_only_calls_use_height_without_input_columns() {
-        let [expression]: [_; 1] = parse_expression
-            .parse("add(2, 3)")
-            .unwrap()
-            .try_into()
-            .expect("expected one expression");
+        let specification = crate::parse("add(2, 3) ~ add(2, 3) - 1").unwrap();
         for height in [0, 3] {
             let data = DataFrame::empty_with_height(height);
-            let output = expression.materialize(&data).unwrap();
-            assert_numeric_output(output.frame(), "add(2, 3)", &vec![Some(5.0); height]);
+            let models = specification.materialize(&data).unwrap();
+            let output = models.iter().next().unwrap();
+            assert_numeric_output(
+                output.expression(crate::Role::Independent).unwrap().frame(),
+                "add(2, 3)",
+                &vec![Some(5.0); height],
+            );
         }
     }
 
@@ -281,27 +298,21 @@ mod tests {
             ("mul(x, 2)", [Some(6.0), Some(8.0)]),
             ("mul(x, `2`)", [Some(30.0), Some(80.0)]),
         ] {
-            let [expression]: [_; 1] = parse_expression
-                .parse(source)
-                .unwrap()
-                .try_into()
-                .expect("expected one expression");
-            let output = expression.materialize(&data).unwrap();
-            assert_numeric_output(output.frame(), "mul(x, 2)", &expected);
+            let output = materialize(source, &data);
+            assert_numeric_output(
+                output.expression(crate::Role::Independent).unwrap().frame(),
+                "mul(x, 2)",
+                &expected,
+            );
         }
     }
 
     #[test]
     fn sqrt_preserves_row_order_nulls_and_domain_behavior() {
         let data = polars::df!("x" => [Some(9.0), Some(1.0), Some(4.0), None, Some(-1.0)]).unwrap();
-        let [expression]: [_; 1] = parse_expression
-            .parse("sqrt(x)")
-            .unwrap()
-            .try_into()
-            .expect("expected one expression");
-        let output = expression.materialize(&data).unwrap();
+        let output = materialize("sqrt(x)", &data);
         assert_numeric_output(
-            output.frame(),
+            output.expression(crate::Role::Independent).unwrap().frame(),
             "sqrt(x)",
             &[Some(3.0), Some(1.0), Some(2.0), None, Some(f64::NAN)],
         );
@@ -310,63 +321,55 @@ mod tests {
     #[test]
     fn add_accepts_repeated_arguments_and_mixed_numeric_types() {
         let data = polars::df!("x" => [3_i32, 1], "y" => [Some(0.5_f32), None]).unwrap();
-        let [expression]: [_; 1] = parse_expression
-            .parse("add(x, y, x)")
-            .unwrap()
-            .try_into()
-            .expect("expected one expression");
-        let output = expression.materialize(&data).unwrap();
-        assert_numeric_output(output.frame(), "add(x, y, x)", &[Some(6.5), None]);
+        let output = materialize("add(x, y, x)", &data);
+        assert_numeric_output(
+            output.expression(crate::Role::Independent).unwrap().frame(),
+            "add(x, y, x)",
+            &[Some(6.5), None],
+        );
     }
 
     #[test]
     fn sub_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [10, 3], "y" => [3, 10], "z" => [2, 1]).unwrap();
-        let [expression]: [_; 1] = parse_expression
-            .parse("sub(x, y, z)")
-            .unwrap()
-            .try_into()
-            .expect("expected one expression");
-        let output = expression.materialize(&data).unwrap();
-        assert_numeric_output(output.frame(), "sub(x, y, z)", &[Some(5.0), Some(-8.0)]);
+        let output = materialize("sub(x, y, z)", &data);
+        assert_numeric_output(
+            output.expression(crate::Role::Independent).unwrap().frame(),
+            "sub(x, y, z)",
+            &[Some(5.0), Some(-8.0)],
+        );
     }
 
     #[test]
     fn mul_multiplies_all_arguments() {
         let data = polars::df!("x" => [2, 3], "y" => [3, 4], "z" => [4, 5]).unwrap();
-        let [expression]: [_; 1] = parse_expression
-            .parse("mul(x, y, z)")
-            .unwrap()
-            .try_into()
-            .expect("expected one expression");
-        let output = expression.materialize(&data).unwrap();
-        assert_numeric_output(output.frame(), "mul(x, y, z)", &[Some(24.0), Some(60.0)]);
+        let output = materialize("mul(x, y, z)", &data);
+        assert_numeric_output(
+            output.expression(crate::Role::Independent).unwrap().frame(),
+            "mul(x, y, z)",
+            &[Some(24.0), Some(60.0)],
+        );
     }
 
     #[test]
     fn div_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [24, 3], "y" => [3, 24], "z" => [2, 2]).unwrap();
-        let [expression]: [_; 1] = parse_expression
-            .parse("div(x, y, z)")
-            .unwrap()
-            .try_into()
-            .expect("expected one expression");
-        let output = expression.materialize(&data).unwrap();
-        assert_numeric_output(output.frame(), "div(x, y, z)", &[Some(4.0), Some(0.0625)]);
+        let output = materialize("div(x, y, z)", &data);
+        assert_numeric_output(
+            output.expression(crate::Role::Independent).unwrap().frame(),
+            "div(x, y, z)",
+            &[Some(4.0), Some(0.0625)],
+        );
     }
 
     #[test]
     fn expression_functions_validate_arity_and_reject_keywords() {
         let data = polars::df!("x" => [1.0]).unwrap();
         for source in ["sqrt()", "sqrt(x, x)", "add()", "add(x)", "sub()", "sub(x)"] {
-            let [expression]: [_; 1] = parse_expression
-                .parse(source)
-                .unwrap()
-                .try_into()
-                .expect("expected one expression");
+            let specification = crate::parse(&format!("x ~ {source} - 1")).unwrap();
             assert!(
                 matches!(
-                    expression.materialize(&data),
+                    specification.materialize(&data),
                     Err(crate::EvaluationError::Validation(
                         crate::ValidationError::InvalidArgumentCount { .. }
                     ))

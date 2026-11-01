@@ -101,7 +101,7 @@ impl Models {
         self.entries.is_empty()
     }
 
-    pub fn get(&self, formula: &Formula) -> Option<&Model> {
+    fn get(&self, formula: &Formula) -> Option<&Model> {
         self.entries.iter().find(|model| model.formula() == formula)
     }
 

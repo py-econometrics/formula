@@ -24,7 +24,7 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Transform {
+pub(crate) enum Transform {
     Expression(ExpressionTransform),
     C(Fit<CategoricalDefinition, CategoricalState>),
     F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
