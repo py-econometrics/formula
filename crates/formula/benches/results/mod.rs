@@ -31,12 +31,8 @@ pub struct Sample {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Output {
     // Retained for older standalone parsing samples.
-    Parsed {
-        formulas: usize,
-    },
-    Fitted {
-        models: Vec<ModelShape>,
-    },
+    Parsed { formulas: usize },
+    Fitted { models: Vec<ModelShape> },
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
