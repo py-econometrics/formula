@@ -29,8 +29,8 @@ struct Specification {
 
 #[pymethods]
 impl Specification {
-    fn materialize(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Models> {
-        py.detach(|| self.inner.materialize(&data.0))
+    fn fit(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Models> {
+        py.detach(|| self.inner.fit(&data.0))
             .map(|inner| Models { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -72,8 +72,8 @@ impl Models {
         })
     }
 
-    fn evaluate(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
-        py.detach(|| self.inner.evaluate(&data.0))
+    fn transform(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
+        py.detach(|| self.inner.transform(&data.0))
             .map(|inner| Self { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
@@ -110,8 +110,8 @@ impl Model {
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
-    fn evaluate(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
-        py.detach(|| self.inner.evaluate(&data.0))
+    fn transform(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
+        py.detach(|| self.inner.transform(&data.0))
             .map(|inner| Self { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }

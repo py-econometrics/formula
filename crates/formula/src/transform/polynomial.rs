@@ -97,7 +97,7 @@ struct RecurrenceStep {
 }
 
 impl PolynomialBasis {
-    fn evaluate(&self, frame: DataFrame, degree: usize) -> Result<Vec<Column>, TransformError> {
+    fn transform(&self, frame: DataFrame, degree: usize) -> Result<Vec<Column>, TransformError> {
         let name = argument_column_name(0);
         let argument = finite_values(col(name.clone()));
 
@@ -118,14 +118,14 @@ impl PolynomialBasis {
 
             Self::Orthogonal(basis) => {
                 let prepared = frame.lazy().select([argument]).collect()?;
-                basis.evaluate(prepared.column(name.as_str())?)
+                basis.transform(prepared.column(name.as_str())?)
             }
         }
     }
 }
 
 impl OrthogonalBasis {
-    fn evaluate(&self, values: &Column) -> Result<Vec<Column>, TransformError> {
+    fn transform(&self, values: &Column) -> Result<Vec<Column>, TransformError> {
         let values = values.f64()?.rechunk();
         let array = values
             .downcast_iter()
@@ -320,7 +320,7 @@ impl Definition<PolynomialState> for PolynomialDefinition {
         let height = frame.height();
         let columns = state
             .basis
-            .evaluate(frame, self.degree)?
+            .transform(frame, self.degree)?
             .into_iter()
             .enumerate()
             .map(|(index, column)| {

@@ -1,5 +1,5 @@
 use crate::fit::{Definition, Fit};
-use crate::model::{EvaluationError, Model, Models};
+use crate::model::{Model, ModelError, Models};
 use crate::parse::{
     FIXED_EFFECT_SEPARATOR, FORMULA_SEPARATOR, is_identifier_character, parse_scalar,
 };
@@ -277,16 +277,16 @@ impl Term {
     fn assemble(
         &self,
         height: usize,
-        evaluated: &[EvaluatedFactor],
+        transformed: &[FittedFactor],
     ) -> Result<(Self, Vec<Column>), TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
         for factor in &self.factors {
-            let result = lookup_factor(evaluated, factor);
+            let result = lookup_factor(transformed, factor);
             match factor.as_ref() {
                 Factor::Variable(_) => {
                     let [column] = result.columns.as_slice() else {
-                        unreachable!("a variable evaluates to exactly one column");
+                        unreachable!("a variable transforms to exactly one column");
                     };
                     validate_numeric_input(column)?;
                 }
@@ -376,12 +376,12 @@ impl Expression {
     pub(crate) fn assemble(
         &self,
         height: usize,
-        evaluated: &[EvaluatedTerm],
-    ) -> Result<EvaluatedExpression, EvaluationError> {
+        transformed: &[FittedTerm],
+    ) -> Result<FittedExpression, ModelError> {
         let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
         for term in &self.terms {
-            let entry = lookup_term(evaluated, term);
+            let entry = lookup_term(transformed, term);
             terms.push(entry.term.clone());
             columns.extend(entry.columns.iter().cloned());
         }
@@ -393,7 +393,7 @@ impl Expression {
 
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
 
-        Ok(EvaluatedExpression::new(expression, frame))
+        Ok(FittedExpression::new(expression, frame))
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -456,16 +456,16 @@ impl Formula {
             .try_for_each(|(_, expression)| expression.validate())
     }
 
-    fn assemble(&self, height: usize, terms: &[EvaluatedTerm]) -> Result<Model, EvaluationError> {
+    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Model, ModelError> {
         let expressions = self
             .expressions
             .iter()
             .map(|(&role, expression)| {
                 expression
                     .assemble(height, terms)
-                    .map(|evaluated| (role, evaluated))
+                    .map(|transformed| (role, transformed))
             })
-            .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
+            .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
         Ok(Model::new(self.clone(), expressions, height))
     }
@@ -510,7 +510,7 @@ impl Specification {
         &self.formulas
     }
 
-    pub fn materialize(&self, data: &DataFrame) -> Result<Models, EvaluationError> {
+    pub fn fit(&self, data: &DataFrame) -> Result<Models, ModelError> {
         for formula in &self.formulas {
             formula.validate()?;
         }
@@ -521,13 +521,13 @@ impl Specification {
             .collect::<Vec<_>>();
 
         // Fit factors and assemble terms once across every formula
-        let terms = fit_and_evaluate_terms(&expressions, data)?;
+        let terms = fit_and_transform_terms(&expressions, data)?;
 
         let entries = self
             .formulas
             .iter()
             .map(|formula| formula.assemble(data.height(), &terms))
-            .collect::<Result<Vec<_>, EvaluationError>>()?;
+            .collect::<Result<Vec<_>, ModelError>>()?;
 
         Ok(Models::new(entries))
     }
@@ -543,23 +543,23 @@ pub enum ValidationError {
     InvalidTransformComposition,
 }
 
-struct EvaluatedFactor {
+struct FittedFactor {
     factor: Arc<Factor>,
     columns: Vec<Column>,
 }
 
-pub(crate) struct EvaluatedTerm {
+pub(crate) struct FittedTerm {
     term: Term,
     columns: Vec<Column>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct EvaluatedExpression {
+pub(crate) struct FittedExpression {
     expression: Expression,
     frame: DataFrame,
 }
 
-impl EvaluatedExpression {
+impl FittedExpression {
     fn new(expression: Expression, frame: DataFrame) -> Self {
         Self { expression, frame }
     }
@@ -576,15 +576,15 @@ fn literal_column(value: &Scalar, height: usize) -> Column {
     Column::new_scalar(name.into(), value.clone(), height)
 }
 
-fn fit_and_evaluate_factors(
+fn fit_and_transform_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedFactor>, EvaluationError> {
-    let mut evaluated = Vec::with_capacity(scheduled.len());
+) -> Result<Vec<FittedFactor>, ModelError> {
+    let mut transformed = Vec::with_capacity(scheduled.len());
 
     for factor in scheduled {
         let result = match factor.as_ref() {
-            Factor::Literal(value) => EvaluatedFactor {
+            Factor::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
                 columns: vec![literal_column(value, data.height())],
             },
@@ -596,7 +596,7 @@ fn fit_and_evaluate_factors(
                 let fitted = variable.fit(column)?;
                 let output = fitted.transform(column)?;
 
-                EvaluatedFactor {
+                FittedFactor {
                     factor: Arc::new(Factor::Variable(fitted)),
                     columns: vec![output],
                 }
@@ -608,19 +608,19 @@ fn fit_and_evaluate_factors(
                 let mut fitted_arguments = Vec::with_capacity(arguments.len());
                 let mut inputs = Vec::new();
                 for argument in arguments {
-                    let result = lookup_factor(&evaluated, argument);
+                    let result = lookup_factor(&transformed, argument);
                     fitted_arguments.push(Arc::clone(&result.factor));
                     inputs.extend(result.columns.iter().cloned());
                 }
 
                 let transform = transform.fit(&inputs).map_err(|error| {
-                    EvaluationError::TransformCall(format!("{}: {error}", factor.render()))
+                    ModelError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
                 let output = transform.transform(&inputs).map_err(|error| {
-                    EvaluationError::TransformCall(format!("{}: {error}", factor.render()))
+                    ModelError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
 
-                EvaluatedFactor {
+                FittedFactor {
                     factor: Arc::new(Factor::Call {
                         transform,
                         arguments: fitted_arguments,
@@ -629,16 +629,16 @@ fn fit_and_evaluate_factors(
                 }
             }
         };
-        evaluated.push(result)
+        transformed.push(result)
     }
-    Ok(evaluated)
+    Ok(transformed)
 }
 
-fn evaluate_factors(
+fn transform_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedFactor>, EvaluationError> {
-    let mut evaluated = Vec::with_capacity(scheduled.len());
+) -> Result<Vec<FittedFactor>, ModelError> {
+    let mut transformed = Vec::with_capacity(scheduled.len());
 
     for factor in scheduled {
         let columns = match factor.as_ref() {
@@ -658,23 +658,23 @@ fn evaluate_factors(
             } => {
                 let mut inputs = Vec::new();
                 for argument in arguments {
-                    let result = lookup_factor(&evaluated, argument);
+                    let result = lookup_factor(&transformed, argument);
                     inputs.extend(result.columns.iter().cloned());
                 }
                 transform
                     .transform(&inputs)
                     .map_err(|error| {
-                        EvaluationError::TransformCall(format!("{}: {error}", factor.render()))
+                        ModelError::TransformCall(format!("{}: {error}", factor.render()))
                     })?
                     .into_columns()
             }
         };
-        evaluated.push(EvaluatedFactor {
+        transformed.push(FittedFactor {
             factor: Arc::clone(factor),
             columns,
         });
     }
-    Ok(evaluated)
+    Ok(transformed)
 }
 
 fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
@@ -708,56 +708,53 @@ fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
 fn assemble_terms(
     expressions: &[&Expression],
     height: usize,
-    factors: &[EvaluatedFactor],
-) -> Result<Vec<EvaluatedTerm>, TransformError> {
-    let mut evaluated: Vec<EvaluatedTerm> = Vec::new();
+    factors: &[FittedFactor],
+) -> Result<Vec<FittedTerm>, TransformError> {
+    let mut transformed: Vec<FittedTerm> = Vec::new();
 
     for expression in expressions {
         for term in &expression.terms {
-            if evaluated.iter().any(|entry| &entry.term == term) {
+            if transformed.iter().any(|entry| &entry.term == term) {
                 continue;
             }
             let (term, columns) = term.assemble(height, factors)?;
-            evaluated.push(EvaluatedTerm { term, columns });
+            transformed.push(FittedTerm { term, columns });
         }
     }
 
-    Ok(evaluated)
+    Ok(transformed)
 }
 
-pub(crate) fn evaluate_terms(
+pub(crate) fn transform_terms(
     expressions: &[&Expression],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedTerm>, EvaluationError> {
+) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
-    let factors = evaluate_factors(&scheduled, data)?;
+    let factors = transform_factors(&scheduled, data)?;
     Ok(assemble_terms(expressions, data.height(), &factors)?)
 }
 
-fn fit_and_evaluate_terms(
+fn fit_and_transform_terms(
     expressions: &[&Expression],
     data: &DataFrame,
-) -> Result<Vec<EvaluatedTerm>, EvaluationError> {
+) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
-    let factors = fit_and_evaluate_factors(&scheduled, data)?;
+    let factors = fit_and_transform_factors(&scheduled, data)?;
     Ok(assemble_terms(expressions, data.height(), &factors)?)
 }
 
-fn lookup_factor<'a>(
-    evaluated: &'a [EvaluatedFactor],
-    factor: &Arc<Factor>,
-) -> &'a EvaluatedFactor {
-    evaluated
+fn lookup_factor<'a>(transformed: &'a [FittedFactor], factor: &Arc<Factor>) -> &'a FittedFactor {
+    transformed
         .iter()
         .find(|entry| &entry.factor == factor)
-        .expect("factor must be evaluated before its consumer")
+        .expect("factor must be transformed before its consumer")
 }
 
-fn lookup_term<'a>(evaluated: &'a [EvaluatedTerm], term: &Term) -> &'a EvaluatedTerm {
-    evaluated
+fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term) -> &'a FittedTerm {
+    transformed
         .iter()
         .find(|entry| &entry.term == term)
-        .expect("every term must have an evaluated entry")
+        .expect("every term must have an transformed entry")
 }
 
 pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
@@ -833,8 +830,8 @@ mod tests {
     use polars::prelude::Scalar;
     use winnow::Parser;
 
-    fn materialize(source: &str, data: &DataFrame) -> Model {
-        let models = crate::parse(source).unwrap().materialize(data).unwrap();
+    fn fit(source: &str, data: &DataFrame) -> Model {
+        let models = crate::parse(source).unwrap().fit(data).unwrap();
         assert_eq!(models.len(), 1);
         models.iter().next().unwrap().clone()
     }
@@ -887,13 +884,13 @@ mod tests {
         use crate::transform::TRANSFORM_CALLS;
 
         #[test]
-        fn raw_materialization_and_prediction_preserve_values_and_schema() {
+        fn raw_fitting_and_prediction_preserve_values_and_schema() {
             let training = polars::df!(
                 "y" => [1.0, 2.0],
                 "x" => [2.0, -3.0],
             )
             .unwrap();
-            let model = materialize("y ~ poly(x, degree=3, raw=true)", &training);
+            let model = fit("y ~ poly(x, degree=3, raw=true)", &training);
             let expected = polars::df!(
                 "Intercept" => [1.0; 2],
                 "poly(x, degree=3, raw=true)[1]" => [2.0, -3.0],
@@ -910,7 +907,7 @@ mod tests {
             );
 
             let prediction = polars::df!("y" => [6.0, 7.0], "x" => [Some(4.0), None]).unwrap();
-            let output = model.evaluate(&prediction).unwrap();
+            let output = model.transform(&prediction).unwrap();
             let expected = polars::df!(
                 "Intercept" => [1.0; 2],
                 "poly(x, degree=3, raw=true)[1]" => [Some(4.0), None],
@@ -934,7 +931,7 @@ mod tests {
                 "x" => [-1.0, 0.0, 1.0],
             )
             .unwrap();
-            let model = materialize("y ~ poly(x, degree=2)", &training);
+            let model = fit("y ~ poly(x, degree=2)", &training);
             assert_eq!(
                 model.expression(Role::Independent).unwrap().frame().shape(),
                 (3, 3)
@@ -943,7 +940,7 @@ mod tests {
             let prediction = polars::df!("y" => [2.0, 3.0], "x" => [Some(2.0), None]).unwrap();
             for _ in 0..2 {
                 TRANSFORM_CALLS.set((0, 0));
-                let output = model.evaluate(&prediction).unwrap();
+                let output = model.transform(&prediction).unwrap();
                 assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
                 let frame = output.expression(Role::Independent).unwrap().frame();
                 assert_eq!(
@@ -969,8 +966,8 @@ mod tests {
             let training = polars::df!("y" => [1.0; 3], "x" => [-1.0, 0.0, 1.0]).unwrap();
             let empty = polars::df!("y" => Vec::<f64>::new(), "x" => Vec::<f64>::new()).unwrap();
             for source in ["y ~ poly(x, degree=2)", "y ~ poly(x, degree=2, raw=true)"] {
-                let model = materialize(source, &training);
-                let output = model.evaluate(&empty).unwrap();
+                let model = fit(source, &training);
+                let output = model.transform(&empty).unwrap();
                 assert_eq!(
                     output
                         .expression(Role::Independent)
@@ -1004,9 +1001,9 @@ mod tests {
                 "y" => [1.0; 3], "x" => [1.0, std::f64::consts::E, std::f64::consts::E.powi(2)],
             )
             .unwrap();
-            let expected = materialize("y ~ log(x) + mul(log(x), log(x))", &data);
+            let expected = fit("y ~ log(x) + mul(log(x), log(x))", &data);
             TRANSFORM_CALLS.set((0, 0));
-            let actual = materialize("y ~ poly(log(x), degree=2, raw=true)", &data);
+            let actual = fit("y ~ poly(log(x), degree=2, raw=true)", &data);
             assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
             assert_eq!(
                 actual
@@ -1045,7 +1042,7 @@ mod tests {
         fn basis_by_column_interactions_preserve_order_and_values() {
             let data =
                 polars::df!("y" => [1.0, 2.0], "x" => [2.0, 3.0], "z" => [5.0, 7.0]).unwrap();
-            let model = materialize("y ~ poly(x, degree=2, raw=true):z - 1", &data);
+            let model = fit("y ~ poly(x, degree=2, raw=true):z - 1", &data);
             let expected = polars::df!(
                 "poly(x, degree=2, raw=true)[1]:z" => [10.0, 21.0],
                 "poly(x, degree=2, raw=true)[2]:z" => [20.0, 63.0],
@@ -1064,7 +1061,7 @@ mod tests {
         fn basis_by_basis_interactions_form_the_cartesian_product() {
             let data =
                 polars::df!("y" => [1.0, 2.0], "x" => [2.0, 3.0], "z" => [5.0, 7.0]).unwrap();
-            let model = materialize(
+            let model = fit(
                 "y ~ poly(x, degree=2, raw=true):poly(z, degree=2, raw=true) - 1",
                 &data,
             );
@@ -1095,8 +1092,8 @@ mod tests {
             ] {
                 assert!(
                     matches!(
-                        crate::parse(source).unwrap().materialize(&data),
-                        Err(EvaluationError::Validation(
+                        crate::parse(source).unwrap().fit(&data),
+                        Err(ModelError::Validation(
                             ValidationError::InvalidTransformComposition
                         ))
                     ),
@@ -1116,14 +1113,14 @@ mod tests {
             ("a*(b/c)", &["a", "b", "b:c", "a:b", "a:b:c"]),
         ];
         for &(source, names) in cases {
-            let model = materialize(&format!("a ~ {source} - 1"), &data);
+            let model = fit(&format!("a ~ {source} - 1"), &data);
             let output = model.expression(Role::Independent).unwrap().frame();
             assert_eq!(output.get_column_names(), names, "{source}");
         }
     }
 
     #[test]
-    fn nesting_materializes_like_explicit_interactions() {
+    fn nesting_fits_like_explicit_interactions() {
         let training = polars::df!(
             "y" => [1.0, 2.0],
             "a" => [2.0, 3.0],
@@ -1135,20 +1132,21 @@ mod tests {
             "y" => [3.0], "a" => [4.0], "b" => [6.0], "c" => [8.0],
         )
         .unwrap();
-        let nested = crate::parse("y ~ (a+b)/c")
-            .unwrap()
-            .materialize(&training)
-            .unwrap();
+        let nested = crate::parse("y ~ (a+b)/c").unwrap().fit(&training).unwrap();
         let expanded = crate::parse("y ~ a+b+a:b:c")
             .unwrap()
-            .materialize(&training)
+            .fit(&training)
             .unwrap();
-        let evaluated_nested = nested.evaluate(&input).unwrap();
-        let evaluated_expanded = expanded.evaluate(&input).unwrap();
+        let transformed_nested = nested.transform(&input).unwrap();
+        let transformed_expanded = expanded.transform(&input).unwrap();
 
         for (actual, expected, interactions) in [
             (&nested, &expanded, vec![Some(40.0), None]),
-            (&evaluated_nested, &evaluated_expanded, vec![Some(192.0)]),
+            (
+                &transformed_nested,
+                &transformed_expanded,
+                vec![Some(192.0)],
+            ),
         ] {
             let actual = actual.iter().next().unwrap();
             let expected = expected.iter().next().unwrap();
@@ -1196,7 +1194,7 @@ mod tests {
         let expression = expressions.first().unwrap();
         let scheduled = schedule_factors(&[expression]);
         let training = polars::df!("x" => [1.0, 2.0]).unwrap();
-        let fitted = fit_and_evaluate_factors(&scheduled, &training).unwrap();
+        let fitted = fit_and_transform_factors(&scheduled, &training).unwrap();
         let fitted_factors = fitted
             .iter()
             .map(|entry| Arc::clone(&entry.factor))
@@ -1204,8 +1202,9 @@ mod tests {
 
         for height in [0, 1, 4] {
             let input = polars::df!("x" => vec![4.0; height]).unwrap();
-            let evaluated = evaluate_factors(&fitted_factors, &input).unwrap();
-            for (entries, expected_height) in [(&fitted, training.height()), (&evaluated, height)] {
+            let transformed = transform_factors(&fitted_factors, &input).unwrap();
+            for (entries, expected_height) in [(&fitted, training.height()), (&transformed, height)]
+            {
                 let mut literal_count = 0;
                 for entry in entries {
                     if let Factor::Literal(value) = entry.factor.as_ref() {
@@ -1223,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_columns_preserve_names_and_values_on_materialization_and_evaluation() {
+    fn quoted_columns_preserve_names_and_values_on_fitting_and_transformation() {
         let training = polars::df!(
             "household income" => [4.0, 9.0],
             "income-growth" => [2.0, 3.0],
@@ -1253,7 +1252,7 @@ mod tests {
                 polars::df!("household income:income-growth" => [8.0, 27.0]).unwrap(),
             ),
         ] {
-            let fitted = materialize(&format!("`household income` ~ {source} - 1"), &training);
+            let fitted = fit(&format!("`household income` ~ {source} - 1"), &training);
             assert!(
                 fitted
                     .expression(Role::Independent)
@@ -1263,9 +1262,9 @@ mod tests {
                 "{source}"
             );
 
-            let evaluated = fitted.evaluate(&input).unwrap();
+            let transformed = fitted.transform(&input).unwrap();
             assert!(
-                evaluated
+                transformed
                     .expression(Role::Independent)
                     .unwrap()
                     .frame()
@@ -1297,8 +1296,8 @@ mod tests {
             ("y ~ x:flag", "flag"),
         ] {
             let specification = crate::parse(source).unwrap();
-            let Err(EvaluationError::Transform(TransformError::NonNumericInput { name, actual })) =
-                specification.materialize(&data)
+            let Err(ModelError::Transform(TransformError::NonNumericInput { name, actual })) =
+                specification.fit(&data)
             else {
                 panic!("expected NonNumericInput for `{source}`");
             };
@@ -1317,11 +1316,7 @@ mod tests {
             ("y ~ exp(log(x))", "log(x)"),
             ("y ~ add(1, log(x))", "log(x)"),
         ] {
-            let error = crate::parse(source)
-                .unwrap()
-                .materialize(&data)
-                .err()
-                .unwrap();
+            let error = crate::parse(source).unwrap().fit(&data).err().unwrap();
             assert_eq!(
                 error.to_string(),
                 format!(
@@ -1338,7 +1333,7 @@ mod tests {
         let data = polars::df!("y" => [1.0, 2.0], "group name" => ["a", "b"]).unwrap();
         let error = crate::parse("y ~ C(`group name`, reference='missing')")
             .unwrap()
-            .materialize(&data)
+            .fit(&data)
             .err()
             .unwrap();
 
@@ -1374,11 +1369,9 @@ mod tests {
                 ),
             ]),
         };
-        let models = Specification::new(vec![formula])
-            .materialize(&data)
-            .unwrap();
+        let models = Specification::new(vec![formula]).fit(&data).unwrap();
         let reordered = data.select(["b", "y", "a"]).unwrap();
-        let evaluated = models.evaluate(&reordered).unwrap();
+        let transformed = models.transform(&reordered).unwrap();
         assert!(
             models
                 .iter()
@@ -1388,7 +1381,7 @@ mod tests {
                 .unwrap()
                 .frame()
                 .equals_missing(
-                    evaluated
+                    transformed
                         .iter()
                         .next()
                         .unwrap()
@@ -1399,10 +1392,10 @@ mod tests {
         );
 
         let missing = data.select(["y", "a"]).unwrap();
-        let error = models.evaluate(&missing).err().unwrap();
+        let error = models.transform(&missing).err().unwrap();
         assert!(matches!(
             error,
-            EvaluationError::Transform(TransformError::Polars(_))
+            ModelError::Transform(TransformError::Polars(_))
         ));
         assert!(error.to_string().contains('b'));
     }
@@ -1439,13 +1432,13 @@ mod tests {
                 .unwrap(),
             ),
         ] {
-            let fitted = materialize(&format!("y ~ {source} - 1"), &training)
+            let fitted = fit(&format!("y ~ {source} - 1"), &training)
                 .select(&[Role::Independent])
                 .unwrap();
-            let evaluated = fitted.evaluate(&input).unwrap();
+            let transformed = fitted.transform(&input).unwrap();
 
             assert!(
-                evaluated
+                transformed
                     .expression(Role::Independent)
                     .unwrap()
                     .frame()
@@ -1456,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_requires_exact_dtypes_for_bare_and_transformed_inputs() {
+    fn transformation_requires_exact_dtypes_for_bare_and_transformed_inputs() {
         let training = polars::df!("y" => [1.0, 2.0], "x" => [2_i32, 3]).unwrap();
         let changed = [
             polars::df!("y" => [1.0, 2.0], "x" => [2_i64, 3]).unwrap(),
@@ -1469,29 +1462,26 @@ mod tests {
             ("y ~ x - 1", DataType::Int32),
             ("y ~ log(x) - 1", DataType::Float64),
         ] {
-            let models = crate::parse(source)
-                .unwrap()
-                .materialize(&training)
-                .unwrap();
+            let models = crate::parse(source).unwrap().fit(&training).unwrap();
             let model = models.iter().next().unwrap();
             assert_eq!(
                 model.expression(Role::Independent).unwrap().frame()[0].dtype(),
                 &output_dtype
             );
-            assert!(models.evaluate(&training).is_ok());
+            assert!(models.transform(&training).is_ok());
 
             for input in &changed {
-                // Every evaluation entry point must use the original fitted dtype.
+                // Every transformation entry point must use the original fitted dtype.
                 for result in [
-                    models.evaluate(input).map(|_| ()),
-                    model.evaluate(input).map(|_| ()),
+                    models.transform(input).map(|_| ()),
+                    model.transform(input).map(|_| ()),
                     model
                         .select(&[Role::Independent])
                         .unwrap()
-                        .evaluate(input)
+                        .transform(input)
                         .map(|_| ()),
                 ] {
-                    let Err(EvaluationError::Fit(crate::FitError::Evaluation(
+                    let Err(ModelError::Fit(crate::FitError::Transform(
                         error @ TransformError::InputTypeMismatch { .. },
                     ))) = result
                     else {
@@ -1512,17 +1502,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_batch_materializes_without_models() {
+    fn empty_batch_fits_without_models() {
         let data = polars::df!("y" => [1.0]).unwrap();
         let models = crate::parse_many(std::iter::empty())
             .unwrap()
-            .materialize(&data)
+            .fit(&data)
             .unwrap();
         assert!(models.is_empty());
     }
 
     #[test]
-    fn argument_count_errors_identify_the_failing_call_before_evaluation() {
+    fn argument_count_errors_identify_the_failing_call_before_transformation() {
         let data = DataFrame::default();
         for (source, expected) in [
             (
@@ -1550,29 +1540,25 @@ mod tests {
                 "poly(x, 2, degree=1, raw=false): invalid argument count: expected exactly 1, received 2",
             ),
         ] {
-            let error = crate::parse(source)
-                .unwrap()
-                .materialize(&data)
-                .err()
-                .unwrap();
+            let error = crate::parse(source).unwrap().fit(&data).err().unwrap();
             assert!(matches!(
                 error,
-                EvaluationError::Validation(ValidationError::InvalidArgumentCount { .. })
+                ModelError::Validation(ValidationError::InvalidArgumentCount { .. })
             ));
             assert_eq!(error.to_string(), expected, "{source}");
         }
     }
 
     #[test]
-    fn batch_materialization_validates_all_formulas_before_fitting() {
+    fn batch_fitting_validates_all_formulas_before_fitting() {
         use crate::transform::TRANSFORM_CALLS;
 
         let data = polars::df!("y" => [1.0], "x" => [2.0]).unwrap();
         let specification = crate::parse("y ~ sw(log(x), sqrt(x, x))").unwrap();
         TRANSFORM_CALLS.set((0, 0));
         assert!(matches!(
-            specification.materialize(&data),
-            Err(EvaluationError::Validation(
+            specification.fit(&data),
+            Err(ModelError::Validation(
                 ValidationError::InvalidArgumentCount { .. }
             ))
         ));
@@ -1602,7 +1588,7 @@ mod tests {
         fn preserves_model_contents_and_order() {
             let (specification, data) = fixture();
             assert_eq!(specification.formulas().len(), 6);
-            let collection = specification.materialize(&data).unwrap();
+            let collection = specification.fit(&data).unwrap();
             assert_eq!(collection.len(), 6);
             let expected_interaction = Column::new(
                 INTERACTION.into(),
@@ -1677,7 +1663,7 @@ mod tests {
         }
 
         #[test]
-        fn evaluates_nested_transforms_once_per_batch() {
+        fn transforms_nested_transforms_once_per_batch() {
             use crate::transform::TRANSFORM_CALLS;
 
             let data =
@@ -1685,7 +1671,7 @@ mod tests {
             let specification = crate::parse("y ~ sqrt(exp(sqrt(g))) + sw0(x)").unwrap();
             assert_eq!(specification.formulas().len(), 2);
             TRANSFORM_CALLS.set((0, 0));
-            let _models = specification.materialize(&data).unwrap();
+            let _models = specification.fit(&data).unwrap();
             // Both sqrt calls and exp each fit and transform once across all models.
             assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
         }
@@ -1695,7 +1681,7 @@ mod tests {
             let data =
                 polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
             let specification = crate::parse("y ~ x:z + sw0(x)").unwrap();
-            let collection = specification.materialize(&data).unwrap();
+            let collection = specification.fit(&data).unwrap();
             assert_eq!(collection.len(), 2);
             let mut models = collection.iter();
             let first = models.next().unwrap();
@@ -1783,11 +1769,11 @@ mod tests {
             ] {
                 let specification = crate::parse(source).unwrap();
                 TRANSFORM_CALLS.set((0, 0));
-                let collection = specification.materialize(&data).unwrap();
+                let collection = specification.fit(&data).unwrap();
                 assert_eq!(TRANSFORM_CALLS.get(), (1, 1), "{source}");
 
                 TRANSFORM_CALLS.set((0, 0));
-                let applied = collection.evaluate(&input).unwrap();
+                let applied = collection.transform(&input).unwrap();
                 assert_eq!(TRANSFORM_CALLS.get(), (0, 1), "{source}");
 
                 for models in [&collection, &applied] {
@@ -1829,7 +1815,7 @@ mod tests {
             )
             .unwrap();
             let specification = crate::parse("y ~ C(g) + sw0(x)").unwrap();
-            let collection = specification.materialize(&data).unwrap();
+            let collection = specification.fit(&data).unwrap();
             let retained = (&collection)
                 .into_iter()
                 .next()
@@ -1858,7 +1844,7 @@ mod tests {
                 "g" => [Some("b"), Some("a"), Some("unseen"), None],
             )
             .unwrap();
-            let evaluated = retained.evaluate(&fresh).unwrap();
+            let transformed = retained.transform(&fresh).unwrap();
             let expected = polars::df!(
                 "Intercept" => [1.0; 4],
                 "C(g)[a]" => [Some(false), Some(true), None, None],
@@ -1866,7 +1852,7 @@ mod tests {
             )
             .unwrap();
             assert!(
-                evaluated
+                transformed
                     .expression(Role::Independent)
                     .unwrap()
                     .frame()
@@ -1890,7 +1876,7 @@ mod tests {
         )
         .unwrap();
         TRANSFORM_CALLS.set((0, 0));
-        let models = specification.materialize(&training).unwrap();
+        let models = specification.fit(&training).unwrap();
         assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
 
         let assert_shared = |models: &crate::Models, expected: &[Option<f64>]| {
@@ -1930,7 +1916,7 @@ mod tests {
         )
         .unwrap();
         TRANSFORM_CALLS.set((0, 0));
-        let applied = models.evaluate(&input).unwrap();
+        let applied = models.transform(&input).unwrap();
         assert_eq!(TRANSFORM_CALLS.get(), (0, 3));
         assert_shared(
             &applied,
@@ -1944,7 +1930,7 @@ mod tests {
 
         let training = polars::df!("g" => [0.0, 1.0, 0.0], "x" => [2.0, 3.0, 4.0]).unwrap();
         TRANSFORM_CALLS.set((0, 0));
-        let model = materialize("sqrt(g) ~ sqrt(g):x + exp(sqrt(g)) - 1", &training);
+        let model = fit("sqrt(g) ~ sqrt(g):x + exp(sqrt(g)) - 1", &training);
         // sqrt(g) and exp(sqrt(g)) each fit and transform once, across both sides.
         assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
 
@@ -1964,7 +1950,7 @@ mod tests {
         let input =
             polars::df!("g" => [Some(1.0), Some(0.0), None], "x" => [5.0, 6.0, 7.0]).unwrap();
         TRANSFORM_CALLS.set((0, 0));
-        let applied = model.evaluate(&input).unwrap();
+        let applied = model.transform(&input).unwrap();
         assert_eq!(TRANSFORM_CALLS.get(), (0, 2));
         assert!(Arc::ptr_eq(
             sqrt,
@@ -2017,17 +2003,17 @@ mod tests {
     }
 
     #[test]
-    fn separate_materializations_learn_independent_state() {
+    fn separate_fittings_learn_independent_state() {
         let specification = crate::parse("y ~ C(g) - 1").unwrap();
         let first_training = polars::df!("y" => [1.0, 2.0], "g" => ["a", "b"]).unwrap();
         let second_training = polars::df!("y" => [1.0, 2.0], "g" => ["b", "c"]).unwrap();
         let first = specification
-            .materialize(&first_training)
+            .fit(&first_training)
             .unwrap()
             .select(&[Role::Independent])
             .unwrap();
         let second = specification
-            .materialize(&second_training)
+            .fit(&second_training)
             .unwrap()
             .select(&[Role::Independent])
             .unwrap();
@@ -2044,8 +2030,8 @@ mod tests {
         )
         .unwrap();
         for (models, expected) in [(&first, &expected_first), (&second, &expected_second)] {
-            let evaluated = models.evaluate(&input).unwrap();
-            let frame = evaluated
+            let transformed = models.transform(&input).unwrap();
+            let frame = transformed
                 .iter()
                 .next()
                 .unwrap()
@@ -2195,7 +2181,7 @@ mod tests {
     fn intercept_is_first_and_included_once() {
         let data = polars::df!("y" => [2.0, 3.0], "x" => [4.0, 5.0]).unwrap();
         for source in ["y ~ x", "y ~ x + 1", "y ~ 1 + x + 1"] {
-            let model = materialize(source, &data);
+            let model = fit(source, &data);
             let frame = model.expression(Role::Independent).unwrap().frame();
             assert_eq!(frame.get_column_names(), ["Intercept", "x"]);
             assert_eq!(
@@ -2217,7 +2203,7 @@ mod tests {
     fn intercept_suppression_survives_later_addition() {
         let data = polars::df!("y" => [2.0], "x" => [3.0]).unwrap();
         for source in ["y ~ -1 + x", "y ~ - 1 + x", "y ~ x - 1", "y ~ x - 1 + 1"] {
-            let model = materialize(source, &data);
+            let model = fit(source, &data);
             assert_eq!(
                 model
                     .expression(Role::Independent)
@@ -2234,7 +2220,7 @@ mod tests {
     fn grouped_subtraction_suppresses_intercept() {
         let data = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
         for source in ["y ~ (x - 1)", "y ~ (-1 + x)", "y ~ x - (z + 1)"] {
-            let model = materialize(source, &data);
+            let model = fit(source, &data);
             assert_eq!(
                 model
                     .expression(Role::Independent)
@@ -2251,12 +2237,12 @@ mod tests {
     fn intercept_name_collision_requires_suppression() {
         let data = polars::df!("y" => [2.0], "Intercept" => [3.0]).unwrap();
         assert!(matches!(
-            crate::parse("y ~ Intercept").unwrap().materialize(&data),
-            Err(EvaluationError::Transform(TransformError::Polars(
+            crate::parse("y ~ Intercept").unwrap().fit(&data),
+            Err(ModelError::Transform(TransformError::Polars(
                 polars::error::PolarsError::Duplicate(_)
             )))
         ));
-        let model = materialize("y ~ Intercept - 1", &data);
+        let model = fit("y ~ Intercept - 1", &data);
         assert_eq!(
             model.expression(Role::Independent).unwrap().frame(),
             &data.select(["Intercept"]).unwrap()
@@ -2264,13 +2250,13 @@ mod tests {
     }
 
     #[test]
-    fn intercept_uses_new_input_height_on_evaluation() {
+    fn intercept_uses_new_input_height_on_transformation() {
         let training = polars::df!("y" => [2.0, 3.0]).unwrap();
-        let model = materialize("y ~ 1", &training);
+        let model = fit("y ~ 1", &training);
         for values in [vec![4.0], vec![4.0, 5.0, 6.0], vec![]] {
             let height = values.len();
             let input = polars::df!("y" => values).unwrap();
-            let output = model.evaluate(&input).unwrap();
+            let output = model.transform(&input).unwrap();
             let frame = output.expression(Role::Independent).unwrap().frame();
             assert_eq!(frame.shape(), (height, 1));
             assert_eq!(
@@ -2290,7 +2276,7 @@ mod tests {
         for values in [vec![1.0, 2.0, 3.0], vec![]] {
             let height = values.len();
             let data = polars::df!("y" => values.clone(), "x" => values).unwrap();
-            let models = specification.materialize(&data).unwrap();
+            let models = specification.fit(&data).unwrap();
             let model = models.iter().next().unwrap();
             assert_eq!(
                 model.expression(Role::Dependent).unwrap().frame().shape(),
@@ -2298,16 +2284,16 @@ mod tests {
             );
             assert!(model.expression(Role::Independent).is_none());
             let input = polars::df!("y" => [4.0, 5.0]).unwrap();
-            let evaluated = model.evaluate(&input).unwrap();
+            let transformed = model.transform(&input).unwrap();
             assert_eq!(
-                evaluated
+                transformed
                     .expression(Role::Dependent)
                     .unwrap()
                     .frame()
                     .height(),
                 2
             );
-            assert!(evaluated.expression(Role::Independent).is_none());
+            assert!(transformed.expression(Role::Independent).is_none());
         }
     }
 
@@ -2321,7 +2307,7 @@ mod tests {
     #[test]
     fn interaction_deduplication_preserves_first_output_name() {
         let data = polars::df!("a" => [2.0, 4.0], "b" => [3.0, 5.0]).unwrap();
-        let model = materialize("a ~ b:a + a:b - 1", &data);
+        let model = fit("a ~ b:a + a:b - 1", &data);
         let output = model.expression(Role::Independent).unwrap().frame();
         assert_eq!(output.shape(), (2, 1));
         assert_eq!(output.columns()[0].name().as_str(), "b:a");
@@ -2436,7 +2422,7 @@ mod tests {
     }
 
     #[test]
-    fn model_evaluation_reuses_fitted_integer_encoding() {
+    fn model_transformation_reuses_fitted_integer_encoding() {
         let training = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "f1" => ["a", "b", "a"],
@@ -2449,9 +2435,9 @@ mod tests {
             "f2" => [2_i32, 1, 1, 1],
         )
         .unwrap();
-        let model = materialize("y ~ -1 | f1:f2", &training);
-        let evaluated = model.evaluate(&input).unwrap();
-        let output = evaluated.expression(Role::FixedEffect).unwrap().frame();
+        let model = fit("y ~ -1 | f1:f2", &training);
+        let transformed = model.transform(&input).unwrap();
+        let output = transformed.expression(Role::FixedEffect).unwrap().frame();
 
         assert_eq!(output.width(), 1);
         assert_eq!(output[0].name().as_str(), "f1:f2");
@@ -2461,7 +2447,7 @@ mod tests {
             vec![Some(2), Some(1), Some(0), None]
         );
         assert_eq!(
-            evaluated.expression(Role::Dependent).unwrap().frame()[0].len(),
+            transformed.expression(Role::Dependent).unwrap().frame()[0].len(),
             4
         );
 
@@ -2473,7 +2459,7 @@ mod tests {
         assert_eq!(original, vec![Some(0), Some(1), Some(2)]);
         assert_eq!(
             model.expression(Role::FixedEffect).unwrap().expression(),
-            evaluated
+            transformed
                 .expression(Role::FixedEffect)
                 .unwrap()
                 .expression()
@@ -2481,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_materialization_matches_explicit_transform_composition() {
+    fn nested_fitting_matches_explicit_transform_composition() {
         let training = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "f1" => [0.0, 1.0, 0.0],
@@ -2494,18 +2480,15 @@ mod tests {
             "f2" => [2.0, 1.0, 1.0, 2.0],
         )
         .unwrap();
-        let model = materialize("y ~ exp(add(f1, f2)) - 1", &training);
-        let rematerialized = model.evaluate(&input).unwrap();
+        let model = fit("y ~ exp(add(f1, f2)) - 1", &training);
+        let transformed = model.transform(&input).unwrap();
 
         let inner = ExpressionTransform::ADD.fit();
         let outer = ExpressionTransform::EXP.fit();
 
         for (data, design) in [
             (&training, model.expression(Role::Independent).unwrap()),
-            (
-                &input,
-                rematerialized.expression(Role::Independent).unwrap(),
-            ),
+            (&input, transformed.expression(Role::Independent).unwrap()),
         ] {
             let inputs = [
                 data.column("f1").unwrap().clone(),

@@ -1,6 +1,6 @@
 # formula
 
-`formula` is  [`Polars`](https://pola.rs)-powerd implementation of Wilkinson formulas in Rust with a Python API. It parses formula strings and materializes data for regression
+`formula` is  [`Polars`](https://pola.rs)-powerd implementation of Wilkinson formulas in Rust with a Python API. It parses formula strings and constructs data frames for regression
 analysis. It is primarily designed for [`PyFixest`](https://github.com/py-econometrics/pyfixest).
 
 > [!NOTE]
@@ -24,26 +24,28 @@ data = polars.DataFrame(
 )
 
 specification = formula.parse("y ~ sw(x, z) | firm")  # Parse into a specification
-models = specification.materialize(data)  # Materialize specification given input data
+models = specification.fit(data)  # Fit specification given input data
 model = models[0]  # Integer indexing follows expansion order
 same_model = models[model.formula]  # Look up an expanded model by its formula
 
-# Access all materialized data or select specific roles
+# Access the complete frame or select specific roles
 frame = model.frame()
 dependent = model.select(formula.Role.Dependent).frame()
 independent = model.select(formula.Role.Independent).frame()
 fixed_effects = model.select(formula.Role.FixedEffect).frame()
 
-# Select roles before evaluating data that has no dependent column.
+# Select roles before transforming data that has no dependent column.
 predictors = models.select([formula.Role.Independent, formula.Role.FixedEffect])
 new_data = polars.DataFrame({"x": [8.0], "z": [9.0], "firm": ["a"]})
-predicted = predictors.evaluate(new_data)
+transformed = predictors.transform(new_data)
 ```
 
 `parse` accepts one formula string or a sequence of strings and returns a
-`Specification`. Its `materialize` method returns one model per expanded formula.
+`Specification`. Its `fit` method returns one model per expanded formula, containing
+the computed columns and learned transformation state. `transform` computes columns
+for new data using that learned state. Fitting does not estimate regression coefficients.
 `frame()` returns a Polars `DataFrame` containing all selected roles. `select` and
-`evaluate` return new models and retain fitted transform state. Selecting an absent
+`transform` return new models and retain fitted transform state. Selecting an absent
 role raises `KeyError`.
 
 ## Rust API
@@ -74,16 +76,16 @@ fn main() {
     // Stores all specifications associated with a formula
     let specification = parse(formula).expect("valid formula");
 
-    // Materializing a specification on data creates a collection of `Model`s
+    // Fitting a specification on data creates a collection of `Model`s
     // Transformations and data are shared across models, so no work is duplicated
     let data = sample_data(1_000_000).expect("valid sample data");
     let models = specification
-        .materialize(&data)
-        .expect("successful materialization");
+        .fit(&data)
+        .expect("successful fitting");
 
     for model in &models {
         println!("Model {}", model.formula());
-        println!("Materialized frame:\n{}", model.frame().expect("valid frame"));
+        println!("Fitted frame:\n{}", model.frame().expect("valid frame"));
         let independent = model
             .select(&[Role::Independent])
             .expect("independent role exists");
@@ -129,8 +131,8 @@ after the pipe.
 
 ### Transformations
 
-`formula` supports symbolic transformations that will be applied to the data provided
-during formula materialization:
+`formula` supports the following transformations, applied to data passed to `fit()`
+or `transform()`:
 
 | Function                                                                     | Description                                                                                                   |
 |------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|

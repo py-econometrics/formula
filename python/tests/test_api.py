@@ -26,10 +26,10 @@ def data() -> polars.DataFrame:
         ([], []),
     ],
 )
-def test_parse_and_materialize(formulas, expected_columns, data):
+def test_parse_and_fit(formulas, expected_columns, data):
     specification = formula.parse(formulas)
     assert isinstance(specification, formula.Specification)
-    models = specification.materialize(data)
+    models = specification.fit(data)
 
     assert len(models) == len(expected_columns)
     for index, column in enumerate(expected_columns):
@@ -38,7 +38,7 @@ def test_parse_and_materialize(formulas, expected_columns, data):
 
 
 def test_role_frames_preserve_rows_and_nulls(data):
-    model = formula.parse("y ~ x | firm").materialize(data)[0]
+    model = formula.parse("y ~ x | firm").fit(data)[0]
 
     dependent = model.select(formula.Role.Dependent).frame()
     independent = model.select(formula.Role.Independent).frame()
@@ -60,21 +60,21 @@ def test_role_frames_preserve_rows_and_nulls(data):
 
 
 @pytest.mark.parametrize("height", [0, 1, 3])
-def test_combined_frame_preserves_input_height_on_materialization_and_evaluation(
+def test_combined_frame_preserves_input_height_on_fitting_and_transformation(
     data, height
 ):
     specification = formula.parse("y ~ x - 1")
     input_data = data.head(height)
-    fitted = specification.materialize(data)[0]
+    fitted = specification.fit(data)[0]
     for model in (
-        specification.materialize(input_data)[0],
-        fitted.evaluate(input_data),
+        specification.fit(input_data)[0],
+        fitted.transform(input_data),
     ):
         assert_frame_equal(model.frame(), input_data.select("y", "x"))
 
 
 def test_model_indexing(data):
-    models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).materialize(data)
+    models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).fit(data)
 
     by_formula = models["y ~ x - 1"]
     assert isinstance(by_formula, formula.Model)
@@ -98,7 +98,7 @@ def test_model_indexing(data):
 
 
 def test_expanded_models_can_be_looked_up_by_their_formula(data):
-    models = formula.parse("y ~ sw(x, z)").materialize(data)
+    models = formula.parse("y ~ sw(x, z)").fit(data)
 
     for index in range(len(models)):
         model = models[index]
@@ -109,7 +109,7 @@ def test_expanded_models_can_be_looked_up_by_their_formula(data):
 
 
 def test_model_owns_its_data_and_returns_independent_frames(data):
-    model = formula.parse("y ~ x - 1").materialize(data)[0]
+    model = formula.parse("y ~ x - 1").fit(data)[0]
     assert isinstance(model, formula.Model)
     frame = model.frame()
     frame.replace_column(1, polars.Series("x", [99.0, 99.0, 99.0]))
@@ -119,14 +119,14 @@ def test_model_owns_its_data_and_returns_independent_frames(data):
     assert_frame_equal(original, data.select("x"))
 
 
-def test_model_evaluate_reuses_fitted_categories(data):
-    model = formula.parse("y ~ C(firm) - 1").materialize(data)[0]
+def test_model_transform_reuses_fitted_categories(data):
+    model = formula.parse("y ~ C(firm) - 1").fit(data)[0]
     training = model.select(formula.Role.Independent).frame()
 
     # Only one training category occurs in the new data; retain both columns.
-    evaluated = model.evaluate(data.slice(1, 1))
-    independent = evaluated.select(formula.Role.Independent).frame()
-    dependent = evaluated.select(formula.Role.Dependent).frame()
+    transformed = model.transform(data.slice(1, 1))
+    independent = transformed.select(formula.Role.Independent).frame()
+    dependent = transformed.select(formula.Role.Dependent).frame()
     assert_frame_equal(independent, training.slice(1, 1))
     assert_frame_equal(dependent, data.select("y").slice(1, 1))
 
@@ -134,14 +134,14 @@ def test_model_evaluate_reuses_fitted_categories(data):
     assert_frame_equal(original, training)
 
 
-def test_models_evaluate_preserves_model_order_and_fitted_state(data):
-    models = formula.parse(["y ~ C(firm) - 1", "y ~ x - 1"]).materialize(data)
-    evaluated = models.evaluate(data.slice(1, 1))
+def test_models_transform_preserves_model_order_and_fitted_state(data):
+    models = formula.parse(["y ~ C(firm) - 1", "y ~ x - 1"]).fit(data)
+    transformed = models.transform(data.slice(1, 1))
 
-    assert len(evaluated) == len(models) == 2
+    assert len(transformed) == len(models) == 2
     for index in range(len(models)):
         training = models[index].select(formula.Role.Independent).frame()
-        independent = evaluated[index].select(formula.Role.Independent).frame()
+        independent = transformed[index].select(formula.Role.Independent).frame()
         assert training.height == data.height
         assert_frame_equal(independent, training.slice(1, 1))
 
@@ -151,7 +151,7 @@ def test_models_evaluate_preserves_model_order_and_fitted_state(data):
     [formula.Role.Independent, [formula.Role.Independent], (formula.Role.Independent,)],
 )
 def test_select_accepts_single_roles_and_sequences(data, roles):
-    models = formula.parse("y ~ x - 1").materialize(data)
+    models = formula.parse("y ~ x - 1").fit(data)
     selected_model = models[0].select(roles)
     selected_models = models.select(roles)
     assert isinstance(selected_model, formula.Model)
@@ -159,12 +159,12 @@ def test_select_accepts_single_roles_and_sequences(data, roles):
 
     new_data = data.select("x")
     for model in (selected_model, selected_models[0]):
-        frame = model.evaluate(new_data).frame()
+        frame = model.transform(new_data).frame()
         assert_frame_equal(frame, new_data)
 
 
 def test_select_rejects_missing_roles_and_empty_selections(data):
-    models = formula.parse("y ~ x").materialize(data)
+    models = formula.parse("y ~ x").fit(data)
     for target in (models, models[0]):
         for roles in (formula.Role.FixedEffect, [formula.Role.FixedEffect]):
             with pytest.raises(KeyError, match="FixedEffect"):
@@ -184,11 +184,11 @@ def test_rust_errors_become_python_exceptions(data):
         formula.parse("y ~")
 
     with pytest.raises(ValueError, match="missing"):
-        formula.parse("y ~ missing").materialize(data)
+        formula.parse("y ~ missing").fit(data)
 
-    models = formula.parse("y ~ x").materialize(data)
+    models = formula.parse("y ~ x").fit(data)
     prediction = data.drop("x")
     with pytest.raises(ValueError, match="x"):
-        models.evaluate(prediction)
+        models.transform(prediction)
     with pytest.raises(ValueError, match="x"):
-        models[0].evaluate(prediction)
+        models[0].transform(prediction)

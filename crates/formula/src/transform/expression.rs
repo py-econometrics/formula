@@ -24,7 +24,7 @@ impl InputPolicy {
     }
 }
 
-/// A stateless transform evaluated using a Polars expression builder.
+/// A stateless transform transformed using a Polars expression builder.
 ///
 /// Builders must produce exactly one value per input row, preserving row
 /// order and alignment. Output shape is checked at runtime.
@@ -185,10 +185,10 @@ mod tests {
     use crate::transform::Transform;
     use winnow::Parser;
 
-    fn materialize(source: &str, data: &DataFrame) -> crate::Model {
+    fn fit(source: &str, data: &DataFrame) -> crate::Model {
         let models = crate::parse(&format!("x ~ {source} - 1"))
             .unwrap()
-            .materialize(data)
+            .fit(data)
             .unwrap();
         models.iter().next().unwrap().clone()
     }
@@ -230,7 +230,7 @@ mod tests {
             ("add(x, -2)", [Some(4.0), None, Some(-5.0)]),
             ("mul(add(x, -2), 3)", [Some(12.0), None, Some(-15.0)]),
         ] {
-            let output = materialize(source, &data);
+            let output = fit(source, &data);
             assert_numeric_output(
                 output.expression(crate::Role::Independent).unwrap().frame(),
                 source,
@@ -249,13 +249,13 @@ mod tests {
             ("add(2, 3)", 5.0),
             ("mul(add(2, -1), 3)", 3.0),
         ] {
-            let fitted = materialize(source, &training);
+            let fitted = fit(source, &training);
             for height in [0, 1, 4] {
                 let input = polars::df!("x" => vec![4.0; height]).unwrap();
                 let expected = vec![Some(expected_value); height];
-                let evaluated = fitted.evaluate(&input).unwrap();
+                let transformed = fitted.transform(&input).unwrap();
                 assert_numeric_output(
-                    evaluated
+                    transformed
                         .expression(crate::Role::Independent)
                         .unwrap()
                         .frame(),
@@ -263,9 +263,9 @@ mod tests {
                     &expected,
                 );
 
-                let materialized = materialize(source, &input);
+                let refitted = fit(source, &input);
                 assert_numeric_output(
-                    materialized
+                    refitted
                         .expression(crate::Role::Independent)
                         .unwrap()
                         .frame(),
@@ -281,7 +281,7 @@ mod tests {
         let specification = crate::parse("add(2, 3) ~ add(2, 3) - 1").unwrap();
         for height in [0, 3] {
             let data = DataFrame::empty_with_height(height);
-            let models = specification.materialize(&data).unwrap();
+            let models = specification.fit(&data).unwrap();
             let output = models.iter().next().unwrap();
             assert_numeric_output(
                 output.expression(crate::Role::Independent).unwrap().frame(),
@@ -298,7 +298,7 @@ mod tests {
             ("mul(x, 2)", [Some(6.0), Some(8.0)]),
             ("mul(x, `2`)", [Some(30.0), Some(80.0)]),
         ] {
-            let output = materialize(source, &data);
+            let output = fit(source, &data);
             assert_numeric_output(
                 output.expression(crate::Role::Independent).unwrap().frame(),
                 "mul(x, 2)",
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn sqrt_preserves_row_order_nulls_and_domain_behavior() {
         let data = polars::df!("x" => [Some(9.0), Some(1.0), Some(4.0), None, Some(-1.0)]).unwrap();
-        let output = materialize("sqrt(x)", &data);
+        let output = fit("sqrt(x)", &data);
         assert_numeric_output(
             output.expression(crate::Role::Independent).unwrap().frame(),
             "sqrt(x)",
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn add_accepts_repeated_arguments_and_mixed_numeric_types() {
         let data = polars::df!("x" => [3_i32, 1], "y" => [Some(0.5_f32), None]).unwrap();
-        let output = materialize("add(x, y, x)", &data);
+        let output = fit("add(x, y, x)", &data);
         assert_numeric_output(
             output.expression(crate::Role::Independent).unwrap().frame(),
             "add(x, y, x)",
@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn sub_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [10, 3], "y" => [3, 10], "z" => [2, 1]).unwrap();
-        let output = materialize("sub(x, y, z)", &data);
+        let output = fit("sub(x, y, z)", &data);
         assert_numeric_output(
             output.expression(crate::Role::Independent).unwrap().frame(),
             "sub(x, y, z)",
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn mul_multiplies_all_arguments() {
         let data = polars::df!("x" => [2, 3], "y" => [3, 4], "z" => [4, 5]).unwrap();
-        let output = materialize("mul(x, y, z)", &data);
+        let output = fit("mul(x, y, z)", &data);
         assert_numeric_output(
             output.expression(crate::Role::Independent).unwrap().frame(),
             "mul(x, y, z)",
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn div_preserves_argument_order_and_associates_left() {
         let data = polars::df!("x" => [24, 3], "y" => [3, 24], "z" => [2, 2]).unwrap();
-        let output = materialize("div(x, y, z)", &data);
+        let output = fit("div(x, y, z)", &data);
         assert_numeric_output(
             output.expression(crate::Role::Independent).unwrap().frame(),
             "div(x, y, z)",
@@ -369,8 +369,8 @@ mod tests {
             let specification = crate::parse(&format!("x ~ {source} - 1")).unwrap();
             assert!(
                 matches!(
-                    specification.materialize(&data),
-                    Err(crate::EvaluationError::Validation(
+                    specification.fit(&data),
+                    Err(crate::ModelError::Validation(
                         crate::ValidationError::InvalidArgumentCount { .. }
                     ))
                 ),
@@ -524,7 +524,7 @@ mod tests {
                 let transform = transform.fit(&input).expect("stateless fitting succeeds");
                 assert!(matches!(
                     transform.transform(&input),
-                    Err(crate::FitError::Evaluation(
+                    Err(crate::FitError::Transform(
                         TransformError::NonNumericInput { .. }
                     ))
                 ));

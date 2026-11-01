@@ -111,7 +111,7 @@ fn main() -> ExitCode {
         let operation_name = match operation {
             Operation::Parse => "Parse",
             Operation::ParseAndFit => "Parse + fit",
-            Operation::Evaluate => "Evaluate",
+            Operation::Transform => "Transform",
         };
         if base.is_none() {
             let timing = format_summary(&candidate_groups[&(benchmark, operation)]);

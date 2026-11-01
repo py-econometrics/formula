@@ -23,12 +23,10 @@ fn main() {
     // Stores all specifications associated with a formula
     let specification = parse(formula).expect("valid formula");
 
-    // Materializing a specification on data creates a collection of `Model`s
+    // Fitting a specification on data creates a collection of `Model`s
     // Transformations and data are shared across models, so no work is duplicated
     let data = sample_data(1_000_000).expect("valid sample data");
-    let models = specification
-        .materialize(&data)
-        .expect("successful materialization");
+    let models = specification.fit(&data).expect("successful fitting");
 
     for model in &models {
         println!("Model {}", model.formula());

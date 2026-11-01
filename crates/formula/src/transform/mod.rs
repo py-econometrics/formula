@@ -86,7 +86,7 @@ impl Transform {
 
         match self {
             Self::Expression(expression) => {
-                expression.transform(inputs).map_err(FitError::Evaluation)
+                expression.transform(inputs).map_err(FitError::Transform)
             }
             Self::C(categorical) => categorical.transform(inputs),
             Self::F(integer) => integer.transform(inputs),

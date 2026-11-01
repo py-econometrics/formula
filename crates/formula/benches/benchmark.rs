@@ -75,7 +75,7 @@ fn measure_samples(
 }
 
 fn model_shapes(models: &Models) -> Output {
-    Output::Materialized {
+    Output::Fitted {
         models: models
             .iter()
             .map(|model| ModelShape {
@@ -131,17 +131,17 @@ fn main() {
             || {
                 parse(black_box(source))
                     .unwrap()
-                    .materialize(black_box(&data))
+                    .fit(black_box(&data))
                     .unwrap()
             },
         ));
-        let fitted = parse(source).unwrap().materialize(&data).unwrap();
+        let fitted = parse(source).unwrap().fit(&data).unwrap();
         results.samples.extend(measure_samples(
             name,
             source,
-            Operation::Evaluate,
+            Operation::Transform,
             samples,
-            || fitted.evaluate(black_box(&data)).unwrap(),
+            || fitted.transform(black_box(&data)).unwrap(),
         ));
     }
     println!("{}", serde_json::to_string_pretty(&results).unwrap());

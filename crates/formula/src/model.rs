@@ -1,7 +1,7 @@
 use crate::Formula;
 use crate::fit::FitError;
 use crate::formula::{
-    EvaluatedExpression, EvaluatedTerm, Expression, Role, ValidationError, evaluate_terms,
+    Expression, FittedExpression, FittedTerm, Role, ValidationError, transform_terms,
 };
 use crate::parse::{ParseResult, parse};
 use crate::transform::TransformError;
@@ -15,14 +15,14 @@ use winnow::error::{ContextError, StrContext, StrContextValue};
 #[derive(Clone, Debug)]
 pub struct Model {
     formula: Formula,
-    expressions: BTreeMap<Role, EvaluatedExpression>,
+    expressions: BTreeMap<Role, FittedExpression>,
     height: usize,
 }
 
 impl Model {
     pub(crate) fn new(
         formula: Formula,
-        expressions: BTreeMap<Role, EvaluatedExpression>,
+        expressions: BTreeMap<Role, FittedExpression>,
         height: usize,
     ) -> Self {
         debug_assert!(
@@ -52,36 +52,36 @@ impl Model {
         DataFrame::new(self.height, columns)
     }
 
-    fn assemble(&self, height: usize, terms: &[EvaluatedTerm]) -> Result<Self, EvaluationError> {
+    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
         let expressions = self
             .expressions
             .iter()
-            .map(|(&role, evaluated)| {
-                evaluated
+            .map(|(&role, transformed)| {
+                transformed
                     .expression()
                     .assemble(height, terms)
                     .map(|expression| (role, expression))
             })
-            .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
+            .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
         Ok(Self::new(self.formula.clone(), expressions, height))
     }
 
-    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
+    pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
         let expressions = self
             .expressions
             .values()
-            .map(EvaluatedExpression::expression)
+            .map(FittedExpression::expression)
             .collect::<Vec<_>>();
 
-        let terms = evaluate_terms(&expressions, data)?;
+        let terms = transform_terms(&expressions, data)?;
         self.assemble(data.height(), &terms)
     }
 
-    pub(crate) fn expression(&self, role: Role) -> Option<&EvaluatedExpression> {
+    pub(crate) fn expression(&self, role: Role) -> Option<&FittedExpression> {
         self.expressions
             .get(&role)
-            .filter(|evaluated| !evaluated.expression().is_empty())
+            .filter(|transformed| !transformed.expression().is_empty())
     }
 
     pub fn select(&self, roles: &[Role]) -> Result<Self, SelectionError> {
@@ -144,22 +144,18 @@ impl Models {
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
-        self.iter().flat_map(|model| {
-            model
-                .expressions
-                .values()
-                .map(EvaluatedExpression::expression)
-        })
+        self.iter()
+            .flat_map(|model| model.expressions.values().map(FittedExpression::expression))
     }
 
-    pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
+    pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
         let expressions: Vec<&Expression> = self.expressions().collect();
-        let terms = evaluate_terms(&expressions, data)?;
+        let terms = transform_terms(&expressions, data)?;
 
         let entries = self
             .iter()
             .map(|model| model.assemble(data.height(), &terms))
-            .collect::<Result<Vec<_>, EvaluationError>>()?;
+            .collect::<Result<Vec<_>, ModelError>>()?;
 
         Ok(Self { entries })
     }
@@ -188,32 +184,32 @@ impl<'a> IntoIterator for &'a Models {
 }
 
 #[derive(Debug)]
-pub enum EvaluationError {
+pub enum ModelError {
     Validation(ValidationError),
     Transform(TransformError),
     Fit(FitError<TransformError>),
     TransformCall(String),
 }
 
-impl From<ValidationError> for EvaluationError {
+impl From<ValidationError> for ModelError {
     fn from(error: ValidationError) -> Self {
         Self::Validation(error)
     }
 }
 
-impl From<TransformError> for EvaluationError {
+impl From<TransformError> for ModelError {
     fn from(error: TransformError) -> Self {
         Self::Transform(error)
     }
 }
 
-impl From<FitError<TransformError>> for EvaluationError {
+impl From<FitError<TransformError>> for ModelError {
     fn from(error: FitError<TransformError>) -> Self {
         Self::Fit(error)
     }
 }
 
-impl std::fmt::Display for EvaluationError {
+impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Validation(error) => error.fmt(f),
@@ -224,7 +220,7 @@ impl std::fmt::Display for EvaluationError {
     }
 }
 
-impl std::error::Error for EvaluationError {}
+impl std::error::Error for ModelError {}
 
 #[derive(Debug)]
 pub enum SelectionError {
@@ -250,15 +246,12 @@ mod tests {
     use super::{Role, SelectionError};
 
     #[test]
-    fn model_select_evaluates_only_selected_roles() {
+    fn model_select_transforms_only_selected_roles() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "a"],
         )
         .unwrap();
-        let models = crate::parse("y ~ C(g) - 1")
-            .unwrap()
-            .materialize(&data)
-            .unwrap();
+        let models = crate::parse("y ~ C(g) - 1").unwrap().fit(&data).unwrap();
         let model = models.iter().next().unwrap();
 
         for (role, column, excluded) in [
@@ -278,11 +271,11 @@ mod tests {
             );
 
             let input = data.select([column]).unwrap().slice(1, 1);
-            let evaluated = selected.evaluate(&input).unwrap();
-            assert_eq!(evaluated.formula(), model.formula());
-            assert!(evaluated.expression(excluded).is_none());
+            let transformed = selected.transform(&input).unwrap();
+            assert_eq!(transformed.formula(), model.formula());
+            assert!(transformed.expression(excluded).is_none());
             assert!(
-                evaluated
+                transformed
                     .expression(role)
                     .unwrap()
                     .frame()
@@ -308,16 +301,16 @@ mod tests {
         .unwrap();
         let models = crate::parse_many(["y ~ C(g) - 1", "y ~ x - 1"])
             .unwrap()
-            .materialize(&data)
+            .fit(&data)
             .unwrap();
         let selected = models.select(&[Role::Independent]).unwrap();
         let input = data.select(["g", "x"]).unwrap().slice(1, 1);
-        let evaluated = selected.evaluate(&input).unwrap();
+        let transformed = selected.transform(&input).unwrap();
 
         assert_eq!(selected.len(), models.len());
-        assert_eq!(evaluated.len(), models.len());
+        assert_eq!(transformed.len(), models.len());
         for ((original, selected_model), applied) in
-            models.iter().zip(selected.iter()).zip(evaluated.iter())
+            models.iter().zip(selected.iter()).zip(transformed.iter())
         {
             assert_eq!(selected_model.formula(), original.formula());
             assert_eq!(applied.formula(), original.formula());
@@ -350,7 +343,7 @@ mod tests {
         .unwrap();
         let models = crate::parse_many(["y ~ x | g", "y ~ x - 1"])
             .unwrap()
-            .materialize(&data)
+            .fit(&data)
             .unwrap();
         let model = models.iter().nth(1).unwrap();
         let roles = [Role::Independent, Role::FixedEffect];
@@ -372,7 +365,7 @@ mod tests {
             Err(SelectionError::EmptySelection)
         ));
 
-        let empty = crate::parse_many([]).unwrap().materialize(&data).unwrap();
+        let empty = crate::parse_many([]).unwrap().fit(&data).unwrap();
         assert!(matches!(
             empty.select(&[]),
             Err(SelectionError::EmptySelection)
@@ -380,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_effect_pipe_materializes_joint_groups_without_intercept() {
+    fn fixed_effect_pipe_fits_joint_groups_without_intercept() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0, 4.0],
             "x" => [5.0, 6.0, 7.0, 8.0],
@@ -390,7 +383,7 @@ mod tests {
         .unwrap();
         let models = crate::parse("y ~ 1 + x | f1:f2")
             .unwrap()
-            .materialize(&data)
+            .fit(&data)
             .unwrap();
         let model = models.iter().next().unwrap();
 
@@ -420,10 +413,10 @@ mod tests {
             "y ~ x | f2 : `firm name`",
         ])
         .unwrap()
-        .materialize(&data)
+        .fit(&data)
         .unwrap();
         let input = data.select(["f2", "firm name", "x", "y"]).unwrap();
-        let applied = models.evaluate(&input).unwrap();
+        let applied = models.transform(&input).unwrap();
 
         for models in [&models, &applied] {
             for (model, expected) in models
@@ -447,7 +440,7 @@ mod tests {
         let data = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
         let models = crate::parse("y ~ C(g, reference='a') - 1")
             .unwrap()
-            .materialize(&data)
+            .fit(&data)
             .unwrap();
         let model = models.iter().next().unwrap();
 
@@ -462,7 +455,7 @@ mod tests {
     fn models_iterate_in_expansion_order() {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
         let specification = crate::parse_many(["y ~ sw(x, z)", "y ~ x"]).unwrap();
-        let models = specification.materialize(&data).unwrap();
+        let models = specification.fit(&data).unwrap();
         drop(specification);
 
         let expected = crate::parse_many(["y ~ x", "y ~ z"]).unwrap();
@@ -487,7 +480,7 @@ mod tests {
     fn models_lookup_by_formula() {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
         let specification = crate::parse("y ~ sw(x, z)").unwrap();
-        let models = specification.materialize(&data).unwrap();
+        let models = specification.fit(&data).unwrap();
 
         for (expected, formula) in models.iter().zip(specification.formulas()) {
             assert!(std::ptr::eq(models.get(formula).unwrap(), expected));
@@ -502,7 +495,7 @@ mod tests {
     fn models_lookup_by_string() {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
         let specification = crate::parse("y ~ sw(x, z)").unwrap();
-        let models = specification.materialize(&data).unwrap();
+        let models = specification.fit(&data).unwrap();
         drop(specification);
 
         // A successful lookup borrows the collection, not the query string.

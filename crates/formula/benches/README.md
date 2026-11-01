@@ -23,8 +23,9 @@ Four rounds alternate base/candidate and candidate/base order. Each process
 performs its own warm-up. Results appear in the job summary and artifact.
 
 Orchestration lives entirely in `.github/workflows/benchmarks.yml`, with separate
-build, benchmark, and comparison steps. If the base predates the harness, only
-the candidate runs, and its timings are reported without percentage changes.
+build, benchmark, and comparison steps. If the base predates the harness or its
+result definitions differ from the candidate, only the candidate runs, and its
+timings are reported without percentage changes.
 Compilation, execution, and malformed JSON failures fail
 the job. A comparable workload whose mean runtime increases by more than 10%
 also fails the job; the full report and artifacts remain available.
@@ -36,8 +37,8 @@ mean milliseconds per operation ± sample standard deviation, rounded to three
 significant digits. Percentage changes compare means. Candidate-only runs use a
 three-column table without empty baseline or percentage columns. Standard
 deviation is unavailable (`—`) when there is only one sample.
-The two operations are parsing plus materialization (`ParseAndFit`) and fitted
-evaluation (`Evaluate`). There is no standalone parsing benchmark. Each sample
+The two operations are parsing plus fitting (`ParseAndFit`) and fitted
+transformation (`Transform`). There is no standalone parsing benchmark. Each sample
 times one operation. Older parsing results remain readable for comparisons
 against earlier revisions.
 Durations are stored as fractional milliseconds to retain submillisecond precision.
@@ -51,7 +52,7 @@ trigger the regression check. Runner noise can cause false alarms.
 
 Data construction, warm-up, output inspection, serialization, and result
 destruction are outside timing.
-Evaluation reuses a model fitted outside timing. The deterministic dataset has
+Transformation reuses a model fitted outside timing. The deterministic dataset has
 90% fully finite rows; the remaining rows contain nulls, NaN, or infinities.
 The `categorical` workload applies `C` to a string column; `integer` encodes it
 as a fixed effect using pipe syntax. Their `_native` counterparts use a
