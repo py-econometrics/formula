@@ -661,58 +661,101 @@ mod tests {
 
     #[test]
     fn categorical_preserves_fitted_order_and_schema() -> Result<(), TransformError> {
-        let training = [Column::new(
-            "group".into(),
-            [Some("b"), Some("a"), Some("b"), None, Some("c")],
-        )];
-        // The new data omits c, but its fitted output column must remain.
-        let input = [Column::new(
-            "group".into(),
-            [Some("a"), Some("b"), Some("unseen"), None],
-        )];
-        let definition = CategoricalDefinition::new(None);
-        let transform = definition.fit(&training)?;
-        let output = definition.transform(&transform, &input)?;
-
-        assert_output(
-            &definition,
-            &transform,
-            &input,
-            &output,
-            &[
-                &[Some(false), Some(true), None, None],
-                &[Some(true), Some(false), None, None],
-                &[Some(false), Some(false), None, None],
-            ],
-        );
+        // Exercise small sets and both sides of the eight-level lookup boundary.
+        let levels = ["b", "a", "c", "d", "e", "f", "g", "h", "i"];
+        for count in [3, 8, 9] {
+            let mut values = vec![Some("b"), Some("a"), Some("b"), None];
+            values.extend(levels[2..count].iter().copied().map(Some));
+            let training = [Column::new("group".into(), values)];
+            // Prediction omits fitted levels, but their columns must remain.
+            let input = [Column::new(
+                "group".into(),
+                [Some("a"), Some("b"), Some("unseen"), None],
+            )];
+            let definition = CategoricalDefinition::new(None);
+            let fitted = Fitted::fit(definition, &training)?;
+            let output = fitted.transform(&input)?;
+            let mut expected = vec![
+                [Some(false), Some(true), None, None],
+                [Some(true), Some(false), None, None],
+            ];
+            expected.extend((2..count).map(|_| [Some(false), Some(false), None, None]));
+            let expected = expected
+                .iter()
+                .map(|values| values.as_slice())
+                .collect::<Vec<_>>();
+            assert_output(
+                &fitted.definition,
+                &fitted.state,
+                &input,
+                &output,
+                &expected,
+            );
+            let names = levels[..count]
+                .iter()
+                .map(|level| format!("C(group)[{level}]"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output
+                    .get_column_names()
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>(),
+                names
+            );
+        }
         Ok(())
     }
 
     #[test]
     fn categorical_omits_reference_and_preserves_nulls() -> Result<(), TransformError> {
-        let training = [Column::new(
-            "group".into(),
-            [Some("a"), Some("b"), Some("c"), None],
-        )];
-        let input = [Column::new(
-            "group".into(),
-            [Some("a"), Some("b"), Some("c"), Some("unseen"), None],
-        )];
-        let reference = Scalar::from(PlSmallStr::from_static("a"));
-        let definition = CategoricalDefinition::new(Some(reference));
-        let transform = definition.fit(&training)?;
-        let output = definition.transform(&transform, &input)?;
-
-        assert_output(
-            &definition,
-            &transform,
-            &input,
-            &output,
-            &[
-                &[Some(false), Some(true), Some(false), None, None],
-                &[Some(false), Some(false), Some(true), None, None],
-            ],
-        );
+        // Keep the same reference and unknown/null semantics for both lookups.
+        let levels = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+        for count in [3, 8, 9] {
+            let mut values = levels[..count]
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>();
+            values.push(None);
+            let training = [Column::new("group".into(), values)];
+            let input = [Column::new(
+                "group".into(),
+                [Some("a"), Some("b"), Some("c"), Some("unseen"), None],
+            )];
+            let reference = Scalar::from(PlSmallStr::from_static("a"));
+            let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
+            let output = fitted.transform(&input)?;
+            let mut expected = vec![
+                [Some(false), Some(true), Some(false), None, None],
+                [Some(false), Some(false), Some(true), None, None],
+            ];
+            expected
+                .extend((3..count).map(|_| [Some(false), Some(false), Some(false), None, None]));
+            let expected = expected
+                .iter()
+                .map(|values| values.as_slice())
+                .collect::<Vec<_>>();
+            assert_output(
+                &fitted.definition,
+                &fitted.state,
+                &input,
+                &output,
+                &expected,
+            );
+            let names = levels[1..count]
+                .iter()
+                .map(|level| format!("C(group, reference='a')[T.{level}]"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output
+                    .get_column_names()
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>(),
+                names
+            );
+        }
         Ok(())
     }
 
