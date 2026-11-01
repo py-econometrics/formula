@@ -78,8 +78,8 @@ impl Models {
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
-    fn select(&self, roles: Vec<Role>) -> PyResult<Self> {
-        let roles = roles.into_iter().map(Into::into).collect::<Vec<_>>();
+    fn select(&self, roles: RoleSelection) -> PyResult<Self> {
+        let roles = roles.into_roles();
 
         self.inner
             .select(&roles)
@@ -103,10 +103,11 @@ impl Model {
         self.inner.formula().to_string()
     }
 
-    fn frame(&self, role: Role) -> Option<PyDataFrame> {
+    fn frame(&self) -> PyResult<PyDataFrame> {
         self.inner
-            .expression(role.into())
-            .map(|expression| PyDataFrame(expression.frame().clone()))
+            .frame()
+            .map(PyDataFrame)
+            .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
     fn evaluate(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Self> {
@@ -115,8 +116,8 @@ impl Model {
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
-    fn select(&self, roles: Vec<Role>) -> PyResult<Self> {
-        let roles = roles.into_iter().map(Into::into).collect::<Vec<_>>();
+    fn select(&self, roles: RoleSelection) -> PyResult<Self> {
+        let roles = roles.into_roles();
 
         self.inner
             .select(&roles)
@@ -142,6 +143,21 @@ impl From<Role> for formula::Role {
             Role::Dependent => Self::Dependent,
             Role::Independent => Self::Independent,
             Role::FixedEffect => Self::FixedEffect,
+        }
+    }
+}
+
+#[derive(FromPyObject)]
+enum RoleSelection {
+    Single(Role),
+    Multiple(Vec<Role>),
+}
+
+impl RoleSelection {
+    fn into_roles(self) -> Vec<formula::Role> {
+        match self {
+            Self::Single(role) => vec![role.into()],
+            Self::Multiple(roles) => roles.into_iter().map(Into::into).collect(),
         }
     }
 }

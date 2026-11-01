@@ -5,6 +5,7 @@ use crate::formula::{
 };
 use crate::parse::{ParseResult, parse};
 use crate::transform::TransformError;
+use polars::error::PolarsResult;
 use polars::prelude::DataFrame;
 use std::collections::BTreeMap;
 use winnow::Parser;
@@ -15,18 +16,40 @@ use winnow::error::{ContextError, StrContext, StrContextValue};
 pub struct Model {
     formula: Formula,
     expressions: BTreeMap<Role, EvaluatedExpression>,
+    height: usize,
 }
 
 impl Model {
-    pub(crate) fn new(formula: Formula, expressions: BTreeMap<Role, EvaluatedExpression>) -> Self {
+    pub(crate) fn new(
+        formula: Formula,
+        expressions: BTreeMap<Role, EvaluatedExpression>,
+        height: usize,
+    ) -> Self {
+        debug_assert!(
+            expressions
+                .values()
+                .all(|expression| expression.frame().height() == height)
+        );
         Self {
             formula,
             expressions,
+            height,
         }
     }
 
     pub fn formula(&self) -> &Formula {
         &self.formula
+    }
+
+    pub fn frame(&self) -> PolarsResult<DataFrame> {
+        let columns = self
+            .expressions
+            .values()
+            .flat_map(|expression| expression.frame().columns())
+            .cloned()
+            .collect();
+
+        DataFrame::new(self.height, columns)
     }
 
     fn assemble(&self, height: usize, terms: &[EvaluatedTerm]) -> Result<Self, EvaluationError> {
@@ -41,7 +64,7 @@ impl Model {
             })
             .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
 
-        Ok(Self::new(self.formula.clone(), expressions))
+        Ok(Self::new(self.formula.clone(), expressions, height))
     }
 
     pub fn evaluate(&self, data: &DataFrame) -> Result<Self, EvaluationError> {
@@ -76,7 +99,7 @@ impl Model {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        Ok(Self::new(self.formula.clone(), expressions))
+        Ok(Self::new(self.formula.clone(), expressions, self.height))
     }
 }
 

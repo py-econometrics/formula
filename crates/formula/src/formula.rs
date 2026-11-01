@@ -467,7 +467,7 @@ impl Formula {
             })
             .collect::<Result<BTreeMap<_, _>, EvaluationError>>()?;
 
-        Ok(Model::new(self.clone(), expressions))
+        Ok(Model::new(self.clone(), expressions, height))
     }
 }
 

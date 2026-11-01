@@ -28,10 +28,11 @@ models = specification.materialize(data)  # Materialize specification given inpu
 model = models[0]  # Integer indexing follows expansion order
 same_model = models[model.formula]  # Look up an expanded model by its formula
 
-# Access materialized data by their role
-dependent = model.frame(formula.Role.Dependent)
-independent = model.frame(formula.Role.Independent)
-fixed_effects = model.frame(formula.Role.FixedEffect)
+# Access all materialized data or select specific roles
+frame = model.frame()
+dependent = model.select(formula.Role.Dependent).frame()
+independent = model.select(formula.Role.Independent).frame()
+fixed_effects = model.select(formula.Role.FixedEffect).frame()
 
 # Select roles before evaluating data that has no dependent column.
 predictors = models.select([formula.Role.Independent, formula.Role.FixedEffect])
@@ -41,9 +42,9 @@ predicted = predictors.evaluate(new_data)
 
 `parse` accepts one formula string or a sequence of strings and returns a
 `Specification`. Its `materialize` method returns one model per expanded formula.
-Each `frame(role)` returns a Polars `DataFrame`. `select` and `evaluate` return new models and retain fitted
-transform state. The returned frames preserve the input row count; callers decide
-which rows to retain.
+`frame()` returns a Polars `DataFrame` containing all selected roles. `select` and
+`evaluate` return new models and retain fitted transform state. Selecting an absent
+role raises `KeyError`.
 
 ## Rust API
 
@@ -82,15 +83,11 @@ fn main() {
 
     for model in &models {
         println!("Model {}", model.formula());
-        if let Some(dependent) = model.expression(Role::Dependent) {
-            println!("Dependent design:\n{}", dependent.frame());
-        }
-        if let Some(independent) = model.expression(Role::Independent) {
-            println!("Independent design:\n{}", independent.frame());
-        }
-        if let Some(fixed_effects) = model.expression(Role::FixedEffect) {
-            println!("Fixed effects:\n{}", fixed_effects.frame());
-        }
+        println!("Materialized frame:\n{}", model.frame().expect("valid frame"));
+        let independent = model
+            .select(&[Role::Independent])
+            .expect("independent role exists");
+        println!("Independent design:\n{}", independent.frame().expect("valid frame"));
     }
 }
 ```
@@ -122,8 +119,8 @@ y ~ 1 + x | firm         # Fixed effects suppress even an explicitly requested i
 ```
 
 Each grouping term produces one integer-coded column, available through
-`model.frame(formula.Role.FixedEffect)` in Python or
-`model.expression(Role::FixedEffect)` in Rust. Column names preserve the input column
+`model.select(formula.Role.FixedEffect).frame()` in Python or
+`model.select(&[Role::FixedEffect])?.frame()?` in Rust. Column names preserve the input column
 names and factor order: `firm:year` and `year:firm` retain their respective order.
 
 The pipe accepts column references, parentheses, formula operators, and stepwise
