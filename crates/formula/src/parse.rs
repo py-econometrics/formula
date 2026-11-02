@@ -285,63 +285,92 @@ fn combine_expressions(
 }
 
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_expression_with_context(ParseContext::Formula).parse_next(cursor)
+    parse_expression_with_context(ParseContext::Formula, None, 0).parse_next(cursor)
 }
 
 fn parse_expression_with_context<'i>(
     context: ParseContext,
+    initial: Option<&[Expression]>,
+    min_precedence: i64,
 ) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
     // Wrap parser factory in closure for deferred evaluation
     move |cursor: &mut &'i str| {
-        expression(parse_operand(context))
-            .infix(alt((
-                '+'.value(Left(
-                    SUM_PRECEDENCE,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.add(right)
-                        }))
-                    },
-                )),
-                '-'.value(Left(
-                    SUM_PRECEDENCE,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.subtract(right)
-                        }))
-                    },
-                )),
-                '*'.value(Left(
-                    PRODUCT_PRECEDENCE,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.interact_fully(right)
-                        }))
-                    },
-                )),
-                '/'.value(Left(
-                    PRODUCT_PRECEDENCE,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.nest(right)
-                        }))
-                    },
-                )),
-                ':'.value(Right(
-                    INTERACTION_PRECEDENCE,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.interact(&right)
-                        }))
-                    },
-                )),
-            )))
-            .parse_next(cursor)
+        // Make initial mutable so that it will be consumed during parsing
+        // This is needed because use parser factories `impl ModalParser` for more convenient combinators
+        let mut initial = initial;
+        expression(|cursor: &mut &'i str| {
+            // Consume initial if provided; subsequent calls will see None
+            let Some(initial) = initial.take() else {
+                // Combine operands in usual Pratt algorithm
+                return parse_operand(context).parse_next(cursor);
+            };
+            // Get first operator defaulting to +, e.g., `x1 + x2` -> `initial + x1 + x2`
+            let operator = preceded(multispace0, opt(one_of(['+', '-'])))
+                .parse_next(cursor)?
+                .unwrap_or('+');
+            // Combine initial with the first product; leave subsequent sums to the outer parser.
+            let right = parse_expression_with_context(context, None, PRODUCT_PRECEDENCE)
+                .parse_next(cursor)?;
+
+            Ok(combine_expressions(
+                initial,
+                &right,
+                |left, right| match operator {
+                    '+' => left.add(right),
+                    '-' => left.subtract(right),
+                    _ => unreachable!(),
+                },
+            ))
+        })
+        .infix(alt((
+            '+'.value(Left(
+                SUM_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.add(right)
+                    }))
+                },
+            )),
+            '-'.value(Left(
+                SUM_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.subtract(right)
+                    }))
+                },
+            )),
+            '*'.value(Left(
+                PRODUCT_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.interact_fully(right)
+                    }))
+                },
+            )),
+            '/'.value(Left(
+                PRODUCT_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.nest(right)
+                    }))
+                },
+            )),
+            ':'.value(Right(
+                INTERACTION_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.interact(&right)
+                    }))
+                },
+            )),
+        )))
+        .current_precedence_level(min_precedence)
+        .parse_next(cursor)
     }
 }
 
 fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_expression_with_context(ParseContext::FixedEffects).parse_next(cursor)
+    parse_expression_with_context(ParseContext::FixedEffects, None, 0).parse_next(cursor)
 }
 
 fn parse_stepwise_arguments<'i>(
@@ -352,7 +381,7 @@ fn parse_stepwise_arguments<'i>(
 
         let arguments = separated(
             1..,
-            cut_err(parse_expression_with_context(context)),
+            cut_err(parse_expression_with_context(context, None, 0)),
             (multispace0, ',', multispace0),
         )
         .parse_next(cursor)?;
@@ -424,7 +453,8 @@ fn parse_expression_parenthesized<'i>(
     move |cursor: &mut &'i str| {
         '('.parse_next(cursor)?;
 
-        let expressions = cut_err(parse_expression_with_context(context)).parse_next(cursor)?;
+        let expressions =
+            cut_err(parse_expression_with_context(context, None, 0)).parse_next(cursor)?;
 
         cut_err(
             ')'.context(StrContext::Expected(StrContextValue::Description(
@@ -483,8 +513,16 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
 
     multispace0.parse_next(cursor)?;
 
-    let right = cut_err(parse_expression.context(StrContext::Label("right-hand expression")))
-        .parse_next(cursor)?;
+    let right = cut_err(
+        parse_expression_with_context(
+            ParseContext::Formula,
+            // Seed expression with an intercept
+            Some(&[Expression::from(Term::intercept())]),
+            0,
+        )
+        .context(StrContext::Label("right-hand expression")),
+    )
+    .parse_next(cursor)?;
 
     let fixed_effects = opt(preceded(
         FIXED_EFFECT_SEPARATOR,
@@ -1413,6 +1451,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn leading_subtraction_uses_the_initial_intercept() {
+        for (source, explicit) in [
+            ("y ~ -x + x*z", "y ~ 1 - x + x*z"),
+            ("y ~ -(x + 1)", "y ~ 1 - (x + 1)"),
+            ("y ~ -1x", "y ~ 1 - 1x"),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(explicit).unwrap(), "{source}");
+        }
+    }
+
     mod errors {
         use super::*;
 
@@ -1799,13 +1848,6 @@ mod tests {
                 "/a",
             ] {
                 assert!(parse_expression.parse(source).is_err(), "{source:?}");
-            }
-        }
-
-        #[test]
-        fn leading_minus_only_accepts_intercept() {
-            for source in ["y ~ -x + x*z", "y ~ -(x + 1)", "y ~ -1x"] {
-                assert!(parse(source).is_err(), "{source}");
             }
         }
 
