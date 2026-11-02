@@ -1065,6 +1065,9 @@ mod tests {
 
     #[test]
     fn quoted_numbers_are_columns_not_intercepts_or_literals() {
+        let zero = parse_expression.parse("`0`").unwrap();
+        assert_eq!(zero, vec![expression(&[&["0"]])]);
+        assert_ne!(zero, parse_expression.parse("0").unwrap());
         let column = parse_expression.parse("`1`").unwrap();
         assert_eq!(column, vec![expression(&[&["1"]])]);
         assert_ne!(column, parse_expression.parse("1").unwrap());
@@ -1187,6 +1190,7 @@ mod tests {
             ("y ~ csw0(x, z):w - 1", &["y~1-1", "y~x:w-1", "y~x:w+z:w-1"]),
             ("y ~ sw(a, b)/c", &["y~a+a:c", "y~b+b:c"]),
             ("y ~ sw(1, x - 1)", &["y~1", "y~x"]),
+            ("y ~ sw(0 + x, z)", &["y~x", "y~z"]),
         ];
 
         for &(source, expected) in cases {

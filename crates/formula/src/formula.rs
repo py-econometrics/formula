@@ -2226,6 +2226,8 @@ mod tests {
         let cases: &[(&str, &[&str])] = &[
             ("y ~ (x - 1)", &["Intercept", "x"]),
             ("y ~ (1 + x - 1)", &["Intercept", "x"]),
+            ("y ~ (-1 + x)", &["Intercept", "x"]),
+            ("y ~ (0 + x)", &["Intercept", "x"]),
             ("y ~ x - (z + 1)", &["x"]),
         ];
         for &(source, expected) in cases {
