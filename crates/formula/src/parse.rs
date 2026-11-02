@@ -151,7 +151,7 @@ fn parse_intercept(cursor: &mut &str) -> ModalResult<SignedNode> {
     take_while(1.., is_identifier_character)
         .verify(|name: &str| matches!(name, "0" | "1"))
         .map(|name: &str| {
-            let node = SignedNode::positive(AstNode::Term(Term::intercept()));
+            let node = SignedNode::from(Term::intercept());
 
             if name == "0" { node.negate() } else { node }
         })
@@ -375,6 +375,12 @@ struct SignedNode {
     node: AstNode,
 }
 
+impl From<Term> for SignedNode {
+    fn from(term: Term) -> Self {
+        Self::positive(AstNode::Term(term))
+    }
+}
+
 impl SignedNode {
     fn add(self, other: Self) -> Self {
         match self {
@@ -581,10 +587,7 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedN
                 parse_node_parenthesized(context),
                 parse_stepwise(context),
                 parse_intercept,
-                factor
-                    .map(Term::from)
-                    .map(AstNode::Term)
-                    .map(SignedNode::positive),
+                factor.map(Term::from).map(SignedNode::from),
             )),
             multispace0,
         )
@@ -1612,8 +1615,8 @@ mod tests {
         use super::*;
         #[test]
         fn signed_ast_evaluation_preserves_operations_and_grouping() {
-            let x = || SignedNode::positive(AstNode::Term(Term::from(Factor::from("x"))));
-            let intercept = || SignedNode::positive(AstNode::Term(Term::intercept()));
+            let x = || SignedNode::from(Term::from(Factor::from("x")));
+            let intercept = || SignedNode::from(Term::intercept());
             let seed = [Expression::from(Term::intercept())];
 
             // x - 1 removes the RHS seed.
