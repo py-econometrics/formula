@@ -1139,7 +1139,8 @@ mod tests {
             ("y ~ x + sw(x, x+x, z)", &["y~x", "y~x+z"]),
             ("sw(y1, y1, y2) ~ sw(x, x)", &["y1~x", "y2~x"]),
             ("y ~ sw(x:z, z:x)", &["y~x:z"]),
-            ("y ~ sw(x+z, z+x)", &["y~x+z", "y~z+x"]),
+            ("y ~ sw(x+z, z+x)", &["y~x+z"]),
+            ("y ~ sw(z+x, x+z)", &["y~z+x"]),
             ("sw(y, y-1) ~ x", &["y~x"]),
         ];
 

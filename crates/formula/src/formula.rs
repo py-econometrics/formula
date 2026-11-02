@@ -303,9 +303,18 @@ impl Term {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Expression {
     terms: Vec<Term>,
+}
+
+// Expression identity ignores term order.
+// This comparison relies on expressions containing no duplicate terms.
+impl PartialEq for Expression {
+    fn eq(&self, other: &Self) -> bool {
+        self.terms.len() == other.terms.len()
+            && self.terms.iter().all(|term| other.terms.contains(term))
+    }
 }
 
 impl FromIterator<Term> for Expression {
@@ -839,6 +848,8 @@ mod tests {
         for source in [
             "y ~ x",
             "y ~ x - 1",
+            "y ~ x - 1 + 1",
+            "y ~ x - 1 + 1 + z",
             "y ~ C(`group name`, reference='a') + poly(x, degree=2)",
             "`outcome value` ~ log(`1`) + add(x, 2.0)",
             "y ~ x | firm:year",

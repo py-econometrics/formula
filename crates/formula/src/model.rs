@@ -568,6 +568,45 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_formulas_preserve_the_first_models_column_order() {
+        let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["y ~ x + z", "y ~ z + x"], &["Intercept", "x", "z"]),
+            (&["y ~ z + x", "y ~ x + z"], &["Intercept", "z", "x"]),
+            (&["y ~ x - 1 + 1", "y ~ x + 1"], &["x", "Intercept"]),
+            (&["y ~ x + 1", "y ~ x - 1 + 1"], &["Intercept", "x"]),
+        ];
+
+        for &(sources, expected_columns) in cases {
+            let models = crate::parse_many(sources.iter().copied())
+                .unwrap()
+                .fit(&data)
+                .unwrap();
+            assert_eq!(models.len(), 1, "{sources:?}");
+            let first = models.iter().next().unwrap();
+            assert_eq!(
+                first
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                expected_columns,
+                "{sources:?}"
+            );
+
+            for source in sources {
+                let found = models.get_by_str(source).unwrap().unwrap();
+                assert!(std::ptr::eq(found, first), "{source}");
+            }
+            let rendered = first.formula().to_string();
+            assert!(std::ptr::eq(
+                models.get_by_str(&rendered).unwrap().unwrap(),
+                first,
+            ));
+        }
+    }
+
+    #[test]
     fn models_lookup_by_string() {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
         let specification = crate::parse("y ~ sw(x, z)").unwrap();
