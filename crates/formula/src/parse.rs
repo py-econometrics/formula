@@ -282,14 +282,12 @@ fn combine_expressions(
 }
 
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_expression_with_context(ParseContext::Formula)
+    parse_node(ParseContext::Formula)
         .map(|node| node.evaluate())
         .parse_next(cursor)
 }
 
-fn parse_expression_with_context<'i>(
-    context: ParseContext,
-) -> impl ModalParser<&'i str, SignedNode, ContextError> {
+fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedNode, ContextError> {
     // Wrap parser factory in closure for deferred evaluation
     move |cursor: &mut &'i str| {
         expression(parse_operand(context))
@@ -329,7 +327,7 @@ fn parse_expression_with_context<'i>(
 }
 
 fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_expression_with_context(ParseContext::FixedEffects)
+    parse_node(ParseContext::FixedEffects)
         .map(|node| node.evaluate())
         .parse_next(cursor)
 }
@@ -342,7 +340,7 @@ fn parse_stepwise_arguments<'i>(
 
         let arguments = separated(
             1..,
-            cut_err(parse_expression_with_context(context)),
+            cut_err(parse_node(context)),
             (multispace0, ',', multispace0),
         )
         .parse_next(cursor)?;
@@ -550,13 +548,13 @@ fn parse_stepwise<'i>(
     }
 }
 
-fn parse_expression_parenthesized<'i>(
+fn parse_node_parenthesized<'i>(
     context: ParseContext,
 ) -> impl ModalParser<&'i str, SignedNode, ContextError> {
     move |cursor: &mut &'i str| {
         '('.parse_next(cursor)?;
 
-        let node = cut_err(parse_expression_with_context(context)).parse_next(cursor)?;
+        let node = cut_err(parse_node(context)).parse_next(cursor)?;
 
         cut_err(
             ')'.context(StrContext::Expected(StrContextValue::Description(
@@ -579,7 +577,7 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedN
         delimited(
             multispace0,
             alt((
-                parse_expression_parenthesized(context),
+                parse_node_parenthesized(context),
                 parse_stepwise(context),
                 parse_intercept,
                 factor
@@ -608,7 +606,7 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     multispace0.parse_next(cursor)?;
 
     let right = cut_err(
-        parse_expression_with_context(ParseContext::Formula)
+        parse_node(ParseContext::Formula)
             .map(|node| node.evaluate_from(&[Expression::from(Term::intercept())]))
             .context(StrContext::Label("right-hand expression")),
     )
