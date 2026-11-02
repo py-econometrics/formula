@@ -153,13 +153,6 @@ fn parse_intercept(cursor: &mut &str) -> ModalResult<Expression> {
         .parse_next(cursor)
 }
 
-// Support a leading suppressed intercept, e.g., `y ~ -1 + x`
-fn parse_suppressed_intercept(cursor: &mut &str) -> ModalResult<Expression> {
-    preceded(('-', multispace0), parse_intercept)
-        .map(|intercept| Expression::from_iter([]).subtract(intercept))
-        .parse_next(cursor)
-}
-
 fn has_float_marker(token: &str) -> bool {
     token.contains('.') || token.contains('e') || token.contains('E')
 }
@@ -482,7 +475,6 @@ fn parse_operand<'i>(
                 parse_expression_parenthesized(context),
                 parse_stepwise(context),
                 alt((
-                    parse_suppressed_intercept,
                     parse_intercept,
                     factor.map(Term::from).map(Expression::from),
                 ))
@@ -534,18 +526,12 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     .map(encode_fixed_effects)
     .collect::<Vec<_>>();
 
-    let left = left
-        .into_iter()
-        // By default no intercept on the left-hand expression of a formula
-        .map(|expression| expression.resolve_intercept(false))
-        .collect::<Vec<_>>();
-
     let mut formulas = Vec::new();
     for left in &left {
         for right in &right {
             for fixed_effects in &fixed_effects {
                 let right = if fixed_effects.is_empty() {
-                    right.clone().resolve_intercept(true)
+                    right.clone()
                 } else {
                     // Suppress intercept in fixed-effect specifications
                     right.clone().without_intercept()
@@ -888,8 +874,8 @@ mod tests {
             vec![Expression::from(Term::intercept())],
         );
         assert_eq!(
-            parse_expression.parse("-1").unwrap(),
-            vec![Expression::from_iter([]).subtract(Expression::from(Term::intercept()))],
+            parse_expression.parse("1 - 1").unwrap(),
+            vec![Expression::from_iter([])],
         );
     }
 
@@ -970,7 +956,10 @@ mod tests {
                     .map(|right| Formula {
                         expressions: BTreeMap::from([
                             (Role::Dependent, expression(&[&["outcome value"]])),
-                            (Role::Independent, right.resolve_intercept(true)),
+                            (
+                                Role::Independent,
+                                Expression::from(Term::intercept()).add(right),
+                            ),
                             (Role::FixedEffect, Expression::from_iter([])),
                         ]),
                     })
@@ -1094,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_estimation_expands_both_sides_and_resolves_intercepts() {
+    fn multiple_estimation_expands_both_sides_with_the_rhs_seed() {
         let cases: &[(&str, &[&str])] = &[
             (
                 "sw(y1, y2) ~ a + sw(x, z)",
@@ -1107,7 +1096,7 @@ mod tests {
             ("y ~ sw0(x):z - 1", &["y~z-1", "y~x:z-1"]),
             ("y ~ csw0(x, z):w - 1", &["y~w-1", "y~x:w-1", "y~x:w+z:w-1"]),
             ("y ~ sw(a, b)/c", &["y~a+a:c", "y~b+b:c"]),
-            ("y ~ sw(1, x - 1)", &["y~1", "y~x-1"]),
+            ("y ~ sw(1, x - 1)", &["y~1", "y~x"]),
         ];
 
         for &(source, expected) in cases {
@@ -1130,7 +1119,7 @@ mod tests {
             ("sw(y1, y1, y2) ~ sw(x, x)", &["y1~x", "y2~x"]),
             ("y ~ sw(x:z, z:x)", &["y~x:z"]),
             ("y ~ sw(x+z, z+x)", &["y~x+z", "y~z+x"]),
-            ("sw(y, y-1) ~ x", &["y~x", "y-1~x"]),
+            ("sw(y, y-1) ~ x", &["y~x"]),
         ];
 
         for &(source, expected) in cases {
@@ -1260,10 +1249,7 @@ mod tests {
             Specification::new(vec![Formula {
                 expressions: BTreeMap::from([
                     (Role::Dependent, expression(&[&["sw"]])),
-                    (
-                        Role::Independent,
-                        expression(&[&["csw0"], &["sw0x"]]).resolve_intercept(true),
-                    ),
+                    (Role::Independent, expression(&[&[], &["csw0"], &["sw0x"]])),
                     (Role::FixedEffect, Expression::from_iter([])),
                 ]),
             }]),
@@ -1351,17 +1337,29 @@ mod tests {
     }
 
     #[test]
-    fn nesting_preserves_intercept_suppression() {
-        for (source, expanded) in [
-            ("y ~ a/b - 1", "y ~ a + a:b - 1"),
-            ("y ~ (a - 1)/b", "y ~ a + a:b - 1"),
-            ("y ~ a/(b - 1)", "y ~ a + a:b - 1"),
+    fn nesting_keeps_intercept_subtraction_local_to_its_expression() {
+        for (source, expanded, expected) in [
+            (
+                "y ~ a/b - 1",
+                "y ~ a + a:b - 1",
+                expression(&[&["a"], &["a", "b"]]),
+            ),
+            (
+                "y ~ (a - 1)/b",
+                "y ~ a + a:b",
+                expression(&[&[], &["a"], &["a", "b"]]),
+            ),
+            (
+                "y ~ a/(b - 1)",
+                "y ~ a + a:b",
+                expression(&[&[], &["a"], &["a", "b"]]),
+            ),
         ] {
             let actual = parse(source).unwrap();
             assert_eq!(actual, parse(expanded).unwrap(), "{source}");
             assert_eq!(
                 actual.formulas()[0].expressions[&Role::Independent],
-                expression(&[&["a"], &["a", "b"]]).subtract(Expression::from(Term::intercept())),
+                expected,
                 "{source}"
             );
         }
@@ -1464,6 +1462,14 @@ mod tests {
 
     mod errors {
         use super::*;
+
+        #[test]
+        fn leading_subtraction_requires_an_initial_seed() {
+            assert!(parse_expression.parse("-1").is_err());
+            for source in ["y ~ (-1 + x)", "y ~ (-x + z)", "y ~ sw(-1 + x, z)"] {
+                assert!(parse(source).is_err(), "{source}");
+            }
+        }
 
         #[test]
         fn formula_boundaries_report_context_and_offsets() {

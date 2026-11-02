@@ -306,14 +306,12 @@ impl Term {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Expression {
     terms: Vec<Term>,
-    suppress_intercept: bool,
 }
 
 impl FromIterator<Term> for Expression {
     fn from_iter<T: IntoIterator<Item = Term>>(terms: T) -> Self {
         Self {
             terms: collect_unique(terms),
-            suppress_intercept: false,
         }
     }
 }
@@ -322,27 +320,17 @@ impl From<Term> for Expression {
     fn from(term: Term) -> Self {
         Self {
             terms: Vec::from([term]),
-            suppress_intercept: false,
         }
     }
 }
 
 impl Expression {
     fn render(&self) -> String {
-        let terms = self
-            .terms
+        self.terms
             .iter()
             .map(Term::render)
             .collect::<Vec<_>>()
-            .join(" + ");
-
-        if !self.suppress_intercept {
-            terms
-        } else if terms.is_empty() {
-            "-1".to_owned()
-        } else {
-            format!("{terms} - 1")
-        }
+            .join(" + ")
     }
     fn has_intercept(&self) -> bool {
         self.terms.iter().any(Term::is_intercept)
@@ -352,18 +340,8 @@ impl Expression {
         self.terms.is_empty()
     }
 
-    pub(crate) fn resolve_intercept(mut self, include: bool) -> Self {
-        let include_intercept = !self.suppress_intercept && (include || self.has_intercept());
-        self.terms.retain(|term| !term.is_intercept());
-        if include_intercept {
-            self.terms.insert(0, Term::intercept());
-        }
-        self
-    }
-
-    pub(crate) fn without_intercept(mut self) -> Self {
-        self.suppress_intercept = true;
-        self.resolve_intercept(false)
+    pub(crate) fn without_intercept(self) -> Self {
+        self.subtract(Term::intercept())
     }
 
     fn validate(&self) -> Result<(), ValidationError> {
@@ -386,10 +364,7 @@ impl Expression {
             columns.extend(entry.columns.iter().cloned());
         }
 
-        let expression = Self {
-            terms,
-            suppress_intercept: self.suppress_intercept,
-        };
+        let expression = Self { terms };
 
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
 
@@ -400,12 +375,10 @@ impl Expression {
         let other = other.into();
         Self {
             terms: collect_unique(self.terms.into_iter().chain(other.terms)),
-            suppress_intercept: self.suppress_intercept || other.suppress_intercept,
         }
     }
     pub(crate) fn subtract(mut self, other: impl Into<Self>) -> Self {
         let other = other.into();
-        self.suppress_intercept |= other.suppress_intercept || other.has_intercept();
         self.terms.retain(|term| !other.terms.contains(term));
         self
     }
@@ -416,7 +389,6 @@ impl Expression {
                     .iter()
                     .flat_map(|left| other.terms.iter().map(move |right| left.interact(right))),
             ),
-            suppress_intercept: self.suppress_intercept || other.suppress_intercept,
         }
     }
     pub(crate) fn interact_fully(self, other: Self) -> Self {
@@ -437,7 +409,6 @@ impl Expression {
             } else {
                 vec![factors]
             },
-            suppress_intercept: self.suppress_intercept,
         };
         let interactions = combined.interact(&other);
         self.add(interactions)
@@ -483,6 +454,12 @@ impl std::fmt::Display for Formula {
             dependent.render(),
             independent.render()
         )?;
+
+        if independent.is_empty() {
+            write!(f, "-1")?;
+        } else if !independent.has_intercept() {
+            write!(f, " - 1")?;
+        }
 
         if !fixed_effects.is_empty() {
             write!(
@@ -2200,9 +2177,16 @@ mod tests {
     }
 
     #[test]
-    fn intercept_suppression_survives_later_addition() {
+    fn intercept_addition_and_subtraction_follow_term_order() {
         let data = polars::df!("y" => [2.0], "x" => [3.0]).unwrap();
-        for source in ["y ~ -1 + x", "y ~ - 1 + x", "y ~ x - 1", "y ~ x - 1 + 1"] {
+        let cases: &[(&str, &[&str])] = &[
+            ("y ~ -1 + x", &["x"]),
+            ("y ~ - 1 + x", &["x"]),
+            ("y ~ x - 1", &["x"]),
+            ("y ~ x - 1 + 1", &["x", "Intercept"]),
+            ("y ~ x - 1 + 1 - 1", &["x"]),
+        ];
+        for &(source, expected) in cases {
             let model = fit(source, &data);
             assert_eq!(
                 model
@@ -2210,16 +2194,21 @@ mod tests {
                     .unwrap()
                     .frame()
                     .get_column_names(),
-                ["x"],
+                expected,
                 "{source}"
             );
         }
     }
 
     #[test]
-    fn grouped_subtraction_suppresses_intercept() {
+    fn grouped_subtraction_keeps_intercept_removal_local() {
         let data = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
-        for source in ["y ~ (x - 1)", "y ~ (-1 + x)", "y ~ x - (z + 1)"] {
+        let cases: &[(&str, &[&str])] = &[
+            ("y ~ (x - 1)", &["Intercept", "x"]),
+            ("y ~ (1 + x - 1)", &["Intercept", "x"]),
+            ("y ~ x - (z + 1)", &["x"]),
+        ];
+        for &(source, expected) in cases {
             let model = fit(source, &data);
             assert_eq!(
                 model
@@ -2227,7 +2216,7 @@ mod tests {
                     .unwrap()
                     .frame()
                     .get_column_names(),
-                ["x"],
+                expected,
                 "{source}"
             );
         }
