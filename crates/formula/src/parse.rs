@@ -20,6 +20,9 @@ use winnow::{ModalParser, ModalResult, Parser};
 
 pub(crate) const FORMULA_SEPARATOR: char = '~';
 pub(crate) const FIXED_EFFECT_SEPARATOR: char = '|';
+const SUM_PRECEDENCE: i64 = 10;
+const PRODUCT_PRECEDENCE: i64 = 20;
+const INTERACTION_PRECEDENCE: i64 = 30;
 
 #[derive(Debug)]
 struct TransformCall {
@@ -293,7 +296,7 @@ fn parse_expression_with_context<'i>(
         expression(parse_operand(context))
             .infix(alt((
                 '+'.value(Left(
-                    10,
+                    SUM_PRECEDENCE,
                     |_, left: Vec<Expression>, right: Vec<Expression>| {
                         Ok(combine_expressions(&left, &right, |left, right| {
                             left.add(right)
@@ -301,7 +304,7 @@ fn parse_expression_with_context<'i>(
                     },
                 )),
                 '-'.value(Left(
-                    10,
+                    SUM_PRECEDENCE,
                     |_, left: Vec<Expression>, right: Vec<Expression>| {
                         Ok(combine_expressions(&left, &right, |left, right| {
                             left.subtract(right)
@@ -309,7 +312,7 @@ fn parse_expression_with_context<'i>(
                     },
                 )),
                 '*'.value(Left(
-                    20,
+                    PRODUCT_PRECEDENCE,
                     |_, left: Vec<Expression>, right: Vec<Expression>| {
                         Ok(combine_expressions(&left, &right, |left, right| {
                             left.interact_fully(right)
@@ -317,7 +320,7 @@ fn parse_expression_with_context<'i>(
                     },
                 )),
                 '/'.value(Left(
-                    20,
+                    PRODUCT_PRECEDENCE,
                     |_, left: Vec<Expression>, right: Vec<Expression>| {
                         Ok(combine_expressions(&left, &right, |left, right| {
                             left.nest(right)
@@ -325,7 +328,7 @@ fn parse_expression_with_context<'i>(
                     },
                 )),
                 ':'.value(Right(
-                    30,
+                    INTERACTION_PRECEDENCE,
                     |_, left: Vec<Expression>, right: Vec<Expression>| {
                         Ok(combine_expressions(&left, &right, |left, right| {
                             left.interact(&right)
