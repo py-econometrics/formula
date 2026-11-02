@@ -1,6 +1,6 @@
 # formula
 
-`formula` is  [`Polars`](https://pola.rs)-powerd implementation of Wilkinson formulas in Rust with a Python API. It parses formula strings and constructs data frames for regression
+`formula` is  [`Polars`](https://pola.rs)-powered implementation of Wilkinson formulas in Rust with a Python API. It parses formula strings and constructs data frames for regression
 analysis. It is primarily designed for [`PyFixest`](https://github.com/py-econometrics/pyfixest).
 
 > [!NOTE]
