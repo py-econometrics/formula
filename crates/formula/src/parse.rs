@@ -20,6 +20,9 @@ use winnow::{ModalParser, ModalResult, Parser};
 
 pub(crate) const FORMULA_SEPARATOR: char = '~';
 pub(crate) const FIXED_EFFECT_SEPARATOR: char = '|';
+const SUM_PRECEDENCE: i64 = 10;
+const PRODUCT_PRECEDENCE: i64 = 20;
+const INTERACTION_PRECEDENCE: i64 = 30;
 
 #[derive(Debug)]
 struct TransformCall {
@@ -150,13 +153,6 @@ fn parse_intercept(cursor: &mut &str) -> ModalResult<Expression> {
         .parse_next(cursor)
 }
 
-// Support a leading suppressed intercept, e.g., `y ~ -1 + x`
-fn parse_suppressed_intercept(cursor: &mut &str) -> ModalResult<Expression> {
-    preceded(('-', multispace0), parse_intercept)
-        .map(|intercept| Expression::from_iter([]).subtract(intercept))
-        .parse_next(cursor)
-}
-
 fn has_float_marker(token: &str) -> bool {
     token.contains('.') || token.contains('e') || token.contains('E')
 }
@@ -282,63 +278,92 @@ fn combine_expressions(
 }
 
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_expression_with_context(ParseContext::Formula).parse_next(cursor)
+    parse_expression_with_context(ParseContext::Formula, None, 0).parse_next(cursor)
 }
 
 fn parse_expression_with_context<'i>(
     context: ParseContext,
+    initial: Option<&[Expression]>,
+    min_precedence: i64,
 ) -> impl ModalParser<&'i str, Vec<Expression>, ContextError> {
     // Wrap parser factory in closure for deferred evaluation
     move |cursor: &mut &'i str| {
-        expression(parse_operand(context))
-            .infix(alt((
-                '+'.value(Left(
-                    10,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.add(right)
-                        }))
-                    },
-                )),
-                '-'.value(Left(
-                    10,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.subtract(right)
-                        }))
-                    },
-                )),
-                '*'.value(Left(
-                    20,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.interact_fully(right)
-                        }))
-                    },
-                )),
-                '/'.value(Left(
-                    20,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.nest(right)
-                        }))
-                    },
-                )),
-                ':'.value(Right(
-                    30,
-                    |_, left: Vec<Expression>, right: Vec<Expression>| {
-                        Ok(combine_expressions(&left, &right, |left, right| {
-                            left.interact(&right)
-                        }))
-                    },
-                )),
-            )))
-            .parse_next(cursor)
+        // Make initial mutable so that it will be consumed during parsing
+        // This is needed because use parser factories `impl ModalParser` for more convenient combinators
+        let mut initial = initial;
+        expression(|cursor: &mut &'i str| {
+            // Consume initial if provided; subsequent calls will see None
+            let Some(initial) = initial.take() else {
+                // Combine operands in usual Pratt algorithm
+                return parse_operand(context).parse_next(cursor);
+            };
+            // Get first operator defaulting to +, e.g., `x1 + x2` -> `initial + x1 + x2`
+            let operator = preceded(multispace0, opt(one_of(['+', '-'])))
+                .parse_next(cursor)?
+                .unwrap_or('+');
+            // Combine initial with the first product; leave subsequent sums to the outer parser.
+            let right = parse_expression_with_context(context, None, PRODUCT_PRECEDENCE)
+                .parse_next(cursor)?;
+
+            Ok(combine_expressions(
+                initial,
+                &right,
+                |left, right| match operator {
+                    '+' => left.add(right),
+                    '-' => left.subtract(right),
+                    _ => unreachable!(),
+                },
+            ))
+        })
+        .infix(alt((
+            '+'.value(Left(
+                SUM_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.add(right)
+                    }))
+                },
+            )),
+            '-'.value(Left(
+                SUM_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.subtract(right)
+                    }))
+                },
+            )),
+            '*'.value(Left(
+                PRODUCT_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.interact_fully(right)
+                    }))
+                },
+            )),
+            '/'.value(Left(
+                PRODUCT_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.nest(right)
+                    }))
+                },
+            )),
+            ':'.value(Right(
+                INTERACTION_PRECEDENCE,
+                |_, left: Vec<Expression>, right: Vec<Expression>| {
+                    Ok(combine_expressions(&left, &right, |left, right| {
+                        left.interact(&right)
+                    }))
+                },
+            )),
+        )))
+        .current_precedence_level(min_precedence)
+        .parse_next(cursor)
     }
 }
 
 fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_expression_with_context(ParseContext::FixedEffects).parse_next(cursor)
+    parse_expression_with_context(ParseContext::FixedEffects, None, 0).parse_next(cursor)
 }
 
 fn parse_stepwise_arguments<'i>(
@@ -349,7 +374,7 @@ fn parse_stepwise_arguments<'i>(
 
         let arguments = separated(
             1..,
-            cut_err(parse_expression_with_context(context)),
+            cut_err(parse_expression_with_context(context, None, 0)),
             (multispace0, ',', multispace0),
         )
         .parse_next(cursor)?;
@@ -408,7 +433,7 @@ fn parse_stepwise<'i>(
         };
 
         if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
-            expressions.insert(0, Expression::from(Term::intercept()));
+            expressions.insert(0, Expression::from_iter([]));
         }
 
         Ok(expressions)
@@ -421,7 +446,8 @@ fn parse_expression_parenthesized<'i>(
     move |cursor: &mut &'i str| {
         '('.parse_next(cursor)?;
 
-        let expressions = cut_err(parse_expression_with_context(context)).parse_next(cursor)?;
+        let expressions =
+            cut_err(parse_expression_with_context(context, None, 0)).parse_next(cursor)?;
 
         cut_err(
             ')'.context(StrContext::Expected(StrContextValue::Description(
@@ -449,7 +475,6 @@ fn parse_operand<'i>(
                 parse_expression_parenthesized(context),
                 parse_stepwise(context),
                 alt((
-                    parse_suppressed_intercept,
                     parse_intercept,
                     factor.map(Term::from).map(Expression::from),
                 ))
@@ -480,8 +505,16 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
 
     multispace0.parse_next(cursor)?;
 
-    let right = cut_err(parse_expression.context(StrContext::Label("right-hand expression")))
-        .parse_next(cursor)?;
+    let right = cut_err(
+        parse_expression_with_context(
+            ParseContext::Formula,
+            // Seed expression with an intercept
+            Some(&[Expression::from(Term::intercept())]),
+            0,
+        )
+        .context(StrContext::Label("right-hand expression")),
+    )
+    .parse_next(cursor)?;
 
     let fixed_effects = opt(preceded(
         FIXED_EFFECT_SEPARATOR,
@@ -493,18 +526,12 @@ fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     .map(encode_fixed_effects)
     .collect::<Vec<_>>();
 
-    let left = left
-        .into_iter()
-        // By default no intercept on the left-hand expression of a formula
-        .map(|expression| expression.resolve_intercept(false))
-        .collect::<Vec<_>>();
-
     let mut formulas = Vec::new();
     for left in &left {
         for right in &right {
             for fixed_effects in &fixed_effects {
                 let right = if fixed_effects.is_empty() {
-                    right.clone().resolve_intercept(true)
+                    right.clone()
                 } else {
                     // Suppress intercept in fixed-effect specifications
                     right.clone().without_intercept()
@@ -668,7 +695,7 @@ mod tests {
             ),
             (
                 "sw0(f1):f2",
-                vec![expression(&[&["f2"]]), expression(&[&["f1", "f2"]])],
+                vec![expression(&[]), expression(&[&["f1", "f2"]])],
             ),
             ("`log(x)`", vec![expression(&[&["log(x)"]])]),
         ] {
@@ -700,7 +727,7 @@ mod tests {
             ("y ~ x | sw0(f)", &["y ~ x", "y ~ x | f"]),
             (
                 "y ~ sw(x, z) | sw0(f1):f2",
-                &["y ~ x | f2", "y ~ x | f1:f2", "y ~ z | f2", "y ~ z | f1:f2"],
+                &["y ~ x", "y ~ x | f1:f2", "y ~ z", "y ~ z | f1:f2"],
             ),
         ];
         for &(source, expanded) in cases {
@@ -847,8 +874,8 @@ mod tests {
             vec![Expression::from(Term::intercept())],
         );
         assert_eq!(
-            parse_expression.parse("-1").unwrap(),
-            vec![Expression::from_iter([]).subtract(Expression::from(Term::intercept()))],
+            parse_expression.parse("1 - 1").unwrap(),
+            vec![Expression::from_iter([])],
         );
     }
 
@@ -929,7 +956,10 @@ mod tests {
                     .map(|right| Formula {
                         expressions: BTreeMap::from([
                             (Role::Dependent, expression(&[&["outcome value"]])),
-                            (Role::Independent, right.resolve_intercept(true)),
+                            (
+                                Role::Independent,
+                                Expression::from(Term::intercept()).add(right),
+                            ),
                             (Role::FixedEffect, Expression::from_iter([])),
                         ]),
                     })
@@ -981,9 +1011,9 @@ mod tests {
     fn stepwise_operators_expand_in_order() {
         let cases: &[(&str, &[&str])] = &[
             ("sw(x, z)", &["x", "z"]),
-            ("sw0(x, z)", &["1", "x", "z"]),
+            ("sw0(x, z)", &["1-1", "x", "z"]),
             ("csw(x, z)", &["x", "x + z"]),
-            ("csw0(x, z)", &["1", "x", "x + z"]),
+            ("csw0(x, z)", &["1-1", "x", "x + z"]),
             ("sw(x)", &["x"]),
             ("sw( x + y,\n log(z) )", &["x + y", "log(z)"]),
             ("sw(x, sw(y, z))", &["x", "y", "z"]),
@@ -992,7 +1022,7 @@ mod tests {
                 &["x", "y", "x+z", "x+w", "y+z", "y+w"],
             ),
             ("sw(csw(x, y), z)", &["x", "x+y", "z"]),
-            ("csw0(x + y, z)", &["1", "x+y", "x+y+z"]),
+            ("csw0(x + y, z)", &["1-1", "x+y", "x+y+z"]),
         ];
 
         for &(source, expected) in cases {
@@ -1023,10 +1053,11 @@ mod tests {
             ("sw(x+y, z):w", &["x:w+y:w", "z:w"]),
             ("a - sw(x, a)", &["a", "a-a"]),
             ("sw(x, y)*z", &["x*z", "y*z"]),
-            ("sw0(x)*z", &["1+z", "x*z"]),
-            ("sw0(x):z", &["z", "x:z"]),
-            ("z:sw0(x)", &["z", "z:x"]),
-            ("csw0(x, y):z", &["z", "x:z", "x:z+y:z"]),
+            ("sw0(x)*z", &["z", "x*z"]),
+            ("sw0(x):z", &["1-1", "x:z"]),
+            ("z:sw0(x)", &["1-1", "z:x"]),
+            ("csw0(x, y):z", &["1-1", "x:z", "x:z+y:z"]),
+            ("sw0(a)/b", &["1-1", "a+a:b"]),
             ("sw(a, b)/c", &["a+a:c", "b+b:c"]),
             ("(a + sw(x, y)):z", &["a:z+x:z", "a:z+y:z"]),
             ("a + sw(x, y)*z", &["a+x+z+x:z", "a+y+z+y:z"]),
@@ -1053,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_estimation_expands_both_sides_and_resolves_intercepts() {
+    fn multiple_estimation_expands_both_sides_with_the_rhs_seed() {
         let cases: &[(&str, &[&str])] = &[
             (
                 "sw(y1, y2) ~ a + sw(x, z)",
@@ -1062,11 +1093,11 @@ mod tests {
             ("sw(y1, y2):w ~ x", &["y1:w~x", "y2:w~x"]),
             ("y ~ sw0(x, z)", &["y~1", "y~x", "y~z"]),
             ("y ~ csw0(x, z) - 1", &["y~1-1", "y~x-1", "y~x+z-1"]),
-            ("y ~ sw0(x, z):w", &["y~w", "y~x:w", "y~z:w"]),
-            ("y ~ sw0(x):z - 1", &["y~z-1", "y~x:z-1"]),
-            ("y ~ csw0(x, z):w - 1", &["y~w-1", "y~x:w-1", "y~x:w+z:w-1"]),
+            ("y ~ sw0(x, z):w", &["y~1", "y~x:w", "y~z:w"]),
+            ("y ~ sw0(x):z - 1", &["y~1-1", "y~x:z-1"]),
+            ("y ~ csw0(x, z):w - 1", &["y~1-1", "y~x:w-1", "y~x:w+z:w-1"]),
             ("y ~ sw(a, b)/c", &["y~a+a:c", "y~b+b:c"]),
-            ("y ~ sw(1, x - 1)", &["y~1", "y~x-1"]),
+            ("y ~ sw(1, x - 1)", &["y~1", "y~x"]),
         ];
 
         for &(source, expected) in cases {
@@ -1083,13 +1114,34 @@ mod tests {
     }
 
     #[test]
+    fn zero_stepwise_alternatives_preserve_intercept_removal() {
+        for (source, expanded) in [
+            (
+                "y ~ x - 1 + sw0(z, w)",
+                ["y ~ x - 1", "y ~ x + z - 1", "y ~ x + w - 1"],
+            ),
+            (
+                "y ~ x - 1 + csw0(z, w)",
+                ["y ~ x - 1", "y ~ x + z - 1", "y ~ x + z + w - 1"],
+            ),
+        ] {
+            assert_eq!(
+                parse(source).unwrap(),
+                parse_many(expanded).unwrap(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn multiple_estimation_deduplicates_complete_formulas_stably() {
         let cases: &[(&str, &[&str])] = &[
             ("y ~ x + sw(x, x+x, z)", &["y~x", "y~x+z"]),
             ("sw(y1, y1, y2) ~ sw(x, x)", &["y1~x", "y2~x"]),
             ("y ~ sw(x:z, z:x)", &["y~x:z"]),
-            ("y ~ sw(x+z, z+x)", &["y~x+z", "y~z+x"]),
-            ("sw(y, y-1) ~ x", &["y~x", "y-1~x"]),
+            ("y ~ sw(x+z, z+x)", &["y~x+z"]),
+            ("y ~ sw(z+x, x+z)", &["y~z+x"]),
+            ("sw(y, y-1) ~ x", &["y~x"]),
         ];
 
         for &(source, expected) in cases {
@@ -1219,10 +1271,7 @@ mod tests {
             Specification::new(vec![Formula {
                 expressions: BTreeMap::from([
                     (Role::Dependent, expression(&[&["sw"]])),
-                    (
-                        Role::Independent,
-                        expression(&[&["csw0"], &["sw0x"]]).resolve_intercept(true),
-                    ),
+                    (Role::Independent, expression(&[&[], &["csw0"], &["sw0x"]])),
                     (Role::FixedEffect, Expression::from_iter([])),
                 ]),
             }]),
@@ -1310,17 +1359,29 @@ mod tests {
     }
 
     #[test]
-    fn nesting_preserves_intercept_suppression() {
-        for (source, expanded) in [
-            ("y ~ a/b - 1", "y ~ a + a:b - 1"),
-            ("y ~ (a - 1)/b", "y ~ a + a:b - 1"),
-            ("y ~ a/(b - 1)", "y ~ a + a:b - 1"),
+    fn nesting_keeps_intercept_subtraction_local_to_its_expression() {
+        for (source, expanded, expected) in [
+            (
+                "y ~ a/b - 1",
+                "y ~ a + a:b - 1",
+                expression(&[&["a"], &["a", "b"]]),
+            ),
+            (
+                "y ~ (a - 1)/b",
+                "y ~ a + a:b",
+                expression(&[&[], &["a"], &["a", "b"]]),
+            ),
+            (
+                "y ~ a/(b - 1)",
+                "y ~ a + a:b",
+                expression(&[&[], &["a"], &["a", "b"]]),
+            ),
         ] {
             let actual = parse(source).unwrap();
             assert_eq!(actual, parse(expanded).unwrap(), "{source}");
             assert_eq!(
                 actual.formulas()[0].expressions[&Role::Independent],
-                expression(&[&["a"], &["a", "b"]]).subtract(Expression::from(Term::intercept())),
+                expected,
                 "{source}"
             );
         }
@@ -1410,8 +1471,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn leading_subtraction_uses_the_initial_intercept() {
+        for (source, explicit) in [
+            ("y ~ -x + x*z", "y ~ 1 - x + x*z"),
+            ("y ~ -(x + 1)", "y ~ 1 - (x + 1)"),
+            ("y ~ -1x", "y ~ 1 - 1x"),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(explicit).unwrap(), "{source}");
+        }
+    }
+
     mod errors {
         use super::*;
+
+        #[test]
+        fn leading_subtraction_requires_an_initial_seed() {
+            assert!(parse_expression.parse("-1").is_err());
+            for source in ["y ~ (-1 + x)", "y ~ (-x + z)", "y ~ sw(-1 + x, z)"] {
+                assert!(parse(source).is_err(), "{source}");
+            }
+        }
 
         #[test]
         fn formula_boundaries_report_context_and_offsets() {
@@ -1796,13 +1876,6 @@ mod tests {
                 "/a",
             ] {
                 assert!(parse_expression.parse(source).is_err(), "{source:?}");
-            }
-        }
-
-        #[test]
-        fn leading_minus_only_accepts_intercept() {
-            for source in ["y ~ -x + x*z", "y ~ -(x + 1)", "y ~ -1x"] {
-                assert!(parse(source).is_err(), "{source}");
             }
         }
 

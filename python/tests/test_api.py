@@ -97,8 +97,11 @@ def test_model_indexing(data):
         models["y ~ sw(x, z)"]
 
 
-def test_expanded_models_can_be_looked_up_by_their_formula(data):
-    models = formula.parse("y ~ sw(x, z)").fit(data)
+@pytest.mark.parametrize(
+    "source", ["y ~ sw(x, z)", "y ~ x - 1 + 1", "y ~ x - 1 + 1 + z"]
+)
+def test_expanded_models_can_be_looked_up_by_their_formula(source, data):
+    models = formula.parse(source).fit(data)
 
     for index in range(len(models)):
         model = models[index]
