@@ -2196,18 +2196,27 @@ mod tests {
             ("y ~ x - 1", &["x"]),
             ("y ~ x - 1 + 1", &["x", "Intercept"]),
             ("y ~ x - 1 + 1 - 1", &["x"]),
+            ("y ~ 0", &[]),
+            ("y ~ 0 + x", &["x"]),
+            ("y ~ x + 0", &["x"]),
+            ("y ~ x + 0 + 1", &["x", "Intercept"]),
+            ("y ~ x - 0", &["Intercept", "x"]),
+            ("y ~ x - 1 - 0", &["x", "Intercept"]),
+            ("y ~ -0 + x", &["Intercept", "x"]),
         ];
         for &(source, expected) in cases {
             let model = fit(source, &data);
-            assert_eq!(
-                model
-                    .expression(Role::Independent)
-                    .unwrap()
-                    .frame()
-                    .get_column_names(),
-                expected,
-                "{source}"
-            );
+            let independent = model.expression(Role::Independent);
+
+            if expected.is_empty() {
+                assert!(independent.is_none(), "{source}");
+            } else {
+                assert_eq!(
+                    independent.unwrap().frame().get_column_names(),
+                    expected,
+                    "{source}",
+                );
+            }
         }
     }
 

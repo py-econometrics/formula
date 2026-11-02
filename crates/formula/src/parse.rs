@@ -148,8 +148,12 @@ fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
 
 fn parse_intercept(cursor: &mut &str) -> ModalResult<SignedNode> {
     take_while(1.., is_identifier_character)
-        .verify(|name: &str| name == "1")
-        .value(SignedNode::positive(AstNode::Term(Term::intercept())))
+        .verify(|name: &str| matches!(name, "0" | "1"))
+        .map(|name: &str| {
+            let node = SignedNode::positive(AstNode::Term(Term::intercept()));
+
+            if name == "0" { node.negate() } else { node }
+        })
         .parse_next(cursor)
 }
 
