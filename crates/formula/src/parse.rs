@@ -972,6 +972,23 @@ mod tests {
     }
 
     #[test]
+    fn subtracting_zero_adds_the_intercept_like_plus_one() {
+        for (removal, addition) in [
+            ("y ~ x - 0", "y ~ x + 1"),
+            ("y ~ x - (0)", "y ~ x + 1"),
+            ("y ~ x - -1", "y ~ x + 1"),
+            ("y - 0 ~ x", "y + 1 ~ x"),
+            ("y ~ x - 1 - 0", "y ~ x - 1 + 1"),
+        ] {
+            assert_eq!(
+                parse(removal).unwrap(),
+                parse(addition).unwrap(),
+                "{removal}"
+            );
+        }
+    }
+
+    #[test]
     fn quoted_numbers_are_columns_not_intercepts_or_literals() {
         let column = parse_expression.parse("`1`").unwrap();
         assert_eq!(column, vec![expression(&[&["1"]])]);

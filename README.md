@@ -97,7 +97,8 @@ fn main() {
 ## Formula syntax
 
 A formula has a response on the left of `~` and predictors on the right. The intercept
-is included by default; use `-1` or `0` to omit it.
+is included by default; use `-1` or `0` to omit it. As in R, `- 0` adds the intercept,
+like `+ 1`.
 
 ```text
 y ~ x + z       # response y, predictors x and z, with an intercept

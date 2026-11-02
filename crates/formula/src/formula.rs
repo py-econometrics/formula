@@ -405,6 +405,10 @@ impl Expression {
     }
     pub(crate) fn subtract(mut self, other: impl Into<Self>) -> Self {
         let other = other.into();
+        // Removing an intercept removal (`- 0`, `- -1`) adds it, like `+ 1`
+        if other.terms.is_empty() && other.suppress_intercept {
+            return self.add(Term::intercept());
+        }
         self.suppress_intercept |= other.suppress_intercept || other.has_intercept();
         self.terms.retain(|term| !other.terms.contains(term));
         self
