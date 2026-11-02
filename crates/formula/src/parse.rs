@@ -150,10 +150,22 @@ fn parse_intercept(cursor: &mut &str) -> ModalResult<Expression> {
         .parse_next(cursor)
 }
 
+fn suppressed_intercept() -> Expression {
+    Expression::from_iter([]).subtract(Term::intercept())
+}
+
 // Support a leading suppressed intercept, e.g., `y ~ -1 + x`
 fn parse_suppressed_intercept(cursor: &mut &str) -> ModalResult<Expression> {
     preceded(('-', multispace0), parse_intercept)
-        .map(|intercept| Expression::from_iter([]).subtract(intercept))
+        .map(|_| suppressed_intercept())
+        .parse_next(cursor)
+}
+
+// `0` suppresses the intercept exactly like `-1`, e.g., `y ~ 0 + x`
+fn parse_zero_intercept(cursor: &mut &str) -> ModalResult<Expression> {
+    take_while(1.., is_identifier_character)
+        .verify(|name: &str| name == "0")
+        .map(|_| suppressed_intercept())
         .parse_next(cursor)
 }
 
@@ -450,6 +462,7 @@ fn parse_operand<'i>(
                 parse_stepwise(context),
                 alt((
                     parse_suppressed_intercept,
+                    parse_zero_intercept,
                     parse_intercept,
                     factor.map(Term::from).map(Expression::from),
                 ))
@@ -945,10 +958,27 @@ mod tests {
     }
 
     #[test]
+    fn zero_suppresses_the_intercept_like_minus_one() {
+        for (zero, minus_one) in [
+            ("y ~ 0 + x", "y ~ -1 + x"),
+            ("y ~ x + 0", "y ~ x - 1"),
+            ("y ~ 0", "y ~ -1"),
+            ("y ~ (0 + x) + z", "y ~ (-1 + x) + z"),
+            ("y ~ sw(0 + x, z)", "y ~ sw(-1 + x, z)"),
+            ("y ~ x | f + 0", "y ~ x | f - 1"),
+        ] {
+            assert_eq!(parse(zero).unwrap(), parse(minus_one).unwrap(), "{zero}");
+        }
+    }
+
+    #[test]
     fn quoted_numbers_are_columns_not_intercepts_or_literals() {
         let column = parse_expression.parse("`1`").unwrap();
         assert_eq!(column, vec![expression(&[&["1"]])]);
         assert_ne!(column, parse_expression.parse("1").unwrap());
+        let zero = parse_expression.parse("`0`").unwrap();
+        assert_eq!(zero, vec![expression(&[&["0"]])]);
+        assert_ne!(zero, parse_expression.parse("0").unwrap());
         assert_ne!(
             parse_expression.parse("log(`1`)").unwrap(),
             parse_expression.parse("log(1)").unwrap(),

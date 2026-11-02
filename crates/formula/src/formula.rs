@@ -2202,7 +2202,15 @@ mod tests {
     #[test]
     fn intercept_suppression_survives_later_addition() {
         let data = polars::df!("y" => [2.0], "x" => [3.0]).unwrap();
-        for source in ["y ~ -1 + x", "y ~ - 1 + x", "y ~ x - 1", "y ~ x - 1 + 1"] {
+        for source in [
+            "y ~ -1 + x",
+            "y ~ - 1 + x",
+            "y ~ x - 1",
+            "y ~ x - 1 + 1",
+            "y ~ 0 + x",
+            "y ~ x + 0",
+            "y ~ x + 0 + 1",
+        ] {
             let model = fit(source, &data);
             assert_eq!(
                 model
@@ -2219,7 +2227,12 @@ mod tests {
     #[test]
     fn grouped_subtraction_suppresses_intercept() {
         let data = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
-        for source in ["y ~ (x - 1)", "y ~ (-1 + x)", "y ~ x - (z + 1)"] {
+        for source in [
+            "y ~ (x - 1)",
+            "y ~ (-1 + x)",
+            "y ~ (0 + x)",
+            "y ~ x - (z + 1)",
+        ] {
             let model = fit(source, &data);
             assert_eq!(
                 model

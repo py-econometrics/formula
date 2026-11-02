@@ -97,7 +97,7 @@ fn main() {
 ## Formula syntax
 
 A formula has a response on the left of `~` and predictors on the right. The intercept
-is included by default; use `-1` to omit it.
+is included by default; use `-1` or `0` to omit it.
 
 ```text
 y ~ x + z       # response y, predictors x and z, with an intercept
@@ -105,6 +105,7 @@ y ~ x:z         # interaction between x and z
 y ~ x*z         # equivalent to x + z + x:z
 y ~ x/z         # equivalent to x + x:z
 y ~ log(x) - 1  # transform x and omit the intercept
+y ~ 0 + log(x)  # equivalent to log(x) - 1
 ```
 
 Use backticks `` ` `` to escape column names containing spaces, punctuation or special
