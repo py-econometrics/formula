@@ -402,7 +402,126 @@ fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
     expressions
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
+struct SignedNode {
+    sign: Sign,
+    node: AstNode,
+}
+
+impl SignedNode {
+    fn positive(node: AstNode) -> Self {
+        Self {
+            sign: Sign::Positive,
+            node,
+        }
+    }
+
+    fn negate(mut self) -> Self {
+        self.sign = match self.sign {
+            Sign::Positive => Sign::Negative,
+            Sign::Negative => Sign::Positive,
+        };
+        self
+    }
+
+    fn evaluate(&self) -> Vec<Expression> {
+        self.evaluate_from(&[Expression::from_iter([])])
+    }
+
+    fn evaluate_from(&self, initial: &[Expression]) -> Vec<Expression> {
+        match self.sign {
+            Sign::Positive => self.node.evaluate_from(initial),
+            Sign::Negative => {
+                let expressions = self.node.evaluate();
+                combine_expressions(initial, &expressions, |left, right| left.subtract(right))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Sign {
+    Positive,
+    Negative,
+}
+
+// Inspired by https://docs.rs/winnow/latest/winnow/_topic/lexing/index.html#parse-to-ast
+#[derive(Clone, Debug)]
+enum AstNode {
+    Term(Term),
+    Sum(Vec<SignedNode>),
+    Interact(Box<SignedNode>, Box<SignedNode>),
+    InteractFully(Box<SignedNode>, Box<SignedNode>),
+    Nest(Box<SignedNode>, Box<SignedNode>),
+    Group(Box<SignedNode>),
+    Stepwise {
+        operator: Stepwise,
+        arguments: Vec<SignedNode>,
+    },
+}
+
+impl AstNode {
+    fn evaluate_from(&self, initial: &[Expression]) -> Vec<Expression> {
+        match self {
+            // A sum cumulates operations before evaluation
+            Self::Sum(operations) => operations
+                .iter()
+                .fold(initial.to_vec(), |accumulated, operation| {
+                    operation.evaluate_from(&accumulated)
+                }),
+            // All other nodes are evaluated locally and then cumulated
+            _ => {
+                let expressions = self.evaluate();
+                combine_expressions(initial, &expressions, |left, right| left.add(right))
+            }
+        }
+    }
+
+    fn evaluate(&self) -> Vec<Expression> {
+        match self {
+            Self::Term(term) => vec![Expression::from(term.clone())],
+            Self::Sum(_) => self.evaluate_from(&[Expression::from_iter([])]),
+            Self::Interact(left, right) => {
+                combine_expressions(&left.evaluate(), &right.evaluate(), |left, right| {
+                    left.interact(&right)
+                })
+            }
+            Self::InteractFully(left, right) => {
+                combine_expressions(&left.evaluate(), &right.evaluate(), |left, right| {
+                    left.interact_fully(right)
+                })
+            }
+            Self::Nest(left, right) => {
+                combine_expressions(&left.evaluate(), &right.evaluate(), |left, right| {
+                    left.nest(right)
+                })
+            }
+            Self::Group(node) => node.evaluate(),
+            Self::Stepwise {
+                operator,
+                arguments,
+            } => {
+                let arguments = arguments
+                    .iter()
+                    .map(SignedNode::evaluate)
+                    .collect::<Vec<_>>();
+
+                let mut expressions = match operator {
+                    Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect(),
+                    Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
+                };
+
+                if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
+                    expressions.insert(0, Expression::from_iter([]));
+                }
+
+                expressions
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 enum Stepwise {
     Sw,
     Sw0,
@@ -1479,6 +1598,40 @@ mod tests {
             ("y ~ -1x", "y ~ 1 - 1x"),
         ] {
             assert_eq!(parse(source).unwrap(), parse(explicit).unwrap(), "{source}");
+        }
+    }
+
+    mod evaluation {
+        use super::*;
+        #[test]
+        fn signed_ast_evaluation_preserves_operations_and_grouping() {
+            let x = || SignedNode::positive(AstNode::Term(Term::from(Factor::from("x"))));
+            let intercept = || SignedNode::positive(AstNode::Term(Term::intercept()));
+            let seed = [Expression::from(Term::intercept())];
+
+            // x - 1 removes the RHS seed.
+            let removed = SignedNode::positive(AstNode::Sum(vec![x(), intercept().negate()]));
+            assert_eq!(removed.evaluate_from(&seed), vec![expression(&[&["x"]])],);
+
+            // (x - 1) evaluates locally, preserving the outer seed.
+            let grouped = SignedNode::positive(AstNode::Group(Box::new(removed.clone())));
+            assert_eq!(
+                grouped.evaluate_from(&seed),
+                vec![expression(&[&[], &["x"]])],
+            );
+
+            // A later + 1 restores the intercept.
+            let restored = SignedNode::positive(AstNode::Sum(vec![removed, intercept()]));
+            assert_eq!(
+                restored.evaluate_from(&seed),
+                vec![expression(&[&["x"], &[]])],
+            );
+
+            // Reversing a negative sign adds the intercept.
+            assert_eq!(
+                intercept().negate().negate().evaluate(),
+                vec![expression(&[&[]])],
+            );
         }
     }
 
