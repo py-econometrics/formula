@@ -136,6 +136,8 @@ names and factor order: `firm:year` and `year:firm` retain their respective orde
 The pipe accepts column references, parentheses, formula operators, and stepwise
 expansion. Transform calls such as `log(x)`, `C(firm)`, and `poly(x)` are rejected
 after the pipe.
+Intercept terms `0` and `1` are also rejected in fixed-effect expressions;
+use backticks for grouping columns named `0` or `1`.
 
 ### Transformations
 
@@ -169,12 +171,12 @@ which enables generating
 multiple model specifications from a single formula. For example, the formula
 `y ~ sw(x1, x2)` expands to the formulas `y ~ x1` and `y ~ x2`.
 
-| Operator             | Models generated                                                                        |
-|----------------------|-----------------------------------------------------------------------------------------|
-| `sw(x, z, w, ...)`   | One model per argument: `x`, `z`, `w`, and so on.                                       |
-| `sw0(x, z, w, ...)`  | An empty expression, then one model per argument: `x`, `z`, `w`, and so on.             |
-| `csw(x, z, w, ...)`  | Cumulative models: `x`, then `x + z`, then `x + z + w`, and so on.                      |
-| `csw0(x, z, w, ...)` | An empty expression, then cumulative models: `x`, `x + z`, `x + z + w`, and so on.      |
+| Operator             | Models generated                                                                   |
+|----------------------|------------------------------------------------------------------------------------|
+| `sw(x, z, w, ...)`   | One model per argument: `x`, `z`, `w`, and so on.                                  |
+| `sw0(x, z, w, ...)`  | An empty expression, then one model per argument: `x`, `z`, `w`, and so on.        |
+| `csw(x, z, w, ...)`  | Cumulative models: `x`, then `x + z`, then `x + z + w`, and so on.                 |
+| `csw0(x, z, w, ...)` | An empty expression, then cumulative models: `x`, `x + z`, `x + z + w`, and so on. |
 
 The empty alternative adds no terms and does not restore a removed intercept.
 For example, `y ~ x - 1 + sw0(z)` expands to `y ~ x - 1` and `y ~ x + z - 1`.

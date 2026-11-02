@@ -11,8 +11,8 @@ use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat, separated,
-    terminated,
+    Prefix, alt, cut_err, delimited, eof, expression, fail, not, opt, peek, preceded, repeat,
+    separated, terminated,
 };
 use winnow::error::{ContextError, ParseError, StrContext, StrContextValue};
 use winnow::token::{one_of, take_while};
@@ -576,9 +576,22 @@ fn parse_node_parenthesized<'i>(
 
 fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedNode, ContextError> {
     move |cursor: &mut &'i str| {
-        let factor = |cursor: &mut &str| match context {
-            ParseContext::Formula => parse_factor(cursor),
-            ParseContext::FixedEffects => parse_column(cursor),
+        let parse_factor = |cursor: &mut &str| match context {
+            ParseContext::Formula => alt((
+                parse_intercept,
+                parse_factor.map(Term::from).map(SignedNode::from),
+            ))
+            .parse_next(cursor),
+            ParseContext::FixedEffects => {
+                let expected = StrContext::Expected(StrContextValue::Description(
+                    "a grouping term (intercept terms are not allowed)",
+                ));
+                preceded(
+                    cut_err(not(parse_intercept).context(expected)),
+                    parse_column.map(Term::from).map(SignedNode::from),
+                )
+                .parse_next(cursor)
+            }
         };
 
         delimited(
@@ -586,8 +599,7 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedN
             alt((
                 parse_node_parenthesized(context),
                 parse_stepwise(context),
-                parse_intercept,
-                factor.map(Term::from).map(SignedNode::from),
+                parse_factor,
             )),
             multispace0,
         )
@@ -798,11 +810,58 @@ mod tests {
                 vec![expression(&[]), expression(&[&["f1", "f2"]])],
             ),
             ("`log(x)`", vec![expression(&[&["log(x)"]])]),
+            ("`0`", vec![expression(&[&["0"]])]),
+            ("`1`", vec![expression(&[&["1"]])]),
+            ("0x + 1x", vec![expression(&[&["0x"], &["1x"]])]),
         ] {
             assert_eq!(
                 parse_fixed_effects.parse(source).unwrap(),
                 expected,
                 "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_effect_expressions_reject_intercept_literals_before_expansion() {
+        for source in [
+            "0",
+            "1",
+            "-0",
+            "-1",
+            "f + 0",
+            "f - 1",
+            "f + (1)",
+            "(0 + f)",
+            "f:1",
+            "1/f",
+            "sw(f, 0)",
+            "csw(f, 1)",
+            "sw0(0, f)",
+            "csw0(f, 1)",
+            "f + 1 - 1",
+        ] {
+            let expected = StrContext::Expected(StrContextValue::Description(
+                "a grouping term (intercept terms are not allowed)",
+            ));
+            let error = parse_fixed_effects.parse(source).unwrap_err();
+            assert!(
+                error.inner().context().any(|context| context == &expected),
+                "{source}: {error}"
+            );
+
+            let formula = format!("y ~ x | {source}");
+            let error = parse(&formula).unwrap_err();
+            assert!(
+                error.inner().context().any(|context| context == &expected),
+                "{formula}: {error}"
+            );
+            assert!(
+                error
+                    .inner()
+                    .context()
+                    .any(|context| context == &StrContext::Label("fixed-effect expression")),
+                "{formula}: {error}"
             );
         }
     }
@@ -825,6 +884,10 @@ mod tests {
     fn fixed_effect_pipe_expands_stepwise_alternatives_across_roles() {
         let cases: &[(&str, &[&str])] = &[
             ("y ~ x | sw0(f)", &["y ~ x", "y ~ x | f"]),
+            (
+                "y ~ x | csw0(f1, f2)",
+                &["y ~ x", "y ~ x | f1", "y ~ x | f1 + f2"],
+            ),
             (
                 "y ~ sw(x, z) | sw0(f1):f2",
                 &["y ~ x", "y ~ x | f1:f2", "y ~ z", "y ~ z | f1:f2"],
