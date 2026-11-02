@@ -378,7 +378,16 @@ struct SignedNode {
 
 impl SignedNode {
     fn add(self, other: Self) -> Self {
-        Self::positive(AstNode::Sum(vec![self, other]))
+        match self {
+            Self {
+                sign: Sign::Positive,
+                node: AstNode::Sum(mut operations),
+            } => {
+                operations.push(other);
+                Self::positive(AstNode::Sum(operations))
+            }
+            left => Self::positive(AstNode::Sum(vec![left, other])),
+        }
     }
 
     fn subtract(self, other: Self) -> Self {
