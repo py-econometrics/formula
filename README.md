@@ -164,9 +164,12 @@ multiple model specifications from a single formula. For example, the formula
 | Operator             | Models generated                                                                        |
 |----------------------|-----------------------------------------------------------------------------------------|
 | `sw(x, z, w, ...)`   | One model per argument: `x`, `z`, `w`, and so on.                                       |
-| `sw0(x, z, w, ...)`  | An empty expression, then one model per argument: `1`, `x`, `z`, `w`, and so on.        |
+| `sw0(x, z, w, ...)`  | An empty expression, then one model per argument: `x`, `z`, `w`, and so on.             |
 | `csw(x, z, w, ...)`  | Cumulative models: `x`, then `x + z`, then `x + z + w`, and so on.                      |
-| `csw0(x, z, w, ...)` | An empty expression, then cumulative models: `1`, `x`, `x + z`, `x + z + w`, and so on. |
+| `csw0(x, z, w, ...)` | An empty expression, then cumulative models: `x`, `x + z`, `x + z + w`, and so on.      |
+
+The empty alternative adds no terms and does not restore a removed intercept.
+For example, `y ~ x - 1 + sw0(z)` expands to `y ~ x - 1` and `y ~ x + z - 1`.
 
 ## Development
 
