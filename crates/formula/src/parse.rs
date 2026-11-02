@@ -23,6 +23,7 @@ pub(crate) const FIXED_EFFECT_SEPARATOR: char = '|';
 const SUM_PRECEDENCE: i64 = 10;
 const PRODUCT_PRECEDENCE: i64 = 20;
 const INTERACTION_PRECEDENCE: i64 = 30;
+const PREFIX_PRECEDENCE: i64 = 40;
 
 #[derive(Debug)]
 struct TransformCall {
@@ -293,7 +294,7 @@ fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedNode
         expression(parse_operand(context))
             .prefix(
                 preceded(multispace0, '-')
-                    .value(Prefix(PRODUCT_PRECEDENCE, |_, node: SignedNode| {
+                    .value(Prefix(PREFIX_PRECEDENCE, |_, node: SignedNode| {
                         Ok(node.negate())
                     }))
                     .context(StrContext::Expected(StrContextValue::Description(
@@ -1410,6 +1411,11 @@ mod tests {
             ("1", expression(&[&[]])),
             ("1 + x + 1", expression(&[&[], &["x"]])),
             ("1:x", expression(&[&["x"]])),
+            ("-1*x", expression(&[&["x"]])),
+            ("0*x", expression(&[&["x"]])),
+            ("(-1)*x", expression(&[&["x"]])),
+            ("-(1*x)", expression(&[])),
+            ("x*-1*z", expression(&[&["x"], &["z"], &["x", "z"]])),
         ];
 
         for (source, expected) in cases {
