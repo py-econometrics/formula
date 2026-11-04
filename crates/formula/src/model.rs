@@ -68,13 +68,9 @@ impl Model {
     }
 
     pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
-        let expressions = self
-            .expressions
-            .values()
-            .map(FittedExpression::expression)
-            .collect::<Vec<_>>();
-
+        let expressions = self.all_expressions();
         let terms = transform_terms(&expressions, data)?;
+
         self.assemble(data.height(), &terms)
     }
 
@@ -100,6 +96,22 @@ impl Model {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         Ok(Self::new(self.formula.clone(), expressions, self.height))
+    }
+
+    fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
+        for expression in self.expressions.values() {
+            output.push(expression.expression());
+
+            for child in expression.children() {
+                child.collect_expressions(output);
+            }
+        }
+    }
+
+    fn all_expressions(&self) -> Vec<&Expression> {
+        let mut expressions = Vec::new();
+        self.collect_expressions(&mut expressions);
+        expressions
     }
 }
 
@@ -144,8 +156,7 @@ impl Models {
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
-        self.iter()
-            .flat_map(|model| model.expressions.values().map(FittedExpression::expression))
+        self.iter().flat_map(Model::all_expressions)
     }
 
     pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
@@ -319,53 +330,6 @@ mod tests {
                 .shape(),
             (2, 0)
         );
-    }
-
-    #[test]
-    fn model_select_transforms_only_selected_roles() {
-        let data = polars::df!(
-            "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "a"],
-        )
-        .unwrap();
-        let models = crate::parse("y ~ C(g) - 1").unwrap().fit(&data).unwrap();
-        let model = models.iter().next().unwrap();
-
-        for (role, column, excluded) in [
-            (Role::Dependent, "y", Role::Independent),
-            (Role::Independent, "g", Role::Dependent),
-        ] {
-            let training = model.expression(role).unwrap().frame().clone();
-            let selected = model.select(&[role]).unwrap();
-            assert_eq!(selected.formula(), model.formula());
-            assert!(selected.expression(excluded).is_none());
-            assert!(
-                selected
-                    .expression(role)
-                    .unwrap()
-                    .frame()
-                    .equals_missing(&training)
-            );
-
-            let input = data.select([column]).unwrap().slice(1, 1);
-            let transformed = selected.transform(&input).unwrap();
-            assert_eq!(transformed.formula(), model.formula());
-            assert!(transformed.expression(excluded).is_none());
-            assert!(
-                transformed
-                    .expression(role)
-                    .unwrap()
-                    .frame()
-                    .equals_missing(&training.slice(1, 1))
-            );
-            assert!(
-                model
-                    .expression(role)
-                    .unwrap()
-                    .frame()
-                    .equals_missing(&training)
-            );
-            assert!(model.expression(excluded).is_some());
-        }
     }
 
     #[test]

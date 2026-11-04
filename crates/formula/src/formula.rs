@@ -359,8 +359,13 @@ impl Expression {
 
     fn validate(&self) -> Result<(), ValidationError> {
         for term in &self.terms {
-            term.validate()?
+            term.validate()?;
         }
+
+        for child in &self.children {
+            child.validate()?;
+        }
+
         Ok(())
     }
 
@@ -378,10 +383,14 @@ impl Expression {
         }
 
         let expression = Self::new(terms, self.children.clone());
-
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
+        let children = self
+            .children
+            .iter()
+            .map(|child| child.assemble(height, transformed))
+            .collect::<Result<Vec<_>, ModelError>>()?;
 
-        Ok(FittedExpression::new(expression, frame))
+        Ok(FittedExpression::new(expression, frame, children))
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -454,6 +463,22 @@ impl Formula {
 
         Ok(Model::new(self.clone(), expressions, height))
     }
+
+    fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
+        for expression in self.expressions.values() {
+            output.push(expression);
+
+            for child in &expression.children {
+                child.collect_expressions(output);
+            }
+        }
+    }
+
+    fn all_expressions(&self) -> Vec<&Expression> {
+        let mut expressions = Vec::new();
+        self.collect_expressions(&mut expressions);
+        expressions
+    }
 }
 
 impl std::fmt::Display for Formula {
@@ -508,7 +533,7 @@ impl Specification {
         let expressions = self
             .formulas
             .iter()
-            .flat_map(|formula| formula.expressions.values())
+            .flat_map(Formula::all_expressions)
             .collect::<Vec<_>>();
 
         // Fit factors and assemble terms once across every formula
@@ -548,17 +573,28 @@ pub(crate) struct FittedTerm {
 pub(crate) struct FittedExpression {
     expression: Expression,
     frame: DataFrame,
+    children: Vec<Model>,
 }
 
 impl FittedExpression {
-    fn new(expression: Expression, frame: DataFrame) -> Self {
-        Self { expression, frame }
+    fn new(expression: Expression, frame: DataFrame, children: Vec<Model>) -> Self {
+        Self {
+            expression,
+            frame,
+            children,
+        }
     }
+
     pub(crate) fn expression(&self) -> &Expression {
         &self.expression
     }
+
     pub(crate) fn frame(&self) -> &DataFrame {
         &self.frame
+    }
+
+    pub(crate) fn children(&self) -> &[Model] {
+        &self.children
     }
 }
 
@@ -830,6 +866,163 @@ mod tests {
     }
 
     #[test]
+    fn formula_tree_preserves_local_frames_through_fit_and_transform() {
+        let mut root = crate::parse("y ~ x - 1").unwrap().formulas()[0].clone();
+        let mut child = crate::parse("a ~ z - 1").unwrap().formulas()[0].clone();
+        let grandchild = crate::parse("b ~ w - 1").unwrap().formulas()[0].clone();
+        let sibling = crate::parse("c ~ v - 1").unwrap().formulas()[0].clone();
+        child
+            .expressions
+            .get_mut(&Role::Dependent)
+            .unwrap()
+            .children
+            .push(grandchild);
+        root.expressions
+            .get_mut(&Role::Independent)
+            .unwrap()
+            .children = vec![child, sibling];
+
+        let training = polars::df!(
+            "y" => [1.0, 2.0], "x" => [3.0, 4.0],
+            "a" => [5.0, 6.0], "z" => [7.0, 8.0],
+            "b" => [9.0, 10.0], "w" => [11.0, 12.0],
+            "c" => [13.0, 14.0], "v" => [15.0, 16.0],
+        )
+        .unwrap();
+        let models = Specification::new(vec![root.clone()])
+            .fit(&training)
+            .unwrap();
+        let model = models.iter().next().unwrap();
+        assert_eq!(model.formula(), &root);
+
+        let check = |model: &Model, data: &DataFrame| {
+            let children = model.expression(Role::Independent).unwrap().children();
+            assert_eq!(children.len(), 2);
+            let grandchildren = children[0].expression(Role::Dependent).unwrap().children();
+            assert_eq!(grandchildren.len(), 1);
+            for (node, columns) in [
+                (model, ["y", "x"]),
+                (&children[0], ["a", "z"]),
+                (&grandchildren[0], ["b", "w"]),
+                (&children[1], ["c", "v"]),
+            ] {
+                assert!(
+                    node.frame()
+                        .unwrap()
+                        .equals_missing(&data.select(columns).unwrap())
+                );
+            }
+        };
+        check(model, &training);
+
+        let prediction = polars::df!(
+            "y" => [20.0, 21.0, 22.0], "x" => [30.0, 31.0, 32.0],
+            "a" => [40.0, 41.0, 42.0], "z" => [50.0, 51.0, 52.0],
+            "b" => [60.0, 61.0, 62.0], "w" => [70.0, 71.0, 72.0],
+            "c" => [80.0, 81.0, 82.0], "v" => [90.0, 91.0, 92.0],
+        )
+        .unwrap();
+        for height in [0, 1, 3] {
+            let input = prediction.head(Some(height));
+            check(&model.transform(&input).unwrap(), &input);
+            let transformed = models.transform(&input).unwrap();
+            check(transformed.iter().next().unwrap(), &input);
+        }
+        check(model, &training);
+    }
+
+    #[test]
+    fn model_select_transforms_only_selected_roles_and_their_children() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "a"],
+            "d" => [4.0, 5.0, 6.0], "i" => [7.0, 8.0, 9.0],
+            "f" => [10.0, 11.0, 12.0],
+        )
+        .unwrap();
+        for with_children in [false, true] {
+            let mut formula = crate::parse("y ~ C(g) - 1").unwrap().formulas()[0].clone();
+            let cases = [
+                (Role::Dependent, Some("y"), "d"),
+                (Role::Independent, Some("g"), "i"),
+                (Role::FixedEffect, None, "f"),
+            ];
+            if with_children {
+                for (role, _, column) in cases {
+                    let child =
+                        crate::parse(&format!("{column} ~ 1")).unwrap().formulas()[0].clone();
+                    formula
+                        .expressions
+                        .get_mut(&role)
+                        .unwrap()
+                        .children
+                        .push(child);
+                }
+            }
+            let models = Specification::new(vec![formula]).fit(&data).unwrap();
+            let model = models.iter().next().unwrap();
+
+            for (role, column, child_column) in cases {
+                if !with_children && role == Role::FixedEffect {
+                    assert!(model.expression(role).is_none());
+                    continue;
+                }
+                let original = model.expression(role).unwrap();
+                let training = original.frame().clone();
+                let child_training = original
+                    .children()
+                    .first()
+                    .map(|child| child.frame().unwrap());
+                let selected = model.select(&[role]).unwrap();
+                assert_eq!(selected.formula(), model.formula());
+                assert!(selected.frame().unwrap().equals_missing(&training));
+                let mut columns = column.into_iter().collect::<Vec<_>>();
+                if with_children {
+                    columns.push(child_column);
+                }
+                // No columns belonging to excluded roles or their children.
+                let input = data.select(columns).unwrap().slice(1, 1);
+                let applied = selected.transform(&input).unwrap();
+                let applied_models = models.select(&[role]).unwrap().transform(&input).unwrap();
+
+                for transformed in [&applied, applied_models.iter().next().unwrap()] {
+                    assert_eq!(transformed.formula(), model.formula());
+                    for (other, _, _) in cases {
+                        if other != role {
+                            assert!(selected.expression(other).is_none());
+                            assert!(transformed.expression(other).is_none());
+                        }
+                    }
+                    let output = transformed.expression(role).unwrap();
+                    assert!(output.frame().equals_missing(&training.slice(1, 1)));
+                    assert_eq!(output.children().len(), usize::from(with_children));
+                    if let Some(child_training) = &child_training {
+                        assert_eq!(selected.expression(role).unwrap().children().len(), 1);
+                        assert!(
+                            output.children()[0]
+                                .frame()
+                                .unwrap()
+                                .equals_missing(&child_training.slice(1, 1))
+                        );
+                        assert!(
+                            original.children()[0]
+                                .frame()
+                                .unwrap()
+                                .equals_missing(child_training)
+                        );
+                    }
+                }
+                assert!(
+                    model
+                        .expression(role)
+                        .unwrap()
+                        .frame()
+                        .equals_missing(&training)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn expression_addition_preserves_children_and_deduplicates_terms() {
         let first = crate::parse("a ~ z").unwrap().formulas()[0].clone();
         let second = crate::parse("b ~ w").unwrap().formulas()[0].clone();
@@ -957,32 +1150,72 @@ mod tests {
                 "x" => [-1.0, 0.0, 1.0],
             )
             .unwrap();
-            let model = fit("y ~ poly(x, degree=2)", &training);
-            assert_eq!(
-                model.expression(Role::Independent).unwrap().frame().shape(),
-                (3, 3)
-            );
-
             let prediction = polars::df!("y" => [2.0, 3.0], "x" => [Some(2.0), None]).unwrap();
-            for _ in 0..2 {
-                TRANSFORM_CALLS.set((0, 0));
-                let output = model.transform(&prediction).unwrap();
-                assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
-                let frame = output.expression(Role::Independent).unwrap().frame();
+            for as_child in [false, true] {
+                let formula = crate::parse("y ~ poly(x, degree=2)").unwrap().formulas()[0].clone();
+                let formula = if as_child {
+                    let mut parent = crate::parse("y - y ~ 0").unwrap().formulas()[0].clone();
+                    parent
+                        .expressions
+                        .get_mut(&Role::Independent)
+                        .unwrap()
+                        .children
+                        .push(formula);
+                    parent
+                } else {
+                    formula
+                };
+                let models = Specification::new(vec![formula]).fit(&training).unwrap();
+                let model = models.iter().next().unwrap();
+                let training_node = if as_child {
+                    &model.expression(Role::Independent).unwrap().children()[0]
+                } else {
+                    model
+                };
                 assert_eq!(
-                    frame.get_column_names(),
-                    [
-                        "Intercept",
-                        "poly(x, degree=2, raw=false)[1]",
-                        "poly(x, degree=2, raw=false)[2]",
-                    ]
+                    training_node
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .shape(),
+                    (3, 3)
                 );
-                for (column, expected) in frame.columns()[1..]
-                    .iter()
-                    .zip([2.0 / 2.0_f64.sqrt(), 10.0 / 6.0_f64.sqrt()])
-                {
-                    assert!((column.f64().unwrap().get(0).unwrap() - expected).abs() < 1e-12);
-                    assert_eq!(column.f64().unwrap().get(1), None);
+
+                for use_collection in [false, true] {
+                    TRANSFORM_CALLS.set((0, 0));
+                    let output = if use_collection {
+                        models
+                            .transform(&prediction)
+                            .unwrap()
+                            .iter()
+                            .next()
+                            .unwrap()
+                            .clone()
+                    } else {
+                        model.transform(&prediction).unwrap()
+                    };
+                    assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
+                    let node = if as_child {
+                        &output.expression(Role::Independent).unwrap().children()[0]
+                    } else {
+                        &output
+                    };
+                    let frame = node.expression(Role::Independent).unwrap().frame();
+                    assert_eq!(
+                        frame.get_column_names(),
+                        [
+                            "Intercept",
+                            "poly(x, degree=2, raw=false)[1]",
+                            "poly(x, degree=2, raw=false)[2]"
+                        ]
+                    );
+                    for (column, expected) in frame.columns()[1..]
+                        .iter()
+                        .zip([2.0 / 2.0_f64.sqrt(), 10.0 / 6.0_f64.sqrt()])
+                    {
+                        assert!((column.f64().unwrap().get(0).unwrap() - expected).abs() < 1e-12);
+                        assert_eq!(column.f64().unwrap().get(1), None);
+                    }
                 }
             }
         }
@@ -1580,15 +1813,26 @@ mod tests {
         use crate::transform::TRANSFORM_CALLS;
 
         let data = polars::df!("y" => [1.0], "x" => [2.0]).unwrap();
-        let specification = crate::parse("y ~ sw(log(x), sqrt(x, x))").unwrap();
-        TRANSFORM_CALLS.set((0, 0));
-        assert!(matches!(
-            specification.fit(&data),
-            Err(ModelError::Validation(
-                ValidationError::InvalidArgumentCount { .. }
-            ))
-        ));
-        assert_eq!(TRANSFORM_CALLS.get(), (0, 0));
+        for invalid_child in [false, true] {
+            let mut specification = crate::parse("y ~ sw(log(x), sqrt(x, x))").unwrap();
+            if invalid_child {
+                let child = specification.formulas.pop().unwrap();
+                specification.formulas[0]
+                    .expressions
+                    .get_mut(&Role::Independent)
+                    .unwrap()
+                    .children
+                    .push(child);
+            }
+            TRANSFORM_CALLS.set((0, 0));
+            assert!(matches!(
+                specification.fit(&data),
+                Err(ModelError::Validation(
+                    ValidationError::InvalidArgumentCount { .. }
+                ))
+            ));
+            assert_eq!(TRANSFORM_CALLS.get(), (0, 0));
+        }
     }
 
     mod multiple_estimation {
@@ -1956,8 +2200,23 @@ mod tests {
 
         let training = polars::df!("g" => [0.0, 1.0, 0.0], "x" => [2.0, 3.0, 4.0]).unwrap();
         TRANSFORM_CALLS.set((0, 0));
-        let model = fit("sqrt(g) ~ sqrt(g):x + exp(sqrt(g)) - 1", &training);
-        // sqrt(g) and exp(sqrt(g)) each fit and transform once, across both sides.
+        let mut formula = crate::parse("sqrt(g) ~ sqrt(g):x + exp(sqrt(g)) - 1")
+            .unwrap()
+            .formulas()[0]
+            .clone();
+        let child = crate::parse("sqrt(g) ~ exp(sqrt(g)) - 1")
+            .unwrap()
+            .formulas()[0]
+            .clone();
+        formula
+            .expressions
+            .get_mut(&Role::Independent)
+            .unwrap()
+            .children
+            .push(child);
+        let models = Specification::new(vec![formula]).fit(&training).unwrap();
+        let model = models.iter().next().unwrap();
+        // Each transform runs once across both local roles and the child.
         assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
 
         let sqrt = &model
@@ -1972,6 +2231,25 @@ mod tests {
             panic!("expected exp call");
         };
         assert!(Arc::ptr_eq(sqrt, &arguments[0]));
+        let child = &model.expression(Role::Independent).unwrap().children()[0];
+        assert!(Arc::ptr_eq(
+            sqrt,
+            &child
+                .expression(Role::Dependent)
+                .unwrap()
+                .expression()
+                .terms[0]
+                .factors[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &independent.terms[1].factors[0],
+            &child
+                .expression(Role::Independent)
+                .unwrap()
+                .expression()
+                .terms[0]
+                .factors[0]
+        ));
 
         let input =
             polars::df!("g" => [Some(1.0), Some(0.0), None], "x" => [5.0, 6.0, 7.0]).unwrap();
@@ -2025,6 +2303,21 @@ mod tests {
                 .unwrap()
                 .frame()
                 .equals_missing(&expected_independent)
+        );
+        let child = &applied.expression(Role::Independent).unwrap().children()[0];
+        assert!(
+            child
+                .expression(Role::Dependent)
+                .unwrap()
+                .frame()
+                .equals_missing(&expected_dependent)
+        );
+        assert!(
+            child
+                .expression(Role::Independent)
+                .unwrap()
+                .frame()
+                .equals_missing(&expected_independent.select(["exp(sqrt(g))"]).unwrap())
         );
     }
 
