@@ -330,7 +330,7 @@ impl From<Term> for Expression {
 }
 
 impl Expression {
-    fn new(terms: impl IntoIterator<Item = Term>, children: Vec<Formula>) -> Self {
+    pub(crate) fn new(terms: impl IntoIterator<Item = Term>, children: Vec<Formula>) -> Self {
         Self {
             terms: collect_unique(terms),
             children,
