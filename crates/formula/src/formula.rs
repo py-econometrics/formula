@@ -341,6 +341,7 @@ impl Expression {
         self.terms
             .iter()
             .map(Term::render)
+            .chain(self.children.iter().map(|child| format!("[{child}]")))
             .collect::<Vec<_>>()
             .join(" + ")
     }
@@ -490,7 +491,11 @@ impl std::fmt::Display for Formula {
         write!(
             f,
             "{} {FORMULA_SEPARATOR} {}",
-            dependent.render(),
+            if dependent.is_empty() {
+                "0".to_owned()
+            } else {
+                dependent.render()
+            },
             independent.render()
         )?;
 
@@ -1085,6 +1090,16 @@ mod tests {
             "`outcome value` ~ log(`1`) + add(x, 2.0)",
             "y ~ x | firm:year",
             "y ~ sw(x, z) | `firm name`",
+            "y ~ x + [a ~ z]",
+            "y ~ x - 1 + [a ~ z - 1]",
+            "y ~ [a ~ 0] - 1",
+            "0 ~ x + [a ~ z]",
+            "[a ~ z] ~ x",
+            "y ~ x + [a ~ z] + [b ~ w]",
+            "y ~ x + [a ~ z + [b ~ w - 1]]",
+            "y ~ x + [a ~ z | firm:year] | region",
+            "y ~ sw(x, w) + [sw(a, b) ~ sw(z, v)]",
+            "y ~ `a[b]` + [`child response` ~ log(`x[z]`) - 1]",
         ] {
             for formula in crate::parse(source).unwrap().formulas() {
                 let rendered = formula.to_string();

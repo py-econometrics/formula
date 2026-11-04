@@ -98,10 +98,19 @@ def test_model_indexing(data):
 
 
 @pytest.mark.parametrize(
-    "source", ["y ~ sw(x, z)", "y ~ x - 1 + 1", "y ~ x - 1 + 1 + z"]
+    "source",
+    [
+        "y ~ sw(x, z)",
+        "y ~ x - 1 + 1",
+        "y ~ x - 1 + 1 + z",
+        "y ~ x + [x ~ sw(x, z)]",
+        "y ~ [x ~ z - 1] - 1",
+        "y ~ x + [x ~ z + [z ~ x]] + [z ~ x | firm]",
+    ],
 )
 def test_expanded_models_can_be_looked_up_by_their_formula(source, data):
     models = formula.parse(source).fit(data)
+    assert len({models[index].formula for index in range(len(models))}) == len(models)
 
     for index in range(len(models)):
         model = models[index]
