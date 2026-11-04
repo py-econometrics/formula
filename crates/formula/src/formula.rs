@@ -901,9 +901,9 @@ mod tests {
         assert_eq!(model.formula(), &root);
 
         let check = |model: &Model, data: &DataFrame| {
-            let children = model.expression(Role::Independent).unwrap().children();
+            let children = model.children(Role::Independent).unwrap();
             assert_eq!(children.len(), 2);
-            let grandchildren = children[0].expression(Role::Dependent).unwrap().children();
+            let grandchildren = children[0].children(Role::Dependent).unwrap();
             assert_eq!(grandchildren.len(), 1);
             for (node, columns) in [
                 (model, ["y", "x"]),
@@ -995,15 +995,26 @@ mod tests {
                         if other != role {
                             assert!(selected.expression(other).is_none());
                             assert!(transformed.expression(other).is_none());
+                            assert!(matches!(
+                                selected.children(other),
+                                Err(crate::SelectionError::MissingRole(missing)) if missing == other
+                            ));
+                            assert!(matches!(
+                                transformed.children(other),
+                                Err(crate::SelectionError::MissingRole(missing)) if missing == other
+                            ));
                         }
                     }
                     let output = transformed.expression(role).unwrap();
                     assert!(output.frame().equals_missing(&training.slice(1, 1)));
-                    assert_eq!(output.children().len(), usize::from(with_children));
+                    assert_eq!(
+                        transformed.children(role).unwrap().len(),
+                        usize::from(with_children)
+                    );
                     if let Some(child_training) = &child_training {
-                        assert_eq!(selected.expression(role).unwrap().children().len(), 1);
+                        assert_eq!(selected.children(role).unwrap().len(), 1);
                         assert!(
-                            output.children()[0]
+                            transformed.children(role).unwrap()[0]
                                 .frame()
                                 .unwrap()
                                 .equals_missing(&child_training.slice(1, 1))
@@ -1183,7 +1194,7 @@ mod tests {
                 let models = Specification::new(vec![formula]).fit(&training).unwrap();
                 let model = models.iter().next().unwrap();
                 let training_node = if as_child {
-                    &model.expression(Role::Independent).unwrap().children()[0]
+                    &model.children(Role::Independent).unwrap()[0]
                 } else {
                     model
                 };
@@ -1211,7 +1222,7 @@ mod tests {
                     };
                     assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
                     let node = if as_child {
-                        &output.expression(Role::Independent).unwrap().children()[0]
+                        &output.children(Role::Independent).unwrap()[0]
                     } else {
                         &output
                     };

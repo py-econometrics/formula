@@ -128,15 +128,11 @@ impl Model {
             })
     }
 
-    fn children(&self, role: Role) -> PyResult<Vec<Self>> {
+    fn children(&self, role: Role) -> PyResult<Models> {
         self.inner
             .children(role.into())
-            .map(|children| {
-                children
-                    .iter()
-                    .cloned()
-                    .map(|inner| Self { inner })
-                    .collect()
+            .map(|children| Models {
+                inner: children.iter().cloned().collect(),
             })
             .map_err(|error| PyKeyError::new_err(error.to_string()))
     }
