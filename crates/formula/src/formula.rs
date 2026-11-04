@@ -1,8 +1,6 @@
 use crate::fit::{Definition, Fit};
 use crate::model::{Model, ModelError, Models};
-use crate::parse::{
-    FIXED_EFFECT_SEPARATOR, FORMULA_SEPARATOR, is_identifier_character, parse_scalar,
-};
+use crate::parse::{FORMULA_SEPARATOR, PIPE_SEPARATOR, is_identifier_character, parse_scalar};
 use crate::transform::{
     ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
 };
@@ -473,7 +471,7 @@ impl std::fmt::Display for Formula {
         if !fixed_effects.is_empty() {
             write!(
                 f,
-                " {FIXED_EFFECT_SEPARATOR} {}",
+                " {PIPE_SEPARATOR} {}",
                 render_fixed_effects(fixed_effects)
             )?;
         }
