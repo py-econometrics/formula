@@ -127,6 +127,19 @@ impl Model {
                 formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
             })
     }
+
+    fn children(&self, role: Role) -> PyResult<Vec<Self>> {
+        self.inner
+            .children(role.into())
+            .map(|children| {
+                children
+                    .iter()
+                    .cloned()
+                    .map(|inner| Self { inner })
+                    .collect()
+            })
+            .map_err(|error| PyKeyError::new_err(error.to_string()))
+    }
 }
 
 #[pyclass(frozen, eq, from_py_object, module = "formula")]

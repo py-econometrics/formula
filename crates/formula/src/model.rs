@@ -98,6 +98,12 @@ impl Model {
         Ok(Self::new(self.formula.clone(), expressions, self.height))
     }
 
+    pub fn children(&self, role: Role) -> Result<&[Self], SelectionError> {
+        self.expression(role)
+            .map(FittedExpression::children)
+            .ok_or(SelectionError::MissingRole(role))
+    }
+
     fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
         for expression in self.expressions.values() {
             output.push(expression.expression());
