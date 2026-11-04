@@ -304,6 +304,7 @@ impl Term {
 #[derive(Clone, Debug)]
 pub(crate) struct Expression {
     terms: Vec<Term>,
+    children: Vec<Formula>,
 }
 
 // Expression identity ignores term order.
@@ -312,26 +313,30 @@ impl PartialEq for Expression {
     fn eq(&self, other: &Self) -> bool {
         self.terms.len() == other.terms.len()
             && self.terms.iter().all(|term| other.terms.contains(term))
+            && self.children == other.children
     }
 }
 
 impl FromIterator<Term> for Expression {
     fn from_iter<T: IntoIterator<Item = Term>>(terms: T) -> Self {
-        Self {
-            terms: collect_unique(terms),
-        }
+        Self::new(terms, Vec::new())
     }
 }
 
 impl From<Term> for Expression {
     fn from(term: Term) -> Self {
-        Self {
-            terms: Vec::from([term]),
-        }
+        Self::new(Vec::from([term]), Vec::new())
     }
 }
 
 impl Expression {
+    fn new(terms: impl IntoIterator<Item = Term>, children: Vec<Formula>) -> Self {
+        Self {
+            terms: collect_unique(terms),
+            children,
+        }
+    }
+
     fn render(&self) -> String {
         self.terms
             .iter()
@@ -339,12 +344,13 @@ impl Expression {
             .collect::<Vec<_>>()
             .join(" + ")
     }
+
     fn has_intercept(&self) -> bool {
         self.terms.iter().any(Term::is_intercept)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.terms.is_empty()
+        self.terms.is_empty() && self.children.is_empty()
     }
 
     pub(crate) fn without_intercept(self) -> Self {
@@ -371,7 +377,7 @@ impl Expression {
             columns.extend(entry.columns.iter().cloned());
         }
 
-        let expression = Self { terms };
+        let expression = Self::new(terms, self.children.clone());
 
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
 
@@ -380,9 +386,10 @@ impl Expression {
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
         let other = other.into();
-        Self {
-            terms: collect_unique(self.terms.into_iter().chain(other.terms)),
-        }
+        Self::new(
+            self.terms.into_iter().chain(other.terms),
+            self.children.into_iter().chain(other.children).collect(),
+        )
     }
     pub(crate) fn subtract(mut self, other: impl Into<Self>) -> Self {
         let other = other.into();
@@ -390,13 +397,12 @@ impl Expression {
         self
     }
     pub(crate) fn interact(&self, other: &Self) -> Self {
-        Self {
-            terms: collect_unique(
-                self.terms
-                    .iter()
-                    .flat_map(|left| other.terms.iter().map(move |right| left.interact(right))),
-            ),
-        }
+        Self::new(
+            self.terms
+                .iter()
+                .flat_map(|left| other.terms.iter().map(move |right| left.interact(right))),
+            Vec::new(),
+        )
     }
     pub(crate) fn interact_fully(self, other: Self) -> Self {
         let interactions = self.interact(&other);
@@ -410,13 +416,14 @@ impl Expression {
             .flat_map(|term| term.factors.iter().cloned())
             .collect::<Term>();
 
-        let combined = Self {
-            terms: if self.terms.is_empty() {
+        let combined = Self::new(
+            if self.terms.is_empty() {
                 vec![]
             } else {
                 vec![factors]
             },
-        };
+            Vec::new(),
+        );
         let interactions = combined.interact(&other);
         self.add(interactions)
     }
@@ -742,17 +749,19 @@ fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term) -> &'a FittedTerm
 }
 
 pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
-    expression
-        .terms
-        .into_iter()
-        .filter(|term| !term.is_intercept())
-        .map(|term| {
-            Term::from(Factor::Call {
-                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                arguments: term.factors,
-            })
-        })
-        .collect()
+    Expression::new(
+        expression
+            .terms
+            .into_iter()
+            .filter(|term| !term.is_intercept())
+            .map(|term| {
+                Term::from(Factor::Call {
+                    transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+                    arguments: term.factors,
+                })
+            }),
+        expression.children,
+    )
 }
 
 fn render_fixed_effects(expression: &Expression) -> String {
@@ -818,6 +827,37 @@ mod tests {
         let models = crate::parse(source).unwrap().fit(data).unwrap();
         assert_eq!(models.len(), 1);
         models.iter().next().unwrap().clone()
+    }
+
+    #[test]
+    fn expression_addition_preserves_children_and_deduplicates_terms() {
+        let first = crate::parse("a ~ z").unwrap().formulas()[0].clone();
+        let second = crate::parse("b ~ w").unwrap().formulas()[0].clone();
+        let term = Term::from(Factor::from("x"));
+        let left = Expression::new([term.clone()], vec![first.clone()]);
+        let right = Expression::new([term.clone()], vec![second.clone(), first.clone()]);
+
+        let combined = left.add(right);
+
+        assert_eq!(combined.terms, vec![term]);
+        assert_eq!(combined.children, vec![first.clone(), second, first]);
+    }
+
+    #[test]
+    fn fixed_effect_encoding_preserves_attached_children() {
+        let child = crate::parse("a ~ z").unwrap().formulas()[0].clone();
+        let expression = Expression::new(
+            [Term::intercept(), Term::from(Factor::from("firm"))],
+            vec![child.clone()],
+        );
+
+        let encoded = encode_fixed_effects(expression);
+        let expected = crate::parse("y ~ x | firm").unwrap().formulas()[0].expressions
+            [&Role::FixedEffect]
+            .clone();
+
+        assert_eq!(encoded.terms, expected.terms);
+        assert_eq!(encoded.children, vec![child]);
     }
 
     #[test]
