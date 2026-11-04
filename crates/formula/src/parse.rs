@@ -286,7 +286,7 @@ fn combine_alternatives<L: Clone, R: Clone, O>(
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
     parse_node(ParseContext::Formula)
         .try_map(|node| {
-            node.expand()
+            node.expand_stepwise()
                 .iter()
                 .map(AstNode::evaluate_expression)
                 .collect::<Result<Vec<_>, _>>()
@@ -423,42 +423,46 @@ impl AstNode {
         Self::Nest(Box::new(self), Box::new(other))
     }
 
-    /// Expand AstNodes recursively
-    fn expand(&self) -> Vec<Self> {
+    /// Recursively expand stepwise calls while preserving AST
+    fn expand_stepwise(&self) -> Vec<Self> {
         match self {
-            Self::Tilde { left, right } => {
-                combine_alternatives(&left.expand(), &right.expand(), |left, right| Self::Tilde {
+            Self::Tilde { left, right } => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Tilde {
                     left: Box::new(left),
                     right: Box::new(right),
-                })
-            }
-            Self::Pipe { left, right } => {
-                combine_alternatives(&left.expand(), &right.expand(), |left, right| Self::Pipe {
+                },
+            ),
+            Self::Pipe { left, right } => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Pipe {
                     left: Box::new(left),
                     right: Box::new(right),
-                })
-            }
+                },
+            ),
             Self::Term(_) => vec![self.clone()],
             Self::Negate(node) => node
-                .expand()
+                .expand_stepwise()
                 .into_iter()
                 .map(|node| Self::Negate(Box::new(node)))
                 .collect(),
-            Self::Subtract { left, right } => {
-                combine_alternatives(&left.expand(), &right.expand(), |left, right| {
-                    Self::Subtract {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                    }
-                })
-            }
+            Self::Subtract { left, right } => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Subtract {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            ),
             Self::Sum(operations) => {
                 let mut alternatives = vec![Vec::new()];
 
                 for operation in operations {
                     alternatives = combine_alternatives(
                         &alternatives,
-                        &operation.expand(),
+                        &operation.expand_stepwise(),
                         |mut operations, operation| {
                             operations.push(operation);
                             operations
@@ -468,23 +472,23 @@ impl AstNode {
 
                 alternatives.into_iter().map(Self::Sum).collect()
             }
-            Self::Interact(left, right) => {
-                combine_alternatives(&left.expand(), &right.expand(), |left, right| {
-                    Self::Interact(Box::new(left), Box::new(right))
-                })
-            }
-            Self::InteractFully(left, right) => {
-                combine_alternatives(&left.expand(), &right.expand(), |left, right| {
-                    Self::InteractFully(Box::new(left), Box::new(right))
-                })
-            }
-            Self::Nest(left, right) => {
-                combine_alternatives(&left.expand(), &right.expand(), |left, right| {
-                    Self::Nest(Box::new(left), Box::new(right))
-                })
-            }
+            Self::Interact(left, right) => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Interact(Box::new(left), Box::new(right)),
+            ),
+            Self::InteractFully(left, right) => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::InteractFully(Box::new(left), Box::new(right)),
+            ),
+            Self::Nest(left, right) => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Nest(Box::new(left), Box::new(right)),
+            ),
             Self::Group(node) => node
-                .expand()
+                .expand_stepwise()
                 .into_iter()
                 .map(|node| Self::Group(Box::new(node)))
                 .collect(),
@@ -492,44 +496,8 @@ impl AstNode {
                 operator,
                 arguments,
             } => {
-                let arguments = arguments.iter().map(AstNode::expand).collect::<Vec<_>>();
-
-                let mut alternatives =
-                    match operator {
-                        Stepwise::Sw | Stepwise::Sw0 => arguments
-                            .into_iter()
-                            .flatten()
-                            .map(|argument| Self::Group(Box::new(argument)))
-                            .collect::<Vec<_>>(),
-
-                        Stepwise::Csw | Stepwise::Csw0 => {
-                            let mut prefixes = vec![Vec::new()];
-                            let mut alternatives = Vec::new();
-
-                            for argument in arguments {
-                                prefixes = combine_alternatives(
-                                    &prefixes,
-                                    &argument,
-                                    |mut operations, argument| {
-                                        operations.push(Self::Group(Box::new(argument)));
-                                        operations
-                                    },
-                                );
-
-                                alternatives.extend(prefixes.iter().cloned().map(|operations| {
-                                    Self::Group(Box::new(Self::Sum(operations)))
-                                }));
-                            }
-
-                            alternatives
-                        }
-                    };
-
-                if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
-                    alternatives.insert(0, Self::Group(Box::new(Self::Sum(Vec::new()))));
-                }
-
-                alternatives
+                let arguments = arguments.iter().map(AstNode::expand_stepwise).collect();
+                operator.expand(arguments)
             }
         }
     }
@@ -611,6 +579,46 @@ enum Stepwise {
     Sw0,
     Csw,
     Csw0,
+}
+
+impl Stepwise {
+    fn expand(&self, arguments: Vec<Vec<AstNode>>) -> Vec<AstNode> {
+        let mut alternatives = match self {
+            Stepwise::Sw | Stepwise::Sw0 => arguments
+                .into_iter()
+                .flatten()
+                .map(|argument| AstNode::Group(Box::new(argument)))
+                .collect::<Vec<_>>(),
+
+            Stepwise::Csw | Stepwise::Csw0 => {
+                let mut prefixes = vec![Vec::new()];
+                let mut alternatives = Vec::new();
+
+                for argument in arguments {
+                    prefixes =
+                        combine_alternatives(&prefixes, &argument, |mut operations, argument| {
+                            operations.push(AstNode::Group(Box::new(argument)));
+                            operations
+                        });
+
+                    alternatives.extend(
+                        prefixes
+                            .iter()
+                            .cloned()
+                            .map(|operations| AstNode::Group(Box::new(AstNode::Sum(operations)))),
+                    );
+                }
+
+                alternatives
+            }
+        };
+
+        if matches!(self, Stepwise::Sw0 | Stepwise::Csw0) {
+            alternatives.insert(0, AstNode::Group(Box::new(AstNode::Sum(Vec::new()))));
+        }
+
+        alternatives
+    }
 }
 
 fn parse_stepwise<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode, ContextError> {
@@ -789,7 +797,7 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
             ))),
         )
         .try_map(|ast| {
-            ast.expand()
+            ast.expand_stepwise()
                 .iter()
                 .map(evaluate_formula)
                 .collect::<Result<Vec<_>, _>>()
@@ -935,7 +943,7 @@ mod tests {
     fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
         parse_node(ParseContext::FixedEffects)
             .try_map(|node| {
-                node.expand()
+                node.expand_stepwise()
                     .iter()
                     .map(AstNode::evaluate_expression)
                     .collect::<Result<Vec<_>, _>>()
@@ -1017,7 +1025,7 @@ mod tests {
             };
             assert!(matches!(right.as_ref(), AstNode::Stepwise { .. }));
 
-            let alternatives = ast.expand();
+            let alternatives = ast.expand_stepwise();
             assert_eq!(alternatives.len(), 2);
             for (alternative, name) in alternatives.iter().zip(["x", "z"]) {
                 let AstNode::Tilde { left, right } = alternative else {
@@ -1032,7 +1040,7 @@ mod tests {
         fn zero_step_expansion_produces_an_empty_group() {
             for source in ["sw0(x)", "csw0(x)"] {
                 let ast = parse_node(ParseContext::Formula).parse(source).unwrap();
-                let alternatives = ast.expand();
+                let alternatives = ast.expand_stepwise();
                 assert_eq!(alternatives.len(), 2, "{source}");
                 let AstNode::Sum(operations) = group_contents(&alternatives[0]) else {
                     panic!("expected an empty sum for {source}");
@@ -1046,7 +1054,7 @@ mod tests {
             let ast = parse_node(ParseContext::Formula)
                 .parse("csw(sw(a, b), sw(c, d))")
                 .unwrap();
-            let alternatives = ast.expand();
+            let alternatives = ast.expand_stepwise();
             let expected: &[&[&str]] = &[
                 &["a"],
                 &["b"],
@@ -2004,7 +2012,7 @@ mod tests {
         }
 
         #[test]
-        fn signed_ast_evaluation_preserves_operations_and_grouping() {
+        fn evaluation_preserves_signs_and_grouping() {
             let x = || AstNode::from(Term::from(Factor::from("x")));
             let intercept = || AstNode::from(Term::intercept());
             let seed = Expression::from(Term::intercept());
