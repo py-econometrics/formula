@@ -19,7 +19,7 @@ use winnow::token::{one_of, take_while};
 use winnow::{ModalParser, ModalResult, Parser};
 
 pub(crate) const FORMULA_SEPARATOR: char = '~';
-pub(crate) const FIXED_EFFECT_SEPARATOR: char = '|';
+pub(crate) const PIPE_SEPARATOR: char = '|';
 const SUM_PRECEDENCE: i64 = 10;
 const PRODUCT_PRECEDENCE: i64 = 20;
 const INTERACTION_PRECEDENCE: i64 = 30;
@@ -147,11 +147,11 @@ fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
     .parse_next(cursor)
 }
 
-fn parse_intercept(cursor: &mut &str) -> ModalResult<SignedNode> {
+fn parse_intercept(cursor: &mut &str) -> ModalResult<AstNode> {
     take_while(1.., is_identifier_character)
         .verify(|name: &str| matches!(name, "0" | "1"))
         .map(|name: &str| {
-            let node = SignedNode::from(Term::intercept());
+            let node = AstNode::from(Term::intercept());
 
             if name == "0" { node.negate() } else { node }
         })
@@ -268,33 +268,39 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     })
 }
 
-fn combine_expressions(
-    left: &[Expression],
-    right: &[Expression],
-    combine: impl Fn(Expression, Expression) -> Expression,
-) -> Vec<Expression> {
-    let mut expressions = Vec::new();
-    for left_expression in left {
-        for right_expression in right {
-            expressions.push(combine(left_expression.clone(), right_expression.clone()));
+fn combine_alternatives<L: Clone, R: Clone, O>(
+    left: &[L],
+    right: &[R],
+    combine: impl Fn(L, R) -> O,
+) -> Vec<O> {
+    let mut alternatives = Vec::new();
+    for left in left {
+        for right in right {
+            alternatives.push(combine(left.clone(), right.clone()));
         }
     }
-    expressions
+    alternatives
 }
 
+#[cfg(test)]
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
     parse_node(ParseContext::Formula)
-        .map(|node| node.evaluate())
+        .try_map(|node| {
+            node.expand_stepwise()
+                .iter()
+                .map(AstNode::evaluate_expression)
+                .collect::<Result<Vec<_>, _>>()
+        })
         .parse_next(cursor)
 }
 
-fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedNode, ContextError> {
+fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode, ContextError> {
     // Wrap parser factory in closure for deferred evaluation
     move |cursor: &mut &'i str| {
         expression(parse_operand(context))
             .prefix(
                 preceded(multispace0, '-')
-                    .value(Prefix(PREFIX_PRECEDENCE, |_, node: SignedNode| {
+                    .value(Prefix(PREFIX_PRECEDENCE, |_, node: AstNode| {
                         Ok(node.negate())
                     }))
                     .context(StrContext::Expected(StrContextValue::Description(
@@ -302,40 +308,32 @@ fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedNode
                     ))),
             )
             .infix(alt((
-                '+'.value(Left(
-                    SUM_PRECEDENCE,
-                    |_, left: SignedNode, right: SignedNode| Ok(left.add(right)),
-                )),
-                '-'.value(Left(
-                    SUM_PRECEDENCE,
-                    |_, left: SignedNode, right: SignedNode| Ok(left.subtract(right)),
-                )),
+                '+'.value(Left(SUM_PRECEDENCE, |_, left: AstNode, right: AstNode| {
+                    Ok(left.add(right))
+                })),
+                '-'.value(Left(SUM_PRECEDENCE, |_, left: AstNode, right: AstNode| {
+                    Ok(left.subtract(right))
+                })),
                 '*'.value(Left(
                     PRODUCT_PRECEDENCE,
-                    |_, left: SignedNode, right: SignedNode| Ok(left.interact_fully(right)),
+                    |_, left: AstNode, right: AstNode| Ok(left.interact_fully(right)),
                 )),
                 '/'.value(Left(
                     PRODUCT_PRECEDENCE,
-                    |_, left: SignedNode, right: SignedNode| Ok(left.nest(right)),
+                    |_, left: AstNode, right: AstNode| Ok(left.nest(right)),
                 )),
                 ':'.value(Right(
                     INTERACTION_PRECEDENCE,
-                    |_, left: SignedNode, right: SignedNode| Ok(left.interact(right)),
+                    |_, left: AstNode, right: AstNode| Ok(left.interact(right)),
                 )),
             )))
             .parse_next(cursor)
     }
 }
 
-fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_node(ParseContext::FixedEffects)
-        .map(|node| node.evaluate())
-        .parse_next(cursor)
-}
-
 fn parse_stepwise_arguments<'i>(
     context: ParseContext,
-) -> impl ModalParser<&'i str, Vec<SignedNode>, ContextError> {
+) -> impl ModalParser<&'i str, Vec<AstNode>, ContextError> {
     move |cursor: &mut &'i str| {
         multispace0.parse_next(cursor)?;
 
@@ -357,168 +355,220 @@ fn parse_stepwise_arguments<'i>(
     }
 }
 
-fn expand_cumulative(arguments: Vec<Vec<Expression>>) -> Vec<Expression> {
-    let mut prefixes = vec![Expression::from_iter([])];
-    let mut expressions = Vec::new();
-
-    for argument in arguments {
-        prefixes = combine_expressions(&prefixes, &argument, |left, right| left.add(right));
-        expressions.extend(prefixes.iter().cloned());
-    }
-
-    expressions
-}
-
+// Inspired by https://docs.rs/winnow/latest/winnow/_topic/lexing/index.html#parse-to-ast
 #[derive(Clone, Debug)]
-struct SignedNode {
-    sign: Sign,
-    node: AstNode,
+enum AstNode {
+    Tilde {
+        left: Box<AstNode>,
+        right: Box<AstNode>,
+    },
+    Pipe {
+        left: Box<AstNode>,
+        right: Box<AstNode>,
+    },
+    Term(Term),
+    Negate(Box<AstNode>),
+    Subtract {
+        left: Box<AstNode>,
+        right: Box<AstNode>,
+    },
+    Sum(Vec<AstNode>),
+    Interact(Box<AstNode>, Box<AstNode>),
+    InteractFully(Box<AstNode>, Box<AstNode>),
+    Nest(Box<AstNode>, Box<AstNode>),
+    Group(Box<AstNode>),
+    Stepwise {
+        operator: Stepwise,
+        arguments: Vec<AstNode>,
+    },
 }
 
-impl From<Term> for SignedNode {
+impl From<Term> for AstNode {
     fn from(term: Term) -> Self {
-        Self::positive(AstNode::Term(term))
+        Self::Term(term)
     }
 }
 
-impl SignedNode {
+impl AstNode {
     fn add(self, other: Self) -> Self {
         match self {
-            Self {
-                sign: Sign::Positive,
-                node: AstNode::Sum(mut operations),
-            } => {
+            Self::Sum(mut operations) => {
                 operations.push(other);
-                Self::positive(AstNode::Sum(operations))
+                Self::Sum(operations)
             }
-            left => Self::positive(AstNode::Sum(vec![left, other])),
+            left => Self::Sum(vec![left, other]),
         }
     }
 
     fn subtract(self, other: Self) -> Self {
-        self.add(other.negate())
+        Self::Subtract {
+            left: Box::new(self),
+            right: Box::new(other),
+        }
+    }
+
+    fn negate(self) -> Self {
+        Self::Negate(Box::new(self))
     }
 
     fn interact(self, other: Self) -> Self {
-        Self::positive(AstNode::Interact(Box::new(self), Box::new(other)))
+        Self::Interact(Box::new(self), Box::new(other))
     }
 
     fn interact_fully(self, other: Self) -> Self {
-        Self::positive(AstNode::InteractFully(Box::new(self), Box::new(other)))
+        Self::InteractFully(Box::new(self), Box::new(other))
     }
 
     fn nest(self, other: Self) -> Self {
-        Self::positive(AstNode::Nest(Box::new(self), Box::new(other)))
+        Self::Nest(Box::new(self), Box::new(other))
     }
 
-    fn positive(node: AstNode) -> Self {
-        Self {
-            sign: Sign::Positive,
-            node,
-        }
-    }
-
-    fn negate(mut self) -> Self {
-        self.sign = match self.sign {
-            Sign::Positive => Sign::Negative,
-            Sign::Negative => Sign::Positive,
-        };
-        self
-    }
-
-    fn evaluate(&self) -> Vec<Expression> {
-        self.evaluate_from(&[Expression::from_iter([])])
-    }
-
-    fn evaluate_from(&self, initial: &[Expression]) -> Vec<Expression> {
-        match self.sign {
-            Sign::Positive => self.node.evaluate_from(initial),
-            Sign::Negative => {
-                let expressions = self.node.evaluate();
-                combine_expressions(initial, &expressions, |left, right| left.subtract(right))
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Sign {
-    Positive,
-    Negative,
-}
-
-// Inspired by https://docs.rs/winnow/latest/winnow/_topic/lexing/index.html#parse-to-ast
-#[derive(Clone, Debug)]
-enum AstNode {
-    Term(Term),
-    Sum(Vec<SignedNode>),
-    Interact(Box<SignedNode>, Box<SignedNode>),
-    InteractFully(Box<SignedNode>, Box<SignedNode>),
-    Nest(Box<SignedNode>, Box<SignedNode>),
-    Group(Box<SignedNode>),
-    Stepwise {
-        operator: Stepwise,
-        arguments: Vec<SignedNode>,
-    },
-}
-
-impl AstNode {
-    fn evaluate_from(&self, initial: &[Expression]) -> Vec<Expression> {
+    /// Recursively expand stepwise calls while preserving AST
+    fn expand_stepwise(&self) -> Vec<Self> {
         match self {
-            // A sum cumulates operations before evaluation
-            Self::Sum(operations) => operations
-                .iter()
-                .fold(initial.to_vec(), |accumulated, operation| {
-                    operation.evaluate_from(&accumulated)
-                }),
-            // All other nodes are evaluated locally and then cumulated
-            _ => {
-                let expressions = self.evaluate();
-                combine_expressions(initial, &expressions, |left, right| left.add(right))
-            }
-        }
-    }
+            Self::Tilde { left, right } => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Tilde {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            ),
+            Self::Pipe { left, right } => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Pipe {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            ),
+            Self::Term(_) => vec![self.clone()],
+            Self::Negate(node) => node
+                .expand_stepwise()
+                .into_iter()
+                .map(|node| Self::Negate(Box::new(node)))
+                .collect(),
+            Self::Subtract { left, right } => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Subtract {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            ),
+            Self::Sum(operations) => {
+                let mut alternatives = vec![Vec::new()];
 
-    fn evaluate(&self) -> Vec<Expression> {
-        match self {
-            Self::Term(term) => vec![Expression::from(term.clone())],
-            Self::Sum(_) => self.evaluate_from(&[Expression::from_iter([])]),
-            Self::Interact(left, right) => {
-                combine_expressions(&left.evaluate(), &right.evaluate(), |left, right| {
-                    left.interact(&right)
-                })
+                for operation in operations {
+                    alternatives = combine_alternatives(
+                        &alternatives,
+                        &operation.expand_stepwise(),
+                        |mut operations, operation| {
+                            operations.push(operation);
+                            operations
+                        },
+                    );
+                }
+
+                alternatives.into_iter().map(Self::Sum).collect()
             }
-            Self::InteractFully(left, right) => {
-                combine_expressions(&left.evaluate(), &right.evaluate(), |left, right| {
-                    left.interact_fully(right)
-                })
-            }
-            Self::Nest(left, right) => {
-                combine_expressions(&left.evaluate(), &right.evaluate(), |left, right| {
-                    left.nest(right)
-                })
-            }
-            Self::Group(node) => node.evaluate(),
+            Self::Interact(left, right) => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Interact(Box::new(left), Box::new(right)),
+            ),
+            Self::InteractFully(left, right) => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::InteractFully(Box::new(left), Box::new(right)),
+            ),
+            Self::Nest(left, right) => combine_alternatives(
+                &left.expand_stepwise(),
+                &right.expand_stepwise(),
+                |left, right| Self::Nest(Box::new(left), Box::new(right)),
+            ),
+            Self::Group(node) => node
+                .expand_stepwise()
+                .into_iter()
+                .map(|node| Self::Group(Box::new(node)))
+                .collect(),
             Self::Stepwise {
                 operator,
                 arguments,
             } => {
-                let arguments = arguments
-                    .iter()
-                    .map(SignedNode::evaluate)
-                    .collect::<Vec<_>>();
-
-                let mut expressions = match operator {
-                    Stepwise::Sw | Stepwise::Sw0 => arguments.into_iter().flatten().collect(),
-                    Stepwise::Csw | Stepwise::Csw0 => expand_cumulative(arguments),
-                };
-
-                if matches!(operator, Stepwise::Sw0 | Stepwise::Csw0) {
-                    expressions.insert(0, Expression::from_iter([]));
-                }
-
-                expressions
+                let arguments = arguments.iter().map(AstNode::expand_stepwise).collect();
+                operator.expand(arguments)
             }
+        }
+    }
+
+    /// Evaluate AstNode locally into Expression
+    fn evaluate_expression(&self) -> Result<Expression, EvaluationError> {
+        match self {
+            Self::Term(term) => Ok(Expression::from(term.clone())),
+            Self::Negate(_) | Self::Subtract { .. } | Self::Sum(_) => {
+                self.apply_to(Expression::from_iter([]))
+            }
+            Self::Interact(left, right) => {
+                let left = left.evaluate_expression()?;
+                let right = right.evaluate_expression()?;
+
+                Ok(left.interact(&right))
+            }
+            Self::InteractFully(left, right) => {
+                let left = left.evaluate_expression()?;
+                let right = right.evaluate_expression()?;
+
+                Ok(left.interact_fully(right))
+            }
+            Self::Nest(left, right) => {
+                let left = left.evaluate_expression()?;
+                let right = right.evaluate_expression()?;
+
+                Ok(left.nest(right))
+            }
+            Self::Group(node) => node.evaluate_expression(),
+            Self::Tilde { .. } | Self::Pipe { .. } => Err(EvaluationError::ExpectedExpression),
+            Self::Stepwise { .. } => Err(EvaluationError::UnexpandedStepwise),
+        }
+    }
+
+    /// Apply sequential additions and subtractions to the enclosing expression.
+    fn apply_to(&self, accumulated: Expression) -> Result<Expression, EvaluationError> {
+        match self {
+            Self::Sum(operations) => operations
+                .iter()
+                .try_fold(accumulated, |accumulated, operation| {
+                    operation.apply_to(accumulated)
+                }),
+            Self::Negate(node) => node.subtract_from(accumulated),
+            Self::Subtract { left, right } => {
+                let accumulated = left.apply_to(accumulated)?;
+                right.subtract_from(accumulated)
+            }
+            Self::Term(_)
+            | Self::Interact(..)
+            | Self::InteractFully(..)
+            | Self::Nest(..)
+            | Self::Group(_) => Ok(accumulated.add(self.evaluate_expression()?)),
+            Self::Tilde { .. } | Self::Pipe { .. } => Err(EvaluationError::ExpectedExpression),
+            Self::Stepwise { .. } => Err(EvaluationError::UnexpandedStepwise),
+        }
+    }
+
+    /// Cancel a direct negation; evaluate other operands locally before subtraction.
+    fn subtract_from(&self, accumulated: Expression) -> Result<Expression, EvaluationError> {
+        match self {
+            Self::Negate(node) => node.apply_to(accumulated),
+            Self::Term(_)
+            | Self::Sum(_)
+            | Self::Subtract { .. }
+            | Self::Interact(..)
+            | Self::InteractFully(..)
+            | Self::Nest(..)
+            | Self::Group(_) => Ok(accumulated.subtract(self.evaluate_expression()?)),
+            Self::Tilde { .. } | Self::Pipe { .. } => Err(EvaluationError::ExpectedExpression),
+            Self::Stepwise { .. } => Err(EvaluationError::UnexpandedStepwise),
         }
     }
 }
@@ -531,9 +581,47 @@ enum Stepwise {
     Csw0,
 }
 
-fn parse_stepwise<'i>(
-    context: ParseContext,
-) -> impl ModalParser<&'i str, SignedNode, ContextError> {
+impl Stepwise {
+    fn expand(&self, arguments: Vec<Vec<AstNode>>) -> Vec<AstNode> {
+        let mut alternatives = match self {
+            Stepwise::Sw | Stepwise::Sw0 => arguments
+                .into_iter()
+                .flatten()
+                .map(|argument| AstNode::Group(Box::new(argument)))
+                .collect::<Vec<_>>(),
+
+            Stepwise::Csw | Stepwise::Csw0 => {
+                let mut prefixes = vec![Vec::new()];
+                let mut alternatives = Vec::new();
+
+                for argument in arguments {
+                    prefixes =
+                        combine_alternatives(&prefixes, &argument, |mut operations, argument| {
+                            operations.push(AstNode::Group(Box::new(argument)));
+                            operations
+                        });
+
+                    alternatives.extend(
+                        prefixes
+                            .iter()
+                            .cloned()
+                            .map(|operations| AstNode::Group(Box::new(AstNode::Sum(operations)))),
+                    );
+                }
+
+                alternatives
+            }
+        };
+
+        if matches!(self, Stepwise::Sw0 | Stepwise::Csw0) {
+            alternatives.insert(0, AstNode::Group(Box::new(AstNode::Sum(Vec::new()))));
+        }
+
+        alternatives
+    }
+}
+
+fn parse_stepwise<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode, ContextError> {
     move |cursor: &mut &'i str| {
         let operator = terminated(
             alt((
@@ -548,16 +636,16 @@ fn parse_stepwise<'i>(
 
         let arguments = cut_err(parse_stepwise_arguments(context)).parse_next(cursor)?;
 
-        Ok(SignedNode::positive(AstNode::Stepwise {
+        Ok(AstNode::Stepwise {
             operator,
             arguments,
-        }))
+        })
     }
 }
 
 fn parse_node_parenthesized<'i>(
     context: ParseContext,
-) -> impl ModalParser<&'i str, SignedNode, ContextError> {
+) -> impl ModalParser<&'i str, AstNode, ContextError> {
     move |cursor: &mut &'i str| {
         '('.parse_next(cursor)?;
 
@@ -570,16 +658,16 @@ fn parse_node_parenthesized<'i>(
         )
         .parse_next(cursor)?;
 
-        Ok(SignedNode::positive(AstNode::Group(Box::new(node))))
+        Ok(AstNode::Group(Box::new(node)))
     }
 }
 
-fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedNode, ContextError> {
+fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode, ContextError> {
     move |cursor: &mut &'i str| {
         let parse_factor = |cursor: &mut &str| match context {
             ParseContext::Formula => alt((
                 parse_intercept,
-                parse_factor.map(Term::from).map(SignedNode::from),
+                parse_factor.map(Term::from).map(AstNode::from),
             ))
             .parse_next(cursor),
             ParseContext::FixedEffects => {
@@ -588,7 +676,7 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedN
                 ));
                 preceded(
                     cut_err(not(parse_intercept).context(expected)),
-                    parse_column.map(Term::from).map(SignedNode::from),
+                    parse_column.map(Term::from).map(AstNode::from),
                 )
                 .parse_next(cursor)
             }
@@ -607,58 +695,89 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, SignedN
     }
 }
 
-fn parse_formula(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
-    multispace0.parse_next(cursor)?;
-
-    let left = parse_expression
-        .context(StrContext::Label("left-hand expression"))
-        .parse_next(cursor)?;
+fn parse_formula_ast(cursor: &mut &str) -> ModalResult<AstNode> {
+    let left = preceded(
+        multispace0,
+        parse_node(ParseContext::Formula).context(StrContext::Label("left-hand expression")),
+    )
+    .parse_next(cursor)?;
 
     '~'.context(StrContext::Expected(StrContextValue::CharLiteral(
         FORMULA_SEPARATOR,
     )))
     .parse_next(cursor)?;
 
-    multispace0.parse_next(cursor)?;
-
-    let right = cut_err(
-        parse_node(ParseContext::Formula)
-            .map(|node| node.evaluate_from(&[Expression::from(Term::intercept())]))
-            .context(StrContext::Label("right-hand expression")),
+    let right = preceded(
+        multispace0,
+        cut_err(
+            parse_node(ParseContext::Formula).context(StrContext::Label("right-hand expression")),
+        ),
     )
     .parse_next(cursor)?;
 
-    let fixed_effects = opt(preceded(
-        FIXED_EFFECT_SEPARATOR,
-        cut_err(parse_fixed_effects.context(StrContext::Label("fixed-effect expression"))),
+    let pipe_right = opt(preceded(
+        PIPE_SEPARATOR,
+        cut_err(
+            parse_node(ParseContext::FixedEffects)
+                .context(StrContext::Label("fixed-effect expression")),
+        ),
     ))
-    .parse_next(cursor)?
-    .unwrap_or_else(|| vec![Expression::from_iter([])])
-    .into_iter()
-    .map(encode_fixed_effects)
-    .collect::<Vec<_>>();
+    .parse_next(cursor)?;
 
-    let mut formulas = Vec::new();
-    for left in &left {
-        for right in &right {
-            for fixed_effects in &fixed_effects {
-                let right = if fixed_effects.is_empty() {
-                    right.clone()
-                } else {
-                    // Suppress intercept in fixed-effect specifications
-                    right.clone().without_intercept()
-                };
-                let expressions = BTreeMap::from([
-                    (Role::Dependent, left.clone()),
-                    (Role::Independent, right),
-                    (Role::FixedEffect, fixed_effects.clone()),
-                ]);
-                formulas.push(Formula { expressions });
-            }
-        }
+    let formula = AstNode::Tilde {
+        left: Box::new(left),
+        right: Box::new(right),
+    };
+
+    Ok(match pipe_right {
+        Some(right) => AstNode::Pipe {
+            left: Box::new(formula),
+            right: Box::new(right),
+        },
+        None => formula,
+    })
+}
+
+fn evaluate_formula(ast: &AstNode) -> Result<Formula, EvaluationError> {
+    let (left, right_of_pipe) = match ast {
+        AstNode::Pipe { left, right } => (left.as_ref(), Some(right.as_ref())),
+        formula => (formula, None),
+    };
+
+    match left {
+        AstNode::Tilde { left, right } => evaluate_formula_parts(left, right, right_of_pipe),
+        _ => Err(EvaluationError::ExpectedFormula),
     }
+}
 
-    Ok(formulas)
+fn evaluate_formula_parts(
+    left: &AstNode,
+    right: &AstNode,
+    fixed_effects: Option<&AstNode>,
+) -> Result<Formula, EvaluationError> {
+    let left = left.evaluate_expression()?;
+    let right = right.apply_to(Expression::from(Term::intercept()))?;
+
+    let fixed_effects = fixed_effects
+        .map(AstNode::evaluate_expression)
+        .transpose()?
+        .unwrap_or_else(|| Expression::from_iter([]));
+    let fixed_effects = encode_fixed_effects(fixed_effects);
+
+    let right = if fixed_effects.is_empty() {
+        right
+    } else {
+        // Suppress intercept in fixed-effect specifications.
+        right.without_intercept()
+    };
+
+    Ok(Formula {
+        expressions: BTreeMap::from([
+            (Role::Dependent, left),
+            (Role::Independent, right),
+            (Role::FixedEffect, fixed_effects),
+        ]),
+    })
 }
 
 pub(crate) type ParseResult<'i, T> = Result<T, ParseError<&'i str, ContextError>>;
@@ -672,11 +791,17 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
 
     for source in input {
         let expanded = terminated(
-            parse_formula,
+            parse_formula_ast,
             eof.context(StrContext::Expected(StrContextValue::Description(
                 "a formula operator or end of input",
             ))),
         )
+        .try_map(|ast| {
+            ast.expand_stepwise()
+                .iter()
+                .map(evaluate_formula)
+                .collect::<Result<Vec<_>, _>>()
+        })
         .parse(source)?;
 
         for formula in expanded {
@@ -792,10 +917,166 @@ enum ParseContext {
     Formula,
     FixedEffects,
 }
+#[derive(Debug)]
+enum EvaluationError {
+    ExpectedExpression,
+    ExpectedFormula,
+    UnexpandedStepwise,
+}
+
+impl std::fmt::Display for EvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ExpectedExpression => "expected an expression node",
+            Self::ExpectedFormula => "expected a formula node",
+            Self::UnexpandedStepwise => "stepwise expansion must precede evaluation",
+        })
+    }
+}
+
+impl std::error::Error for EvaluationError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
+        parse_node(ParseContext::FixedEffects)
+            .try_map(|node| {
+                node.expand_stepwise()
+                    .iter()
+                    .map(AstNode::evaluate_expression)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .parse_next(cursor)
+    }
+
+    mod ast {
+        use super::*;
+
+        fn assert_term(node: &AstNode, name: &str) {
+            let AstNode::Term(term) = node else {
+                panic!("expected term {name}, got {node:?}");
+            };
+            assert_eq!(term, &Term::from(Factor::from(name)));
+        }
+
+        fn group_contents(node: &AstNode) -> &AstNode {
+            let AstNode::Group(inner) = node else {
+                panic!("expected a group, got {node:?}");
+            };
+            inner
+        }
+
+        #[test]
+        fn parsing_preserves_formula_delimiters() {
+            let ast = parse_formula_ast.parse("y ~ x | firm").unwrap();
+            let AstNode::Pipe { left, right } = &ast else {
+                panic!("expected a pipe, got {ast:?}");
+            };
+            assert_term(right, "firm");
+            let AstNode::Tilde { left, right } = left.as_ref() else {
+                panic!("expected a tilde, got {left:?}");
+            };
+            assert_term(left, "y");
+            assert_term(right, "x");
+        }
+
+        #[test]
+        fn parsing_preserves_subtraction() {
+            let ast = parse_node(ParseContext::Formula).parse("x - z").unwrap();
+            let AstNode::Subtract { left, right } = &ast else {
+                panic!("expected subtraction, got {ast:?}");
+            };
+            assert_term(left, "x");
+            assert_term(right, "z");
+        }
+
+        #[test]
+        fn parsing_does_not_cancel_double_negation() {
+            let ast = parse_node(ParseContext::Formula).parse("--x").unwrap();
+            let AstNode::Negate(outer) = &ast else {
+                panic!("expected outer negation, got {ast:?}");
+            };
+            let AstNode::Negate(inner) = outer.as_ref() else {
+                panic!("expected inner negation, got {outer:?}");
+            };
+            assert_term(inner, "x");
+        }
+
+        #[test]
+        fn parsing_preserves_grouped_negation_in_subtraction() {
+            let ast = parse_node(ParseContext::Formula).parse("x - (-z)").unwrap();
+            let AstNode::Subtract { left, right } = &ast else {
+                panic!("expected subtraction, got {ast:?}");
+            };
+            assert_term(left, "x");
+            let AstNode::Negate(node) = group_contents(right) else {
+                panic!("expected grouped negation, got {right:?}");
+            };
+            assert_term(node, "z");
+        }
+
+        #[test]
+        fn stepwise_expansion_preserves_formula_and_argument_groups() {
+            let ast = parse_formula_ast.parse("y ~ sw(x, z)").unwrap();
+            let AstNode::Tilde { right, .. } = &ast else {
+                panic!("expected a tilde, got {ast:?}");
+            };
+            assert!(matches!(right.as_ref(), AstNode::Stepwise { .. }));
+
+            let alternatives = ast.expand_stepwise();
+            assert_eq!(alternatives.len(), 2);
+            for (alternative, name) in alternatives.iter().zip(["x", "z"]) {
+                let AstNode::Tilde { left, right } = alternative else {
+                    panic!("expected a tilde, got {alternative:?}");
+                };
+                assert_term(left, "y");
+                assert_term(group_contents(right), name);
+            }
+        }
+
+        #[test]
+        fn zero_step_expansion_produces_an_empty_group() {
+            for source in ["sw0(x)", "csw0(x)"] {
+                let ast = parse_node(ParseContext::Formula).parse(source).unwrap();
+                let alternatives = ast.expand_stepwise();
+                assert_eq!(alternatives.len(), 2, "{source}");
+                let AstNode::Sum(operations) = group_contents(&alternatives[0]) else {
+                    panic!("expected an empty sum for {source}");
+                };
+                assert!(operations.is_empty(), "{source}");
+            }
+        }
+
+        #[test]
+        fn cumulative_expansion_preserves_prefix_order_and_local_groups() {
+            let ast = parse_node(ParseContext::Formula)
+                .parse("csw(sw(a, b), sw(c, d))")
+                .unwrap();
+            let alternatives = ast.expand_stepwise();
+            let expected: &[&[&str]] = &[
+                &["a"],
+                &["b"],
+                &["a", "c"],
+                &["a", "d"],
+                &["b", "c"],
+                &["b", "d"],
+            ];
+            assert_eq!(alternatives.len(), expected.len());
+            for (alternative, names) in alternatives.iter().zip(expected) {
+                let AstNode::Sum(operations) = group_contents(alternative) else {
+                    panic!("expected a grouped cumulative sum, got {alternative:?}");
+                };
+                assert_eq!(operations.len(), names.len());
+                for (operation, name) in operations.iter().zip(*names) {
+                    // Both the cumulative argument and its nested sw argument
+                    // establish local evaluation scope.
+                    assert_term(group_contents(group_contents(operation)), name);
+                }
+            }
+        }
+    }
 
     #[test]
     fn fixed_effect_expressions_preserve_grouping_and_stepwise_expansion() {
@@ -1676,34 +1957,88 @@ mod tests {
 
     mod evaluation {
         use super::*;
+
         #[test]
-        fn signed_ast_evaluation_preserves_operations_and_grouping() {
-            let x = || SignedNode::from(Term::from(Factor::from("x")));
-            let intercept = || SignedNode::from(Term::intercept());
-            let seed = [Expression::from(Term::intercept())];
+        fn local_evaluation_and_application_preserve_sign_and_group_scope() {
+            for (source, local, applied) in [
+                ("--x", expression(&[&["x"]]), expression(&[&[], &["x"]])),
+                ("-(-x)", expression(&[]), expression(&[&[]])),
+                (
+                    "x - -z",
+                    expression(&[&["x"], &["z"]]),
+                    expression(&[&[], &["x"], &["z"]]),
+                ),
+                (
+                    "x - (-z)",
+                    expression(&[&["x"]]),
+                    expression(&[&[], &["x"]]),
+                ),
+                (
+                    "x - 1 - -1",
+                    expression(&[&["x"], &[]]),
+                    expression(&[&["x"], &[]]),
+                ),
+                ("x - 1 - (-1)", expression(&[&["x"]]), expression(&[&["x"]])),
+            ] {
+                let node = parse_node(ParseContext::Formula).parse(source).unwrap();
+                assert_eq!(node.evaluate_expression().unwrap(), local, "{source}");
+                assert_eq!(
+                    node.apply_to(Expression::from(Term::intercept())).unwrap(),
+                    applied,
+                    "{source}",
+                );
+            }
+        }
+
+        #[test]
+        fn evaluation_reports_wrong_node_categories_and_unexpanded_stepwise() {
+            let expression = parse_node(ParseContext::Formula).parse("x").unwrap();
+            assert!(matches!(
+                evaluate_formula(&expression),
+                Err(EvaluationError::ExpectedFormula)
+            ));
+
+            let formula = parse_formula_ast.parse("y ~ x").unwrap();
+            assert!(matches!(
+                formula.evaluate_expression(),
+                Err(EvaluationError::ExpectedExpression)
+            ));
+
+            let stepwise = parse_node(ParseContext::Formula).parse("sw(x, z)").unwrap();
+            assert!(matches!(
+                stepwise.evaluate_expression(),
+                Err(EvaluationError::UnexpandedStepwise)
+            ));
+        }
+
+        #[test]
+        fn evaluation_preserves_signs_and_grouping() {
+            let x = || AstNode::from(Term::from(Factor::from("x")));
+            let intercept = || AstNode::from(Term::intercept());
+            let seed = Expression::from(Term::intercept());
 
             // x - 1 removes the RHS seed.
-            let removed = SignedNode::positive(AstNode::Sum(vec![x(), intercept().negate()]));
-            assert_eq!(removed.evaluate_from(&seed), vec![expression(&[&["x"]])],);
+            let removed = x().subtract(intercept());
+            assert_eq!(
+                removed.apply_to(seed.clone()).unwrap(),
+                expression(&[&["x"]]),
+            );
 
             // (x - 1) evaluates locally, preserving the outer seed.
-            let grouped = SignedNode::positive(AstNode::Group(Box::new(removed.clone())));
+            let grouped = AstNode::Group(Box::new(removed.clone()));
             assert_eq!(
-                grouped.evaluate_from(&seed),
-                vec![expression(&[&[], &["x"]])],
+                grouped.apply_to(seed.clone()).unwrap(),
+                expression(&[&[], &["x"]]),
             );
 
             // A later + 1 restores the intercept.
-            let restored = SignedNode::positive(AstNode::Sum(vec![removed, intercept()]));
-            assert_eq!(
-                restored.evaluate_from(&seed),
-                vec![expression(&[&["x"], &[]])],
-            );
+            let restored = AstNode::Sum(vec![removed, intercept()]);
+            assert_eq!(restored.apply_to(seed).unwrap(), expression(&[&["x"], &[]]),);
 
             // Reversing a negative sign adds the intercept.
             assert_eq!(
-                intercept().negate().negate().evaluate(),
-                vec![expression(&[&[]])],
+                intercept().negate().negate().evaluate_expression().unwrap(),
+                expression(&[&[]]),
             );
         }
     }
