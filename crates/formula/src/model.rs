@@ -519,15 +519,26 @@ mod tests {
     #[test]
     fn models_lookup_by_formula() {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
-        let specification = crate::parse("y ~ sw(x, z)").unwrap();
-        let models = specification.fit(&data).unwrap();
+        for source in [
+            "y ~ sw(x, z)",
+            "y ~ x + [x ~ sw(x, z)]",
+            "y ~ [x ~ z - 1] - 1",
+        ] {
+            let specification = crate::parse(source).unwrap();
+            let models = specification.fit(&data).unwrap();
 
-        for (expected, formula) in models.iter().zip(specification.formulas()) {
-            assert!(std::ptr::eq(models.get(formula).unwrap(), expected));
-        }
-        for source in ["y ~ x + z", "y ~ x - 1"] {
-            let query = crate::parse(source).unwrap();
-            assert!(models.get(&query.formulas()[0]).is_none());
+            for (expected, formula) in models.iter().zip(specification.formulas()) {
+                assert!(std::ptr::eq(models.get(formula).unwrap(), expected));
+                let rendered = formula.to_string();
+                assert!(std::ptr::eq(
+                    models.get_by_str(&rendered).unwrap().unwrap(),
+                    expected,
+                ));
+            }
+            for source in ["y ~ x + z", "y ~ x - 1"] {
+                let query = crate::parse(source).unwrap();
+                assert!(models.get(&query.formulas()[0]).is_none());
+            }
         }
     }
 

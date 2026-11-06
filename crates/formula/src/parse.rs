@@ -300,7 +300,13 @@ fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode, C
         expression(parse_operand(context))
             .prefix(
                 preceded(multispace0, '-')
-                    .value(Prefix(PREFIX_PRECEDENCE, |_, node: AstNode| {
+                    .value(Prefix(PREFIX_PRECEDENCE, |cursor, node: AstNode| {
+                        if node.contains_multistage() {
+                            return cut_err(fail.context(StrContext::Label(
+                                "multistage formulas may only be added",
+                            )))
+                            .parse_next(cursor);
+                        }
                         Ok(node.negate())
                     }))
                     .context(StrContext::Expected(StrContextValue::Description(
@@ -311,20 +317,53 @@ fn parse_node<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode, C
                 '+'.value(Left(SUM_PRECEDENCE, |_, left: AstNode, right: AstNode| {
                     Ok(left.add(right))
                 })),
-                '-'.value(Left(SUM_PRECEDENCE, |_, left: AstNode, right: AstNode| {
-                    Ok(left.subtract(right))
-                })),
+                '-'.value(Left(
+                    SUM_PRECEDENCE,
+                    |cursor, left: AstNode, right: AstNode| {
+                        if right.contains_multistage() {
+                            return cut_err(fail.context(StrContext::Label(
+                                "multistage formulas may only be added",
+                            )))
+                            .parse_next(cursor);
+                        }
+                        Ok(left.subtract(right))
+                    },
+                )),
                 '*'.value(Left(
                     PRODUCT_PRECEDENCE,
-                    |_, left: AstNode, right: AstNode| Ok(left.interact_fully(right)),
+                    |cursor, left: AstNode, right: AstNode| {
+                        if left.contains_multistage() || right.contains_multistage() {
+                            return cut_err(fail.context(StrContext::Label(
+                                "multistage formulas may only be added",
+                            )))
+                            .parse_next(cursor);
+                        }
+                        Ok(left.interact_fully(right))
+                    },
                 )),
                 '/'.value(Left(
                     PRODUCT_PRECEDENCE,
-                    |_, left: AstNode, right: AstNode| Ok(left.nest(right)),
+                    |cursor, left: AstNode, right: AstNode| {
+                        if left.contains_multistage() || right.contains_multistage() {
+                            return cut_err(fail.context(StrContext::Label(
+                                "multistage formulas may only be added",
+                            )))
+                            .parse_next(cursor);
+                        }
+                        Ok(left.nest(right))
+                    },
                 )),
                 ':'.value(Right(
                     INTERACTION_PRECEDENCE,
-                    |_, left: AstNode, right: AstNode| Ok(left.interact(right)),
+                    |cursor, left: AstNode, right: AstNode| {
+                        if left.contains_multistage() || right.contains_multistage() {
+                            return cut_err(fail.context(StrContext::Label(
+                                "multistage formulas may only be added",
+                            )))
+                            .parse_next(cursor);
+                        }
+                        Ok(left.interact(right))
+                    },
                 )),
             )))
             .parse_next(cursor)
@@ -381,6 +420,7 @@ enum AstNode {
         operator: Stepwise,
         arguments: Vec<AstNode>,
     },
+    Multistage(Box<AstNode>),
 }
 
 impl From<Term> for AstNode {
@@ -499,6 +539,11 @@ impl AstNode {
                 let arguments = arguments.iter().map(AstNode::expand_stepwise).collect();
                 operator.expand(arguments)
             }
+            Self::Multistage(formula) => formula
+                .expand_stepwise()
+                .into_iter()
+                .map(|formula| Self::Multistage(Box::new(formula)))
+                .collect(),
         }
     }
 
@@ -530,6 +575,10 @@ impl AstNode {
             Self::Group(node) => node.evaluate_expression(),
             Self::Tilde { .. } | Self::Pipe { .. } => Err(EvaluationError::ExpectedExpression),
             Self::Stepwise { .. } => Err(EvaluationError::UnexpandedStepwise),
+            Self::Multistage(formula) => {
+                let child = evaluate_formula(formula)?;
+                Ok(Expression::new([], vec![child]))
+            }
         }
     }
 
@@ -547,6 +596,7 @@ impl AstNode {
                 right.subtract_from(accumulated)
             }
             Self::Term(_)
+            | Self::Multistage(_)
             | Self::Interact(..)
             | Self::InteractFully(..)
             | Self::Nest(..)
@@ -569,6 +619,24 @@ impl AstNode {
             | Self::Group(_) => Ok(accumulated.subtract(self.evaluate_expression()?)),
             Self::Tilde { .. } | Self::Pipe { .. } => Err(EvaluationError::ExpectedExpression),
             Self::Stepwise { .. } => Err(EvaluationError::UnexpandedStepwise),
+            Self::Multistage(_) => Err(EvaluationError::MultistageArithmetic),
+        }
+    }
+
+    fn contains_multistage(&self) -> bool {
+        match self {
+            Self::Multistage(_) => true,
+            Self::Term(_) | Self::Tilde { .. } | Self::Pipe { .. } => false,
+            Self::Negate(node) | Self::Group(node) => node.contains_multistage(),
+            Self::Subtract { left, right }
+            | Self::Interact(left, right)
+            | Self::InteractFully(left, right)
+            | Self::Nest(left, right) => left.contains_multistage() || right.contains_multistage(),
+            Self::Sum(operations)
+            | Self::Stepwise {
+                arguments: operations,
+                ..
+            } => operations.iter().any(Self::contains_multistage),
         }
     }
 }
@@ -666,6 +734,7 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode
     move |cursor: &mut &'i str| {
         let parse_factor = |cursor: &mut &str| match context {
             ParseContext::Formula => alt((
+                parse_multistage,
                 parse_intercept,
                 parse_factor.map(Term::from).map(AstNode::from),
             ))
@@ -693,6 +762,20 @@ fn parse_operand<'i>(context: ParseContext) -> impl ModalParser<&'i str, AstNode
         )
         .parse_next(cursor)
     }
+}
+
+fn parse_multistage(cursor: &mut &str) -> ModalResult<AstNode> {
+    preceded(
+        '[',
+        cut_err(terminated(
+            parse_formula_ast,
+            ']'.context(StrContext::Expected(StrContextValue::Description(
+                "']' to close the nested formula",
+            ))),
+        )),
+    )
+    .map(|formula| AstNode::Multistage(Box::new(formula)))
+    .parse_next(cursor)
 }
 
 fn parse_formula_ast(cursor: &mut &str) -> ModalResult<AstNode> {
@@ -922,6 +1005,7 @@ enum EvaluationError {
     ExpectedExpression,
     ExpectedFormula,
     UnexpandedStepwise,
+    MultistageArithmetic,
 }
 
 impl std::fmt::Display for EvaluationError {
@@ -930,6 +1014,7 @@ impl std::fmt::Display for EvaluationError {
             Self::ExpectedExpression => "expected an expression node",
             Self::ExpectedFormula => "expected a formula node",
             Self::UnexpandedStepwise => "stepwise expansion must precede evaluation",
+            Self::MultistageArithmetic => "multistage formulas may only be added",
         })
     }
 }
@@ -939,6 +1024,124 @@ impl std::error::Error for EvaluationError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod multistage {
+        use super::*;
+
+        fn formula(source: &str) -> Formula {
+            let specification = parse(source).unwrap();
+            assert_eq!(specification.formulas().len(), 1, "{source}");
+            specification.formulas()[0].clone()
+        }
+
+        fn attach(mut parent: Formula, role: Role, children: Vec<Formula>) -> Formula {
+            let expression = parent.expressions.remove(&role).unwrap();
+            parent
+                .expressions
+                .insert(role, expression.add(Expression::new([], children)));
+            parent
+        }
+
+        #[test]
+        fn intercept_defaults_and_controls_are_local() {
+            for (source, outer, child) in [
+                ("y ~ x + [a ~ z]", "y ~ x", "a ~ z"),
+                ("y ~ x - 1 + [a ~ z]", "y ~ x - 1", "a ~ z"),
+                ("y ~ x + [a ~ z - 1]", "y ~ x", "a ~ z - 1"),
+                ("y ~ x + [a ~ z | firm]", "y ~ x", "a ~ z | firm"),
+                ("y ~ x + [a ~ z] | year", "y ~ x | year", "a ~ z"),
+            ] {
+                assert_eq!(
+                    formula(source),
+                    attach(formula(outer), Role::Independent, vec![formula(child)]),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn siblings_and_descendants_retain_local_expressions() {
+            let child = attach(formula("a ~ z"), Role::Independent, vec![formula("b ~ w")]);
+            let expected = attach(
+                formula("y ~ x"),
+                Role::Independent,
+                vec![child, formula("c ~ v")],
+            );
+            assert_eq!(formula("y ~ x + [a ~ z + [b ~ w]] + [c ~ v]"), expected);
+
+            let source = "y ~ x + [log(a) + b:c ~ C(g) + poly(z, degree=2) | firm]";
+            let expected = attach(
+                formula("y ~ x"),
+                Role::Independent,
+                vec![formula("log(a) + b:c ~ C(g) + poly(z, degree=2) | firm")],
+            );
+            assert_eq!(formula(source), expected);
+        }
+
+        #[test]
+        fn attachment_preserves_the_containing_role() {
+            let child = formula("a ~ z");
+            let dependent = attach(formula("0 ~ x"), Role::Dependent, vec![child.clone()]);
+            let independent = attach(formula("0 ~ x"), Role::Independent, vec![child]);
+            assert_eq!(formula("[a ~ z] ~ x"), dependent);
+            assert_eq!(formula("0 ~ x + [a ~ z]"), independent);
+            assert_ne!(dependent, independent);
+        }
+
+        #[test]
+        fn subtraction_changes_only_local_terms() {
+            for (source, outer) in [
+                ("y ~ x + [a ~ z] - a", "y ~ x"),
+                ("y ~ x + a + [a ~ z] - a", "y ~ x"),
+                ("y ~ x + [a ~ z] - x", "y ~ 1"),
+                ("y ~ x + [a ~ z] - (x + 1)", "y ~ 0"),
+            ] {
+                assert_eq!(
+                    formula(source),
+                    attach(formula(outer), Role::Independent, vec![formula("a ~ z")]),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn stepwise_expansion_preserves_parent_child_order() {
+            let actual = parse("y ~ sw(x, w) + [sw(a, b) ~ sw(z, v)] + [c ~ q]").unwrap();
+            let mut expected = Vec::new();
+            for outer in ["x", "w"] {
+                for dependent in ["a", "b"] {
+                    for independent in ["z", "v"] {
+                        expected.push(attach(
+                            formula(&format!("y ~ {outer}")),
+                            Role::Independent,
+                            vec![
+                                formula(&format!("{dependent} ~ {independent}")),
+                                formula("c ~ q"),
+                            ],
+                        ));
+                    }
+                }
+            }
+            assert_eq!(actual.formulas(), expected);
+        }
+
+        #[test]
+        fn stepwise_zero_and_cumulative_children_preserve_intercept_removal() {
+            let parent = formula("y ~ x - 1");
+            let first = attach(parent.clone(), Role::Independent, vec![formula("a ~ z")]);
+            let both = attach(first.clone(), Role::Independent, vec![formula("b ~ w")]);
+            assert_eq!(
+                parse("y ~ x - 1 + sw0([a ~ z])").unwrap().formulas(),
+                &[parent, first.clone()]
+            );
+            assert_eq!(
+                parse("y ~ x - 1 + csw([a ~ z], [b ~ w])")
+                    .unwrap()
+                    .formulas(),
+                &[first, both]
+            );
+        }
+    }
 
     fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
         parse_node(ParseContext::FixedEffects)
@@ -2045,6 +2248,89 @@ mod tests {
 
     mod errors {
         use super::*;
+
+        #[test]
+        fn multistage_arithmetic_is_rejected_before_evaluation() {
+            for source in [
+                "y ~ x * [a ~ z]",
+                "y ~ [a ~ z] * x",
+                "y ~ x : [a ~ z]",
+                "y ~ [a ~ z] : x",
+                "y ~ x / [a ~ z]",
+                "y ~ [a ~ z] / x",
+                "y ~ x - [a ~ z]",
+                "y ~ -[a ~ z]",
+                "y ~ --[a ~ z]",
+                "y ~ x - -[a ~ z]",
+                "y ~ x * ([a ~ z] + w)",
+                "y ~ ([a ~ z] + w) : x",
+                "y ~ x - (w + [a ~ z])",
+                "y ~ -([a ~ z] + w)",
+                "y ~ x * sw(w, [a ~ z])",
+                "y ~ x / sw0([a ~ z])",
+                "y ~ x - csw(w, [a ~ z])",
+                "y ~ -sw([a ~ z], w)",
+                "y ~ x + [a ~ z * [b ~ w]]",
+            ] {
+                // Test the syntax parser directly: evaluation is not involved.
+                let error = parse_formula_ast.parse(source).unwrap_err();
+                assert!(
+                    error.inner().context().any(|context| {
+                        context == &StrContext::Label("multistage formulas may only be added")
+                    }),
+                    "{source}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn fixed_effect_expressions_reject_multistage_blocks_in_any_grouping() {
+            for source in [
+                "y ~ x | [a ~ z]",
+                "y ~ x | firm + [a ~ z]",
+                "y ~ x | ([a ~ z])",
+                "y ~ x | sw(firm, [a ~ z])",
+                "y ~ x | csw0(firm, [a ~ z])",
+                "y ~ x + [a ~ z | [b ~ w]]",
+            ] {
+                assert!(parse_formula_ast.parse(source).is_err(), "{source}");
+            }
+        }
+
+        #[test]
+        fn missing_multistage_closing_brackets_report_the_expected_delimiter() {
+            for source in [
+                "y ~ x + [a ~ z",
+                "y ~ [a ~ z | firm",
+                "y ~ [a ~ z + [b ~ w]",
+            ] {
+                let error = parse(source).unwrap_err();
+                assert!(
+                    error.inner().context().any(|context| {
+                        context
+                            == &StrContext::Expected(StrContextValue::Description(
+                                "']' to close the nested formula",
+                            ))
+                    }),
+                    "{source}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_multistage_formulas_are_rejected() {
+            for source in [
+                "y ~ []",
+                "y ~ [a]",
+                "y ~ [~ z]",
+                "y ~ [a ~]",
+                "y ~ [a ~ z]]",
+                "y ~ [[a ~ z]]",
+                "y ~ [a ~ z)",
+            ] {
+                assert!(parse(source).is_err(), "{source}");
+            }
+        }
 
         #[test]
         fn formula_boundaries_report_context_and_offsets() {
