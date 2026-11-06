@@ -98,6 +98,12 @@ impl Model {
         Ok(Self::new(self.formula.clone(), expressions, self.height))
     }
 
+    pub fn children(&self, role: Role) -> Result<&[Self], SelectionError> {
+        self.expression(role)
+            .map(FittedExpression::children)
+            .ok_or(SelectionError::MissingRole(role))
+    }
+
     fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
         for expression in self.expressions.values() {
             output.push(expression.expression());
@@ -117,6 +123,12 @@ impl Model {
 
 pub struct Models {
     entries: Vec<Model>,
+}
+
+impl FromIterator<Model> for Models {
+    fn from_iter<T: IntoIterator<Item = Model>>(entries: T) -> Self {
+        Self::new(entries.into_iter().collect())
+    }
 }
 
 impl Models {
@@ -485,6 +497,11 @@ mod tests {
         let model = models.iter().next().unwrap();
 
         assert!(model.expression(Role::FixedEffect).is_none());
+        assert!(matches!(
+            model.children(Role::FixedEffect),
+            Err(SelectionError::MissingRole(Role::FixedEffect))
+        ));
+        assert!(model.children(Role::Independent).unwrap().is_empty());
         assert_eq!(
             model.expression(Role::Independent).unwrap().frame().shape(),
             (2, 0)
