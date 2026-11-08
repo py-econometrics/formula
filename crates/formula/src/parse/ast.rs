@@ -1,3 +1,5 @@
+use crate::formula;
+
 pub(super) enum Forbidden {}
 
 pub(super) enum Simple {}
@@ -20,6 +22,39 @@ pub(super) enum Stepwise {
     Sw0,
     Csw,
     Csw0,
+}
+
+impl Stepwise {
+    fn expand(
+        &self,
+        arguments: impl IntoIterator<Item = Vec<formula::Expression>>,
+    ) -> Vec<formula::Expression> {
+        let mut alternatives = match self {
+            Self::Sw | Self::Sw0 => arguments.into_iter().flatten().collect::<Vec<_>>(),
+
+            Self::Csw | Self::Csw0 => {
+                let mut prefixes = vec![formula::Expression::from_iter([])];
+                let mut alternatives = Vec::new();
+
+                for argument in arguments {
+                    prefixes =
+                        super::combine_alternatives(&prefixes, &argument, |prefix, value| {
+                            prefix.add(value)
+                        });
+
+                    alternatives.extend(prefixes.iter().cloned());
+                }
+
+                alternatives
+            }
+        };
+
+        if matches!(self, Self::Sw0 | Self::Csw0) {
+            alternatives.insert(0, formula::Expression::from_iter([]));
+        }
+
+        alternatives
+    }
 }
 
 pub(super) struct StepwiseCall<E> {
@@ -115,7 +150,51 @@ impl<K: Construct> Expression<K> {
     }
 }
 
+impl Expression<Simple> {
+    fn expand_operand(term: &formula::Term) -> Vec<formula::Expression> {
+        vec![formula::Expression::from(term.clone())]
+    }
+
+    pub(super) fn expand(&self) -> Vec<formula::Expression> {
+        expand_arithmetic(self, Self::expand_operand)
+    }
+
+    pub(super) fn apply_to(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
+        apply_arithmetic(self, accumulated, Self::expand_operand)
+    }
+
+    fn subtract_from(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
+        if let Self::Negate(value) = self {
+            value.apply_to(accumulated)
+        } else {
+            self.expand()
+                .into_iter()
+                .map(|value| accumulated.clone().subtract(value))
+                .collect()
+        }
+    }
+}
+
 impl Expression<Multistage> {
+    fn expand_operand(operand: &MultistageOperand) -> Vec<formula::Expression> {
+        match operand {
+            MultistageOperand::Term(term) => vec![formula::Expression::from(term.clone())],
+            MultistageOperand::Formula(child) => child
+                .expand()
+                .into_iter()
+                .map(|child| formula::Expression::new([], vec![child]))
+                .collect(),
+        }
+    }
+
+    pub(super) fn expand(&self) -> Vec<formula::Expression> {
+        expand_arithmetic(self, Self::expand_operand)
+    }
+
+    pub(super) fn apply_to(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
+        apply_arithmetic(self, accumulated, Self::expand_operand)
+    }
+
     pub(super) fn into_simple(self) -> Result<Expression<Simple>, ConstructionError> {
         Ok(match self {
             Self::Empty => Expression::Empty,
@@ -145,6 +224,153 @@ impl Expression<Multistage> {
             Self::Interact(node) => Expression::Interact(node),
             Self::InteractFully(node) => Expression::InteractFully(node),
             Self::Nesting(node) => Expression::Nesting(node),
+        })
+    }
+}
+
+impl Expression<FixedEffect> {
+    pub(super) fn expand(&self) -> Vec<formula::Expression> {
+        match self {
+            Self::Empty => vec![formula::Expression::from_iter([])],
+
+            Self::Operand(name) => vec![formula::Expression::from(formula::Term::from(
+                formula::Factor::from(name.as_str()),
+            ))],
+
+            Self::Add(node) => super::combine_alternatives(
+                &node.left.expand(),
+                &node.right.expand(),
+                |left, right| left.add(right),
+            ),
+
+            Self::Interact(node) => super::combine_alternatives(
+                &node.left.expand(),
+                &node.right.expand(),
+                |left, right| left.interact(&right),
+            ),
+
+            Self::Group(value) => value.expand(),
+
+            Self::Stepwise(call) => call.operator.expand(
+                std::iter::once(call.first.as_ref())
+                    .chain(call.rest.iter())
+                    .map(Self::expand),
+            ),
+
+            Self::Subtract(impossible) => match *impossible {},
+            Self::Negate(impossible) => match *impossible {},
+            Self::InteractFully(impossible) => match *impossible {},
+            Self::Nesting(impossible) => match *impossible {},
+        }
+    }
+}
+
+fn expand_arithmetic<K>(
+    expression: &Expression<K>,
+    expand_operand: fn(&K::Operand) -> Vec<formula::Expression>,
+) -> Vec<formula::Expression>
+where
+    K: Kind<
+            Addition = Binary<Expression<K>>,
+            Subtraction = Binary<Expression<K>, Expression<Simple>>,
+            Negation = Box<Expression<Simple>>,
+            Interaction = Binary<Expression<Simple>>,
+            FullInteraction = Binary<Expression<Simple>>,
+            Nesting = Binary<Expression<Simple>>,
+        >,
+{
+    match expression {
+        Expression::Empty => vec![formula::Expression::from_iter([])],
+        Expression::Operand(operand) => expand_operand(operand),
+        Expression::Add(_) | Expression::Subtract(_) | Expression::Negate(_) => apply_arithmetic(
+            expression,
+            formula::Expression::from_iter([]),
+            expand_operand,
+        ),
+        Expression::Interact(node) => {
+            super::combine_alternatives(&node.left.expand(), &node.right.expand(), |left, right| {
+                left.interact(&right)
+            })
+        }
+        Expression::InteractFully(node) => {
+            super::combine_alternatives(&node.left.expand(), &node.right.expand(), |left, right| {
+                left.interact_fully(right)
+            })
+        }
+        Expression::Nesting(node) => {
+            super::combine_alternatives(&node.left.expand(), &node.right.expand(), |left, right| {
+                left.nest(right)
+            })
+        }
+        Expression::Group(value) => expand_arithmetic(value, expand_operand),
+        Expression::Stepwise(call) => call.operator.expand(
+            std::iter::once(call.first.as_ref())
+                .chain(call.rest.iter())
+                .map(|argument| expand_arithmetic(argument, expand_operand)),
+        ),
+    }
+}
+
+fn apply_arithmetic<K>(
+    expression: &Expression<K>,
+    accumulated: formula::Expression,
+    expand_operand: fn(&K::Operand) -> Vec<formula::Expression>,
+) -> Vec<formula::Expression>
+where
+    K: Kind<
+            Addition = Binary<Expression<K>>,
+            Subtraction = Binary<Expression<K>, Expression<Simple>>,
+            Negation = Box<Expression<Simple>>,
+            Interaction = Binary<Expression<Simple>>,
+            FullInteraction = Binary<Expression<Simple>>,
+            Nesting = Binary<Expression<Simple>>,
+        >,
+{
+    match expression {
+        Expression::Add(node) => apply_arithmetic(&node.left, accumulated, expand_operand)
+            .into_iter()
+            .flat_map(|value| apply_arithmetic(&node.right, value, expand_operand))
+            .collect(),
+        Expression::Subtract(node) => apply_arithmetic(&node.left, accumulated, expand_operand)
+            .into_iter()
+            .flat_map(|value| node.right.subtract_from(value))
+            .collect(),
+        Expression::Negate(value) => value.subtract_from(accumulated),
+        _ => expand_arithmetic(expression, expand_operand)
+            .into_iter()
+            .map(|value| accumulated.clone().add(value))
+            .collect(),
+    }
+}
+
+impl Formula {
+    pub(super) fn expand(&self) -> Vec<formula::Formula> {
+        let left = self.left.expand();
+        let right = self
+            .right
+            .apply_to(formula::Expression::from(formula::Term::intercept()));
+        let fixed_effects = self
+            .fixed_effects
+            .as_ref()
+            .map(Expression::<FixedEffect>::expand)
+            .unwrap_or_else(|| vec![formula::Expression::from_iter([])]);
+
+        let sides = super::combine_alternatives(&left, &right, |left, right| (left, right));
+        super::combine_alternatives(&sides, &fixed_effects, |(left, right), fixed_effects| {
+            let fixed_effects = formula::encode_fixed_effects(fixed_effects);
+            let right = if fixed_effects.is_empty() {
+                right
+            } else {
+                right.without_intercept()
+            };
+
+            formula::Formula {
+                expressions: std::collections::BTreeMap::from([
+                    (formula::Role::Dependent, left),
+                    (formula::Role::Independent, right),
+                    (formula::Role::FixedEffect, fixed_effects),
+                ]),
+            }
         })
     }
 }
@@ -312,11 +538,7 @@ impl std::fmt::Display for ConstructionError {
                 f.write_str("fixed effects require column references")
             }
             Self::FixedEffectOperator(operator) => {
-                write!(
-                    f,
-                    "operator {operator} is not supported in fixed effects; \
-                     only + and : are allowed"
-                )
+                write!(f, "operator {operator} is not supported in fixed effects")
             }
         }
     }
