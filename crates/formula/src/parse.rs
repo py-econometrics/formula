@@ -1,7 +1,10 @@
+mod ast;
+
 use crate::fit::Fit;
 use crate::formula::{
     Expression, Factor, Formula, Role, Specification, Term, encode_fixed_effects, push_unique,
 };
+use crate::parse::ast::Stepwise;
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
 };
@@ -639,14 +642,6 @@ impl AstNode {
             } => operations.iter().any(Self::contains_multistage),
         }
     }
-}
-
-#[derive(Clone, Debug)]
-enum Stepwise {
-    Sw,
-    Sw0,
-    Csw,
-    Csw0,
 }
 
 impl Stepwise {
