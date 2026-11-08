@@ -156,10 +156,8 @@ y ~ 1 + x | firm         # Fixed effects suppress even an explicitly requested i
 Each grouping term produces one integer-coded column. Column names preserve the input column
 names and factor order: `firm:year` and `year:firm` retain their respective order.
 
-The pipe accepts column references and their sums and interaction.
-Transform calls such as `log(x)`, `C(firm)`, and `poly(x)` are rejected after the pipe.
-Intercept terms `0` and `1` are also rejected in fixed-effect expressions;
-use backticks for grouping columns named `0` or `1`.
+The fixed-effect pipe accepts column references, addition (`+`), interactions (`:`),
+parentheses, and stepwise calls (`sw`, `sw0`, `csw`, `csw0`).
 
 ### Transformations
 
