@@ -5,49 +5,49 @@ use pyo3_polars::PyDataFrame;
 #[pymodule]
 mod _formula {
     #[pymodule_export]
-    use super::{Model, Models, Role, Specification, parse, parse_many};
+    use super::{FittedFormula, FittedFormulas, Formulas, Role, parse, parse_many};
 }
 
 #[pyfunction]
-fn parse(formulas: &str) -> PyResult<Specification> {
+fn parse(formulas: &str) -> PyResult<Formulas> {
     formula::parse(formulas)
-        .map(|inner| Specification { inner })
+        .map(|inner| Formulas { inner })
         .map_err(|error| PySyntaxError::new_err(error.to_string()))
 }
 
 #[pyfunction]
-fn parse_many(formulas: Vec<String>) -> PyResult<Specification> {
+fn parse_many(formulas: Vec<String>) -> PyResult<Formulas> {
     formula::parse_many(formulas.iter().map(String::as_str))
-        .map(|inner| Specification { inner })
+        .map(|inner| Formulas { inner })
         .map_err(|error| PySyntaxError::new_err(error.to_string()))
 }
 
 #[pyclass(frozen, module = "formula")]
-struct Specification {
-    inner: formula::Specification,
+struct Formulas {
+    inner: formula::Formulas,
 }
 
 #[pymethods]
-impl Specification {
-    fn fit(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<Models> {
+impl Formulas {
+    fn fit(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<FittedFormulas> {
         py.detach(|| self.inner.fit(&data.0))
-            .map(|inner| Models { inner })
+            .map(|inner| FittedFormulas { inner })
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 }
 
 #[pyclass(frozen, module = "formula")]
-struct Models {
-    inner: formula::Models,
+struct FittedFormulas {
+    inner: formula::FittedFormulas,
 }
 
 #[pymethods]
-impl Models {
+impl FittedFormulas {
     fn __len__(&self) -> usize {
         self.inner.len()
     }
 
-    fn __getitem__(&self, key: ModelKey) -> PyResult<Model> {
+    fn __getitem__(&self, key: ModelKey) -> PyResult<FittedFormula> {
         let inner = match key {
             ModelKey::Index(index) => {
                 let index = if index < 0 {
@@ -67,7 +67,7 @@ impl Models {
                 .ok_or_else(|| PyKeyError::new_err(source))?,
         };
 
-        Ok(Model {
+        Ok(FittedFormula {
             inner: inner.clone(),
         })
     }
@@ -92,12 +92,12 @@ impl Models {
 }
 
 #[pyclass(frozen, module = "formula")]
-struct Model {
-    inner: formula::Model,
+struct FittedFormula {
+    inner: formula::FittedFormula,
 }
 
 #[pymethods]
-impl Model {
+impl FittedFormula {
     #[getter]
     fn formula(&self) -> String {
         self.inner.formula().to_string()
@@ -128,10 +128,10 @@ impl Model {
             })
     }
 
-    fn children(&self, role: Role) -> PyResult<Models> {
+    fn children(&self, role: Role) -> PyResult<FittedFormulas> {
         self.inner
             .children(role.into())
-            .map(|children| Models {
+            .map(|children| FittedFormulas {
                 inner: children.iter().cloned().collect(),
             })
             .map_err(|error| PyKeyError::new_err(error.to_string()))

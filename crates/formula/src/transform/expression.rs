@@ -185,7 +185,7 @@ mod tests {
     use crate::transform::Transform;
     use winnow::Parser;
 
-    fn fit(source: &str, data: &DataFrame) -> crate::Model {
+    fn fit(source: &str, data: &DataFrame) -> crate::FittedFormula {
         let models = crate::parse(&format!("x ~ {source} - 1"))
             .unwrap()
             .fit(data)

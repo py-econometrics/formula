@@ -28,7 +28,7 @@ def data() -> polars.DataFrame:
 )
 def test_parse_and_fit(formulas, expected_columns, data):
     specification = formula.parse(formulas)
-    assert isinstance(specification, formula.Specification)
+    assert isinstance(specification, formula.Formulas)
     models = specification.fit(data)
 
     assert len(models) == len(expected_columns)
@@ -77,7 +77,7 @@ def test_model_indexing(data):
     models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).fit(data)
 
     by_formula = models["y ~ x - 1"]
-    assert isinstance(by_formula, formula.Model)
+    assert isinstance(by_formula, formula.FittedFormula)
     assert by_formula.formula == models[0].formula == "y ~ x - 1"
     assert models[" y~x -1 "].formula == by_formula.formula
     independent = by_formula.select(formula.Role.Independent).frame()
@@ -122,7 +122,7 @@ def test_expanded_models_can_be_looked_up_by_their_formula(source, data):
 
 def test_model_owns_its_data_and_returns_independent_frames(data):
     model = formula.parse("y ~ x - 1").fit(data)[0]
-    assert isinstance(model, formula.Model)
+    assert isinstance(model, formula.FittedFormula)
     frame = model.frame()
     frame.replace_column(1, polars.Series("x", [99.0, 99.0, 99.0]))
 
@@ -165,9 +165,9 @@ def test_children_preserve_role_attachment_order_and_navigation(data):
     ).fit(data)
     model = models[0]
     children = model.children(formula.Role.Independent)
-    assert isinstance(children, formula.Models)
+    assert isinstance(children, formula.FittedFormulas)
     assert len(children) == 2
-    assert all(isinstance(child, formula.Model) for child in children)
+    assert all(isinstance(child, formula.FittedFormula) for child in children)
     assert_frame_equal(
         children[0].select(formula.Role.Dependent).frame(), data.select("x")
     )
@@ -177,7 +177,7 @@ def test_children_preserve_role_attachment_order_and_navigation(data):
     grandchild = children[0].children(formula.Role.Independent)[0]
     assert_frame_equal(grandchild.frame(), data.select("z", "x"))
     empty = children[1].children(formula.Role.Independent)
-    assert isinstance(empty, formula.Models)
+    assert isinstance(empty, formula.FittedFormulas)
     assert len(empty) == 0
     with pytest.raises(IndexError):
         empty[0]
@@ -249,8 +249,8 @@ def test_select_accepts_single_roles_and_sequences(data, roles):
     models = formula.parse("y ~ x - 1").fit(data)
     selected_model = models[0].select(roles)
     selected_models = models.select(roles)
-    assert isinstance(selected_model, formula.Model)
-    assert isinstance(selected_models, formula.Models)
+    assert isinstance(selected_model, formula.FittedFormula)
+    assert isinstance(selected_models, formula.FittedFormulas)
 
     new_data = data.select("x")
     for model in (selected_model, selected_models[0]):

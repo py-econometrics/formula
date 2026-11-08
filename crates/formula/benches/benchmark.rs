@@ -2,7 +2,7 @@
 
 mod results;
 
-use formula::{Models, Role, parse};
+use formula::{FittedFormulas, Role, parse};
 use polars::prelude::*;
 use results::{ModelShape, Operation, Output, Results, Sample};
 use std::env;
@@ -52,7 +52,7 @@ fn measure_samples(
     formula: &str,
     operation: Operation,
     samples: usize,
-    mut run: impl FnMut() -> Models,
+    mut run: impl FnMut() -> FittedFormulas,
 ) -> Vec<Sample> {
     drop(black_box(run())); // One unreported warm-up.
     (0..samples)
@@ -74,7 +74,7 @@ fn measure_samples(
         .collect()
 }
 
-fn model_shapes(models: &Models) -> Output {
+fn model_shapes(models: &FittedFormulas) -> Output {
     Output::Fitted {
         models: models
             .iter()
