@@ -3,7 +3,7 @@ mod ast;
 use crate::fit::Fit;
 #[cfg(test)]
 use crate::formula::Expression;
-use crate::formula::{Factor, Formula, Specification, Term, push_unique};
+use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::Stepwise;
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
@@ -467,11 +467,11 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::Formula> {
 
 pub(crate) type ParseResult<'i, T> = Result<T, ParseError<&'i str, ContextError>>;
 
-pub fn parse(source: &str) -> ParseResult<'_, Specification> {
+pub fn parse(source: &str) -> ParseResult<'_, Formulas> {
     parse_many(std::iter::once(source))
 }
 
-pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'a, Specification> {
+pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'a, Formulas> {
     let mut formulas: Vec<Formula> = Vec::new();
 
     for source in input {
@@ -489,7 +489,7 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
         }
     }
 
-    Ok(Specification::new(formulas))
+    Ok(Formulas::new(formulas))
 }
 
 impl TryFrom<TransformCall> for Factor {
@@ -1208,7 +1208,7 @@ mod tests {
                 ],
             ),
         ] {
-            let expected = Specification::new(
+            let expected = Formulas::new(
                 right
                     .into_iter()
                     .map(|right| Formula {
@@ -1369,7 +1369,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 super::parse(source).unwrap(),
-                Specification::new(expected),
+                Formulas::new(expected),
                 "{source}"
             );
         }
@@ -1413,7 +1413,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 super::parse(source).unwrap(),
-                Specification::new(expected),
+                Formulas::new(expected),
                 "{source}"
             );
         }
@@ -1530,7 +1530,7 @@ mod tests {
         }
         assert_eq!(
             parse("sw ~ csw0 + sw0x").unwrap(),
-            Specification::new(vec![Formula {
+            Formulas::new(vec![Formula {
                 expressions: BTreeMap::from([
                     (Role::Dependent, expression(&[&["sw"]])),
                     (Role::Independent, expression(&[&[], &["csw0"], &["sw0x"]])),

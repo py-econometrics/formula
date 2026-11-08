@@ -23,29 +23,30 @@ data = polars.DataFrame(
     }
 )
 
-specification = formula.parse("y ~ sw(x, z) | firm")  # Parse into a specification
-models = specification.fit(data)  # Fit specification given input data
-model = models[0]  # Integer indexing follows expansion order
-same_model = models[model.formula]  # Look up an expanded model by its formula
+formulas = formula.parse("y ~ sw(x, z) | firm")  # Parse and expand formulas
+fits = formulas.fit(data)  # Compute columns and learn transformation state
+fit = fits[0]  # Integer indexing follows expansion order
+same_fit = fits[fit.formula]  # Look up a fitted formula by its formula string
 
 # Access the complete frame or select specific roles
-frame = model.frame()
-dependent = model.select(formula.Role.Dependent).frame()
-independent = model.select(formula.Role.Independent).frame()
-fixed_effects = model.select(formula.Role.FixedEffect).frame()
+frame = fit.frame()
+dependent = fit.select(formula.Role.Dependent).frame()
+independent = fit.select(formula.Role.Independent).frame()
+fixed_effects = fit.select(formula.Role.FixedEffect).frame()
 
 # Select roles before transforming data that has no dependent column.
-predictors = models.select([formula.Role.Independent, formula.Role.FixedEffect])
+predictors = fits.select([formula.Role.Independent, formula.Role.FixedEffect])
 new_data = polars.DataFrame({"x": [8.0], "z": [9.0], "firm": ["a"]})
 transformed = predictors.transform(new_data)
 ```
 
 `parse` accepts one formula string or a sequence of strings and returns a
-`Specification`. Its `fit` method returns one model per expanded formula, containing
-the computed columns and learned transformation state. `transform` computes columns
+`Formulas` collection. Its `fit` method returns `FittedFormulas`, containing one
+`FittedFormula` per expanded formula, with the computed columns and learned
+transformation state. `transform` computes columns
 for new data using that learned state. Fitting does not estimate regression coefficients.
 `frame()` returns a Polars `DataFrame` containing all selected roles. `select` and
-`transform` return new models and retain fitted transform state. Selecting an absent
+`transform` return new fitted formulas and retain fitted transform state. Selecting an absent
 role raises `KeyError`.
 
 ## Rust API
@@ -73,20 +74,20 @@ fn main() {
     let formula =
         "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year";
 
-    // Stores all specifications associated with a formula
-    let specification = parse(formula).expect("valid formula");
+    // Stores the expanded formulas
+    let formulas = parse(formula).expect("valid formula");
 
-    // Fitting a specification on data creates a collection of `Model`s
-    // Transformations and data are shared across models, so no work is duplicated
+    // Fitting formulas creates a collection of `FittedFormula`s
+    // Transformations and data are shared across fitted formulas
     let data = sample_data(1_000_000).expect("valid sample data");
-    let models = specification
+    let fits = formulas
         .fit(&data)
         .expect("successful fitting");
 
-    for model in &models {
-        println!("Model {}", model.formula());
-        println!("Fitted frame:\n{}", model.frame().expect("valid frame"));
-        let independent = model
+    for fit in &fits {
+        println!("Formula {}", fit.formula());
+        println!("Fitted frame:\n{}", fit.frame().expect("valid frame"));
+        let independent = fit
             .select(&[Role::Independent])
             .expect("independent role exists");
         println!("Independent design:\n{}", independent.frame().expect("valid frame"));
@@ -131,7 +132,7 @@ endogenous = child.select(formula.Role.Dependent).frame()
 instruments = child.select(formula.Role.Independent).frame()
 ```
 
-`children(role)` returns a `Models` collection in attachment order, supporting
+`children(role)` returns a `FittedFormulas` collection in attachment order, supporting
 integer and formula-string indexing, selection, and transformation. A present
 role without children returns an empty collection; an absent or excluded role
 raises `KeyError`.
@@ -188,15 +189,15 @@ column with a numeric name, quote it: ``mul(x, `2`)``.
 `formula` supports the [`fixest`](https://lrberge.github.io/fixest/index.html)-style
 [multiple estimation syntax](https://lrberge.github.io/fixest/reference/index.html#multiple-estimations)
 which enables generating
-multiple model specifications from a single formula. For example, the formula
+multiple formulas from a single formula string. For example, the formula
 `y ~ sw(x1, x2)` expands to the formulas `y ~ x1` and `y ~ x2`.
 
-| Operator             | Models generated                                                                   |
+| Operator             | Formulas generated                                                                 |
 |----------------------|------------------------------------------------------------------------------------|
-| `sw(x, z, w, ...)`   | One model per argument: `x`, `z`, `w`, and so on.                                  |
-| `sw0(x, z, w, ...)`  | An empty expression, then one model per argument: `x`, `z`, `w`, and so on.        |
-| `csw(x, z, w, ...)`  | Cumulative models: `x`, then `x + z`, then `x + z + w`, and so on.                 |
-| `csw0(x, z, w, ...)` | An empty expression, then cumulative models: `x`, `x + z`, `x + z + w`, and so on. |
+| `sw(x, z, w, ...)`   | One formula per argument: `x`, `z`, `w`, and so on.                                |
+| `sw0(x, z, w, ...)`  | An empty expression, then one formula per argument: `x`, `z`, `w`, and so on.      |
+| `csw(x, z, w, ...)`  | Cumulative formulas: `x`, then `x + z`, then `x + z + w`, and so on.               |
+| `csw0(x, z, w, ...)` | An empty expression, then cumulative formulas: `x`, `x + z`, `x + z + w`, and so on. |
 
 The empty alternative adds no terms and does not restore a removed intercept.
 For example, `y ~ x - 1 + sw0(z)` expands to `y ~ x - 1` and `y ~ x + z - 1`.

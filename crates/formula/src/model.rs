@@ -13,13 +13,13 @@ use winnow::combinator::fail;
 use winnow::error::{ContextError, StrContext, StrContextValue};
 
 #[derive(Clone, Debug)]
-pub struct Model {
+pub struct FittedFormula {
     formula: Formula,
     expressions: BTreeMap<Role, FittedExpression>,
     height: usize,
 }
 
-impl Model {
+impl FittedFormula {
     pub(crate) fn new(
         formula: Formula,
         expressions: BTreeMap<Role, FittedExpression>,
@@ -121,22 +121,22 @@ impl Model {
     }
 }
 
-pub struct Models {
-    entries: Vec<Model>,
+pub struct FittedFormulas {
+    entries: Vec<FittedFormula>,
 }
 
-impl FromIterator<Model> for Models {
-    fn from_iter<T: IntoIterator<Item = Model>>(entries: T) -> Self {
+impl FromIterator<FittedFormula> for FittedFormulas {
+    fn from_iter<T: IntoIterator<Item = FittedFormula>>(entries: T) -> Self {
         Self::new(entries.into_iter().collect())
     }
 }
 
-impl Models {
-    pub(crate) fn new(entries: Vec<Model>) -> Self {
+impl FittedFormulas {
+    pub(crate) fn new(entries: Vec<FittedFormula>) -> Self {
         Self { entries }
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, Model> {
+    pub fn iter(&self) -> std::slice::Iter<'_, FittedFormula> {
         self.entries.iter()
     }
 
@@ -148,11 +148,11 @@ impl Models {
         self.entries.is_empty()
     }
 
-    fn get(&self, formula: &Formula) -> Option<&Model> {
+    fn get(&self, formula: &Formula) -> Option<&FittedFormula> {
         self.entries.iter().find(|model| model.formula() == formula)
     }
 
-    pub fn get_by_str<'a>(&self, source: &'a str) -> ParseResult<'a, Option<&Model>> {
+    pub fn get_by_str<'a>(&self, source: &'a str) -> ParseResult<'a, Option<&FittedFormula>> {
         let specification = parse(source)?;
 
         if let [formula] = specification.formulas() {
@@ -168,7 +168,7 @@ impl Models {
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
-        self.iter().flat_map(Model::all_expressions)
+        self.iter().flat_map(FittedFormula::all_expressions)
     }
 
     pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
@@ -197,9 +197,9 @@ impl Models {
     }
 }
 
-impl<'a> IntoIterator for &'a Models {
-    type Item = &'a Model;
-    type IntoIter = std::slice::Iter<'a, Model>;
+impl<'a> IntoIterator for &'a FittedFormulas {
+    type Item = &'a FittedFormula;
+    type IntoIter = std::slice::Iter<'a, FittedFormula>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.entries.iter()

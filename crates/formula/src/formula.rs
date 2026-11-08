@@ -1,5 +1,5 @@
 use crate::fit::{Definition, Fit};
-use crate::model::{Model, ModelError, Models};
+use crate::model::{FittedFormula, FittedFormulas, ModelError};
 use crate::parse::{FORMULA_SEPARATOR, PIPE_SEPARATOR, is_identifier_character, parse_scalar};
 use crate::transform::{
     ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
@@ -464,7 +464,7 @@ impl Formula {
             .try_for_each(|(_, expression)| expression.validate())
     }
 
-    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Model, ModelError> {
+    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<FittedFormula, ModelError> {
         let expressions = self
             .expressions
             .iter()
@@ -475,7 +475,7 @@ impl Formula {
             })
             .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
-        Ok(Model::new(self.clone(), expressions, height))
+        Ok(FittedFormula::new(self.clone(), expressions, height))
     }
 
     fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
@@ -531,11 +531,11 @@ impl std::fmt::Display for Formula {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Specification {
+pub struct Formulas {
     formulas: Vec<Formula>,
 }
 
-impl Specification {
+impl Formulas {
     pub(crate) fn new(formulas: Vec<Formula>) -> Self {
         Self { formulas }
     }
@@ -544,7 +544,7 @@ impl Specification {
         &self.formulas
     }
 
-    pub fn fit(&self, data: &DataFrame) -> Result<Models, ModelError> {
+    pub fn fit(&self, data: &DataFrame) -> Result<FittedFormulas, ModelError> {
         for formula in &self.formulas {
             formula.validate()?;
         }
@@ -563,7 +563,7 @@ impl Specification {
             .map(|formula| formula.assemble(data.height(), &terms))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
-        Ok(Models::new(entries))
+        Ok(FittedFormulas::new(entries))
     }
 }
 
@@ -591,11 +591,11 @@ pub(crate) struct FittedTerm {
 pub(crate) struct FittedExpression {
     expression: Expression,
     frame: DataFrame,
-    children: Vec<Model>,
+    children: Vec<FittedFormula>,
 }
 
 impl FittedExpression {
-    fn new(expression: Expression, frame: DataFrame, children: Vec<Model>) -> Self {
+    fn new(expression: Expression, frame: DataFrame, children: Vec<FittedFormula>) -> Self {
         Self {
             expression,
             frame,
@@ -611,7 +611,7 @@ impl FittedExpression {
         &self.frame
     }
 
-    pub(crate) fn children(&self) -> &[Model] {
+    pub(crate) fn children(&self) -> &[FittedFormula] {
         &self.children
     }
 }
@@ -877,7 +877,7 @@ mod tests {
     use polars::prelude::Scalar;
     use winnow::Parser;
 
-    fn fit(source: &str, data: &DataFrame) -> Model {
+    fn fit(source: &str, data: &DataFrame) -> FittedFormula {
         let models = crate::parse(source).unwrap().fit(data).unwrap();
         assert_eq!(models.len(), 1);
         models.iter().next().unwrap().clone()
@@ -907,13 +907,11 @@ mod tests {
             "c" => [13.0, 14.0], "v" => [15.0, 16.0],
         )
         .unwrap();
-        let models = Specification::new(vec![root.clone()])
-            .fit(&training)
-            .unwrap();
+        let models = Formulas::new(vec![root.clone()]).fit(&training).unwrap();
         let model = models.iter().next().unwrap();
         assert_eq!(model.formula(), &root);
 
-        let check = |model: &Model, data: &DataFrame| {
+        let check = |model: &FittedFormula, data: &DataFrame| {
             let children = model.children(Role::Independent).unwrap();
             assert_eq!(children.len(), 2);
             let grandchildren = children[0].children(Role::Dependent).unwrap();
@@ -976,7 +974,7 @@ mod tests {
                         .push(child);
                 }
             }
-            let models = Specification::new(vec![formula]).fit(&data).unwrap();
+            let models = Formulas::new(vec![formula]).fit(&data).unwrap();
             let model = models.iter().next().unwrap();
 
             for (role, column, child_column) in cases {
@@ -1204,7 +1202,7 @@ mod tests {
                 } else {
                     formula
                 };
-                let models = Specification::new(vec![formula]).fit(&training).unwrap();
+                let models = Formulas::new(vec![formula]).fit(&training).unwrap();
                 let model = models.iter().next().unwrap();
                 let training_node = if as_child {
                     &model.children(Role::Independent).unwrap()[0]
@@ -1667,7 +1665,7 @@ mod tests {
                 ),
             ]),
         };
-        let models = Specification::new(vec![formula]).fit(&data).unwrap();
+        let models = Formulas::new(vec![formula]).fit(&data).unwrap();
         let reordered = data.select(["b", "y", "a"]).unwrap();
         let transformed = models.transform(&reordered).unwrap();
         assert!(
@@ -1879,7 +1877,7 @@ mod tests {
 
         const INTERACTION: &str = "sqrt(exp(sqrt(g))):x";
 
-        fn fixture() -> (Specification, DataFrame) {
+        fn fixture() -> (Formulas, DataFrame) {
             let data = polars::df!(
                 "y1" => [1.0, 2.0, 3.0], "y2" => [4.0, 5.0, 6.0],
                 "g" => [Some(0.0), Some(1.0), None], "x" => [2.0, 3.0, 4.0],
@@ -2188,7 +2186,7 @@ mod tests {
         let models = specification.fit(&training).unwrap();
         assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
 
-        let assert_shared = |models: &crate::Models, expected: &[Option<f64>]| {
+        let assert_shared = |models: &crate::FittedFormulas, expected: &[Option<f64>]| {
             let designs = models
                 .iter()
                 .map(|model| model.expression(Role::Independent).unwrap())
@@ -2253,7 +2251,7 @@ mod tests {
             .unwrap()
             .children
             .push(child);
-        let models = Specification::new(vec![formula]).fit(&training).unwrap();
+        let models = Formulas::new(vec![formula]).fit(&training).unwrap();
         let model = models.iter().next().unwrap();
         // Each transform runs once across both local roles and the child.
         assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
@@ -2404,10 +2402,10 @@ mod tests {
     fn public_pipeline_types_remain_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
 
-        assert_send_sync::<Specification>();
+        assert_send_sync::<Formulas>();
         assert_send_sync::<Formula>();
-        assert_send_sync::<crate::Models>();
-        assert_send_sync::<Model>();
+        assert_send_sync::<crate::FittedFormulas>();
+        assert_send_sync::<FittedFormula>();
     }
 
     #[test]

@@ -20,22 +20,22 @@ fn main() {
     let formula =
         "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year";
 
-    // Stores all specifications associated with a formula
-    let specification = parse(formula).expect("valid formula");
+    // Stores the expanded formulas
+    let formulas = parse(formula).expect("valid formula");
 
-    // Fitting a specification on data creates a collection of `Model`s
-    // Transformations and data are shared across models, so no work is duplicated
+    // Fitting formulas creates a collection of `FittedFormula`s
+    // Transformations and data are shared across fitted formulas
     let data = sample_data(1_000_000).expect("valid sample data");
-    let models = specification.fit(&data).expect("successful fitting");
+    let fits = formulas.fit(&data).expect("successful fitting");
 
-    for model in &models {
-        println!("Model {}", model.formula());
+    for fit in &fits {
+        println!("Formula {}", fit.formula());
         for (role, label) in [
             (Role::Dependent, "Dependent design"),
             (Role::Independent, "Independent design"),
             (Role::FixedEffect, "Fixed effects"),
         ] {
-            let selected = model.select(&[role]).expect("role exists in the formula");
+            let selected = fit.select(&[role]).expect("role exists in the formula");
             println!("{label}:\n{}", selected.frame().expect("valid frame"));
         }
     }
