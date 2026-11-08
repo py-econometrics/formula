@@ -1,16 +1,13 @@
 use crate::Formula;
 use crate::fit::FitError;
 use crate::formula::{
-    Expression, FittedExpression, FittedTerm, Role, ValidationError, transform_terms,
+    Expression, FittedExpression, FittedTerm, Role, ValidationError, parse_one, transform_terms,
 };
-use crate::parse::{ParseResult, parse};
+use crate::parse::ParseResult;
 use crate::transform::TransformError;
 use polars::error::PolarsResult;
 use polars::prelude::DataFrame;
 use std::collections::BTreeMap;
-use winnow::Parser;
-use winnow::combinator::fail;
-use winnow::error::{ContextError, StrContext, StrContextValue};
 
 #[derive(Clone, Debug)]
 pub struct FittedFormula {
@@ -153,18 +150,8 @@ impl FittedFormulas {
     }
 
     pub fn get_by_str<'a>(&self, source: &'a str) -> ParseResult<'a, Option<&FittedFormula>> {
-        let specification = parse(source)?;
-
-        if let [formula] = specification.formulas() {
-            return Ok(self.get(formula));
-        }
-
-        // A formula string expanding to multiple formulas is not supported
-        fail::<_, _, ContextError>
-            .context(StrContext::Expected(StrContextValue::Description(
-                "exactly one formula",
-            )))
-            .parse(source)
+        let formula = parse_one(source)?;
+        Ok(self.get(&formula))
     }
 
     fn expressions(&self) -> impl Iterator<Item = &Expression> {
@@ -518,7 +505,7 @@ mod tests {
         let expected = crate::parse_many(["y ~ x", "y ~ z"]).unwrap();
         assert_eq!(models.len(), 2);
         assert!(!models.is_empty());
-        for (model, expected) in models.iter().zip(expected.formulas()) {
+        for (model, expected) in models.iter().zip(&expected) {
             assert_eq!(model.formula(), expected);
             assert_eq!(
                 model
@@ -544,7 +531,7 @@ mod tests {
             let specification = crate::parse(source).unwrap();
             let models = specification.fit(&data).unwrap();
 
-            for (expected, formula) in models.iter().zip(specification.formulas()) {
+            for (expected, formula) in models.iter().zip(&specification) {
                 assert!(std::ptr::eq(models.get(formula).unwrap(), expected));
                 let rendered = formula.to_string();
                 assert!(std::ptr::eq(
@@ -554,7 +541,7 @@ mod tests {
             }
             for source in ["y ~ x + z", "y ~ x - 1"] {
                 let query = crate::parse(source).unwrap();
-                assert!(models.get(&query.formulas()[0]).is_none());
+                assert!(models.get(query.iter().next().unwrap()).is_none());
             }
         }
     }

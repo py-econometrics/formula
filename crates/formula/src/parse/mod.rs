@@ -603,8 +603,8 @@ mod tests {
 
         fn formula(source: &str) -> Formula {
             let specification = parse(source).unwrap();
-            assert_eq!(specification.formulas().len(), 1, "{source}");
-            specification.formulas()[0].clone()
+            assert_eq!(specification.len(), 1, "{source}");
+            specification.iter().next().unwrap().clone()
         }
 
         fn attach(mut parent: Formula, role: Role, children: Vec<Formula>) -> Formula {
@@ -695,7 +695,7 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(actual.formulas(), expected);
+            assert_eq!(actual, expected.into_iter().collect::<Formulas>());
         }
 
         #[test]
@@ -704,14 +704,12 @@ mod tests {
             let first = attach(parent.clone(), Role::Independent, vec![formula("a ~ z")]);
             let both = attach(first.clone(), Role::Independent, vec![formula("b ~ w")]);
             assert_eq!(
-                parse("y ~ x - 1 + sw0([a ~ z])").unwrap().formulas(),
-                &[parent, first.clone()]
+                parse("y ~ x - 1 + sw0([a ~ z])").unwrap(),
+                [parent, first.clone()].into_iter().collect::<Formulas>()
             );
             assert_eq!(
-                parse("y ~ x - 1 + csw([a ~ z], [b ~ w])")
-                    .unwrap()
-                    .formulas(),
-                &[first, both]
+                parse("y ~ x - 1 + csw([a ~ z], [b ~ w])").unwrap(),
+                [first, both].into_iter().collect::<Formulas>()
             );
         }
     }
@@ -809,7 +807,7 @@ mod tests {
             assert_term(&call.rest[0], "z");
 
             let expected = parse_many(["y ~ x", "y ~ z"]).unwrap();
-            assert_eq!(ast.expand(), expected.formulas());
+            assert_eq!(ast.expand().into_iter().collect::<Formulas>(), expected);
         }
 
         #[test]
@@ -1259,13 +1257,13 @@ mod tests {
         let sources = [source, String::from("y ~ x"), String::from("y ~ w")];
         let actual = parse_many(sources.iter().map(String::as_str)).unwrap();
         let expected = parse_many(["y ~ x", "y ~ z", "y ~ w"]).unwrap();
-        assert_eq!(actual.formulas(), expected.formulas());
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn parse_many_handles_empty_input() {
         let specification = parse_many(std::iter::empty()).unwrap();
-        assert!(specification.formulas().is_empty());
+        assert!(specification.is_empty());
     }
 
     #[test]
@@ -1365,7 +1363,7 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| parse(source).unwrap().formulas()[0].clone())
+                .map(|source| parse(source).unwrap().iter().next().unwrap().clone())
                 .collect::<Vec<_>>();
             assert_eq!(
                 super::parse(source).unwrap(),
@@ -1409,7 +1407,7 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| parse(source).unwrap().formulas()[0].clone())
+                .map(|source| parse(source).unwrap().iter().next().unwrap().clone())
                 .collect::<Vec<_>>();
             assert_eq!(
                 super::parse(source).unwrap(),
@@ -1647,7 +1645,7 @@ mod tests {
             let actual = parse(source).unwrap();
             assert_eq!(actual, parse(expanded).unwrap(), "{source}");
             assert_eq!(
-                actual.formulas()[0].expressions[&Role::Independent],
+                actual.iter().next().unwrap().expressions[&Role::Independent],
                 expected,
                 "{source}"
             );
@@ -1681,7 +1679,7 @@ mod tests {
 
         for source in ["y~x+z", "y ~ x + z", " \n y \t~\n x + z \t"] {
             assert_eq!(
-                parse(source).expect(source).formulas()[0].clone(),
+                parse(source).expect(source).iter().next().unwrap().clone(),
                 expected,
                 "{source}"
             );
