@@ -47,6 +47,12 @@ pub(crate) struct VariableDefinition {
     name: String,
 }
 
+impl VariableDefinition {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct VariableState {
     dtype: DataType,
@@ -196,6 +202,13 @@ impl Term {
 
     pub(crate) fn intercept() -> Self {
         Self { factors: vec![] }
+    }
+
+    pub(crate) fn as_factor(&self) -> Option<&Factor> {
+        match self.factors.as_slice() {
+            [factor] => Some(factor.as_ref()),
+            _ => None,
+        }
     }
 
     fn is_intercept(&self) -> bool {
