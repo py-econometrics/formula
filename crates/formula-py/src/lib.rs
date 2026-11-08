@@ -127,6 +127,15 @@ impl Model {
                 formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
             })
     }
+
+    fn children(&self, role: Role) -> PyResult<Models> {
+        self.inner
+            .children(role.into())
+            .map(|children| Models {
+                inner: children.iter().cloned().collect(),
+            })
+            .map_err(|error| PyKeyError::new_err(error.to_string()))
+    }
 }
 
 #[pyclass(frozen, eq, from_py_object, module = "formula")]

@@ -131,12 +131,20 @@ def test_model_owns_its_data_and_returns_independent_frames(data):
     assert_frame_equal(original, data.select("x"))
 
 
-def test_model_transform_reuses_fitted_categories(data):
-    model = formula.parse("y ~ C(firm) - 1").fit(data)[0]
+@pytest.mark.parametrize("as_child", [False, True])
+def test_model_transform_reuses_fitted_categories(data, as_child):
+    source = "y ~ C(firm) - 1"
+    if as_child:
+        source = f"y ~ x + [{source}]"
+    models = formula.parse(source).fit(data)
+    parent = models[0]
+    model = parent.children(formula.Role.Independent)[0] if as_child else parent
+    del parent, models
     training = model.select(formula.Role.Independent).frame()
 
     # Only one training category occurs in the new data; retain both columns.
-    transformed = model.transform(data.slice(1, 1))
+    # A child owns its fitted state and no longer requires the parent's x column.
+    transformed = model.transform(data.select("y", "firm").slice(1, 1))
     independent = transformed.select(formula.Role.Independent).frame()
     dependent = transformed.select(formula.Role.Dependent).frame()
     assert_frame_equal(independent, training.slice(1, 1))
@@ -144,6 +152,81 @@ def test_model_transform_reuses_fitted_categories(data):
 
     original = model.select(formula.Role.Independent).frame()
     assert_frame_equal(original, training)
+    selected = model.select(formula.Role.Independent)
+    assert_frame_equal(
+        selected.transform(data.select("firm").slice(1, 1)).frame(),
+        training.slice(1, 1),
+    )
+
+
+def test_children_preserve_role_attachment_order_and_navigation(data):
+    models = formula.parse(
+        "[z ~ x - 1] ~ x + [x ~ z + [z ~ x - 1] - 1] + [z ~ x - 1] - 1"
+    ).fit(data)
+    model = models[0]
+    children = model.children(formula.Role.Independent)
+    assert isinstance(children, formula.Models)
+    assert len(children) == 2
+    assert all(isinstance(child, formula.Model) for child in children)
+    assert_frame_equal(
+        children[0].select(formula.Role.Dependent).frame(), data.select("x")
+    )
+    assert_frame_equal(
+        children[1].select(formula.Role.Dependent).frame(), data.select("z")
+    )
+    grandchild = children[0].children(formula.Role.Independent)[0]
+    assert_frame_equal(grandchild.frame(), data.select("z", "x"))
+    empty = children[1].children(formula.Role.Independent)
+    assert isinstance(empty, formula.Models)
+    assert len(empty) == 0
+    with pytest.raises(IndexError):
+        empty[0]
+    assert_frame_equal(children["z ~ x - 1"].frame(), children[-1].frame())
+    assert_frame_equal(children[children[0].formula].frame(), children[0].frame())
+    with pytest.raises(KeyError, match="missing"):
+        children["z ~ missing"]
+    with pytest.raises(IndexError):
+        children[2]
+    with pytest.raises(SyntaxError):
+        children["z ~"]
+    with pytest.raises(SyntaxError, match="exactly one formula"):
+        children["z ~ sw(x, z)"]
+    assert_frame_equal(model.frame(), data.select("x"))
+
+    # A role with children but no local terms is still selectable and navigable.
+    dependent = model.select(formula.Role.Dependent)
+    assert dependent.frame().width == 0
+    assert_frame_equal(
+        dependent.children(formula.Role.Dependent)[0].frame(), data.select("z", "x")
+    )
+    for target, missing in [
+        (model, formula.Role.FixedEffect),
+        (dependent, formula.Role.Independent),
+        (model.select(formula.Role.Independent), formula.Role.Dependent),
+    ]:
+        with pytest.raises(KeyError, match="does not contain role"):
+            target.children(missing)
+    # Transforming either entry point yields children backed by the new data.
+    prediction = data.slice(1, 1)
+    for transformed in (model.transform(prediction), models.transform(prediction)[0]):
+        output = transformed.children(formula.Role.Independent)
+        assert_frame_equal(
+            output[0].select(formula.Role.Dependent).frame(), prediction.select("x")
+        )
+        assert_frame_equal(
+            output[0].children(formula.Role.Independent)[0].frame(),
+            prediction.select("z", "x"),
+        )
+
+    selected = children.select(formula.Role.Dependent)
+    applied_children = children.transform(prediction)
+    for index, column in enumerate(["x", "z"]):
+        assert_frame_equal(selected[index].frame(), data.select(column))
+        assert_frame_equal(
+            applied_children[index].select(formula.Role.Dependent).frame(),
+            prediction.select(column),
+        )
+    assert len(model.children(formula.Role.Independent)) == 2
 
 
 def test_models_transform_preserves_model_order_and_fitted_state(data):

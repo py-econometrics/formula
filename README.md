@@ -118,6 +118,31 @@ expands to `y ~ x` and `y ~ z`, both with an intercept.
 Use backticks `` ` `` to escape column names containing spaces, punctuation or special
 characters, for example ``y ~ `household income` ``.
 
+### Multistage formulas
+
+Square brackets attach child formulas to the containing expression. Using the
+data from the Python example above:
+
+```python
+model = formula.parse("y ~ z + [x ~ log(z) - 1]").fit(data)[0]
+child = model.children(formula.Role.Independent)[0]
+same_child = model.children(formula.Role.Independent)["x ~ log(z) - 1"]
+endogenous = child.select(formula.Role.Dependent).frame()
+instruments = child.select(formula.Role.Independent).frame()
+```
+
+`children(role)` returns a `Models` collection in attachment order, supporting
+integer and formula-string indexing, selection, and transformation. A present
+role without children returns an empty collection; an absent or excluded role
+raises `KeyError`.
+Children support the same selection and transformation methods as their parent
+and remain usable after the parent is dropped. In Rust,
+`model.children(Role::Independent)` returns a borrowed slice or `SelectionError`.
+
+Sibling blocks and deeper nesting are supported. Every formula includes its own
+intercept by default; explicit intercept controls and fixed effects apply locally.
+For example, `y ~ z - 1 + [x ~ log(z)]` removes only the parent's intercept.
+
 ### Fixed effects
 
 Use `|` to specify fixed effects separately from ordinary predictors:
