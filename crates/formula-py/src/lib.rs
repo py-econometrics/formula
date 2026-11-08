@@ -5,7 +5,7 @@ use pyo3_polars::PyDataFrame;
 #[pymodule]
 mod _formula {
     #[pymodule_export]
-    use super::{FittedFormula, FittedFormulas, Formulas, Role, parse, parse_many};
+    use super::{FittedFormula, FittedFormulas, Formula, Formulas, Role, parse, parse_many};
 }
 
 #[pyfunction]
@@ -23,12 +23,53 @@ fn parse_many(formulas: Vec<String>) -> PyResult<Formulas> {
 }
 
 #[pyclass(frozen, module = "formula")]
+struct Formula {
+    inner: formula::Formula,
+}
+
+#[pymethods]
+impl Formula {
+    fn __str__(&self) -> String {
+        self.inner.to_string()
+    }
+}
+
+#[pyclass(frozen, module = "formula")]
 struct Formulas {
     inner: formula::Formulas,
 }
 
 #[pymethods]
 impl Formulas {
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __getitem__(&self, key: FormulaKey) -> PyResult<Formula> {
+        let inner = match key {
+            FormulaKey::Index(index) => {
+                let index = if index < 0 {
+                    self.inner.len().checked_add_signed(index)
+                } else {
+                    Some(index as usize)
+                };
+
+                index
+                    .and_then(|index| self.inner.iter().nth(index))
+                    .ok_or_else(|| PyIndexError::new_err("formula index out of range"))?
+            }
+            FormulaKey::Formula(source) => self
+                .inner
+                .get_by_str(&source)
+                .map_err(|error| PySyntaxError::new_err(error.to_string()))?
+                .ok_or_else(|| PyKeyError::new_err(source))?,
+        };
+
+        Ok(Formula {
+            inner: inner.clone(),
+        })
+    }
+
     fn fit(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<FittedFormulas> {
         py.detach(|| self.inner.fit(&data.0))
             .map(|inner| FittedFormulas { inner })
@@ -47,9 +88,9 @@ impl FittedFormulas {
         self.inner.len()
     }
 
-    fn __getitem__(&self, key: ModelKey) -> PyResult<FittedFormula> {
+    fn __getitem__(&self, key: FormulaKey) -> PyResult<FittedFormula> {
         let inner = match key {
-            ModelKey::Index(index) => {
+            FormulaKey::Index(index) => {
                 let index = if index < 0 {
                     self.inner.len().checked_add_signed(index)
                 } else {
@@ -60,7 +101,7 @@ impl FittedFormulas {
                     .and_then(|index| self.inner.iter().nth(index))
                     .ok_or_else(|| PyIndexError::new_err("model index out of range"))?
             }
-            ModelKey::Formula(source) => self
+            FormulaKey::Formula(source) => self
                 .inner
                 .get_by_str(&source)
                 .map_err(|error| PySyntaxError::new_err(error.to_string()))?
@@ -172,7 +213,7 @@ impl RoleSelection {
 }
 
 #[derive(FromPyObject)]
-enum ModelKey {
+enum FormulaKey {
     Index(isize),
     Formula(String),
 }

@@ -24,6 +24,9 @@ data = polars.DataFrame(
 )
 
 formulas = formula.parse("y ~ sw(x, z) | firm")  # Parse and expand formulas
+assert len(formulas) == 2
+first_formula = formulas[0]  # Negative indices and formula-string lookup also work
+expanded_sources = [str(entry) for entry in formulas]
 fits = formulas.fit(data)  # Compute columns and learn transformation state
 fit = fits[0]  # Integer indexing follows expansion order
 same_fit = fits[fit.formula]  # Look up a fitted formula by its formula string
@@ -48,6 +51,11 @@ for new data using that learned state. Fitting does not estimate regression coef
 `frame()` returns a Polars `DataFrame` containing all selected roles. `select` and
 `transform` return new fitted formulas and retain fitted transform state. Selecting an absent
 role raises `KeyError`.
+
+`Formulas` supports length, iteration, and indexing by integer or formula string,
+like `FittedFormulas`. Its entries are unfitted `Formula` objects;
+`str(entry)` returns the canonical formula string. An entry remains usable after
+its collection is dropped.
 
 ## Rust API
 
@@ -77,6 +85,11 @@ fn main() {
     // Stores the expanded formulas
     let formulas = parse(formula).expect("valid formula");
 
+    println!("Expanded formulas: {}", formulas.len());
+    for formula in &formulas {
+        println!("Formula: {formula}");
+    }
+
     // Fitting formulas creates a collection of `FittedFormula`s
     // Transformations and data are shared across fitted formulas
     let data = sample_data(1_000_000).expect("valid sample data");
@@ -94,6 +107,11 @@ fn main() {
     }
 }
 ```
+
+Like `FittedFormulas`, the Rust `Formulas` collection supports `len()`, `is_empty()`,
+`iter()`, and iteration over `&formulas`. Iterators of `Formula` can be collected
+into `Formulas`, preserving their order and duplicates; parsing continues to
+deduplicate expanded formulas.
 
 ## Formula syntax
 
@@ -192,11 +210,11 @@ which enables generating
 multiple formulas from a single formula string. For example, the formula
 `y ~ sw(x1, x2)` expands to the formulas `y ~ x1` and `y ~ x2`.
 
-| Operator             | Formulas generated                                                                 |
-|----------------------|------------------------------------------------------------------------------------|
-| `sw(x, z, w, ...)`   | One formula per argument: `x`, `z`, `w`, and so on.                                |
-| `sw0(x, z, w, ...)`  | An empty expression, then one formula per argument: `x`, `z`, `w`, and so on.      |
-| `csw(x, z, w, ...)`  | Cumulative formulas: `x`, then `x + z`, then `x + z + w`, and so on.               |
+| Operator             | Formulas generated                                                                   |
+|----------------------|--------------------------------------------------------------------------------------|
+| `sw(x, z, w, ...)`   | One formula per argument: `x`, `z`, `w`, and so on.                                  |
+| `sw0(x, z, w, ...)`  | An empty expression, then one formula per argument: `x`, `z`, `w`, and so on.        |
+| `csw(x, z, w, ...)`  | Cumulative formulas: `x`, then `x + z`, then `x + z + w`, and so on.                 |
 | `csw0(x, z, w, ...)` | An empty expression, then cumulative formulas: `x`, `x + z`, `x + z + w`, and so on. |
 
 The empty alternative adds no terms and does not restore a removed intercept.

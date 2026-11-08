@@ -37,6 +37,53 @@ def test_parse_and_fit(formulas, expected_columns, data):
         assert_frame_equal(frame, data.select(column))
 
 
+def test_unfitted_formulas_support_indexing_and_iteration():
+    formulas = formula.parse(["y ~ sw(x, z) - 1", "y ~ x - 1"])
+
+    assert len(formulas) == 2
+    assert all(isinstance(entry, formula.Formula) for entry in formulas)
+    assert [str(entry) for entry in formulas] == ["y ~ x - 1", "y ~ z - 1"]
+    assert str(formulas[0]) == str(formulas[-2]) == "y ~ x - 1"
+    assert str(formulas[1]) == str(formulas[-1]) == "y ~ z - 1"
+    assert str(formulas[" y~x -1 "]) == "y ~ x - 1"
+
+    first = formulas[0]
+    del formulas
+    assert str(first) == "y ~ x - 1"
+
+
+def test_unfitted_formula_lookup_uses_formula_identity():
+    formulas = formula.parse("y ~ x + z - 1")
+    assert str(formulas["y ~ z + x - 1"]) == "y ~ x + z - 1"
+
+
+def test_unfitted_formulas_report_invalid_keys():
+    formulas = formula.parse("y ~ sw(x, z) - 1")
+    for index in (2, -3):
+        with pytest.raises(IndexError, match="formula index out of range"):
+            formulas[index]
+
+    with pytest.raises(KeyError, match="missing"):
+        formulas["y ~ missing"]
+    with pytest.raises(SyntaxError, match="exactly one formula"):
+        formulas["y ~ sw(x, z)"]
+    with pytest.raises(SyntaxError):
+        formulas["y ~"]
+
+
+def test_empty_unfitted_formulas_are_an_empty_collection():
+    formulas = formula.parse([])
+    assert len(formulas) == 0
+    assert not formulas
+    assert list(iter(formulas)) == []
+
+    for index in (0, -1):
+        with pytest.raises(IndexError, match="formula index out of range"):
+            formulas[index]
+    with pytest.raises(KeyError):
+        formulas["y ~ x"]
+
+
 def test_role_frames_preserve_rows_and_nulls(data):
     model = formula.parse("y ~ x | firm").fit(data)[0]
 

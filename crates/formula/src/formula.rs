@@ -1,6 +1,8 @@
 use crate::fit::{Definition, Fit};
 use crate::model::{FittedFormula, FittedFormulas, ModelError};
-use crate::parse::{FORMULA_SEPARATOR, PIPE_SEPARATOR, is_identifier_character, parse_scalar};
+use crate::parse::{
+    FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
+};
 use crate::transform::{
     ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
 };
@@ -8,6 +10,8 @@ use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scala
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use winnow::Parser;
+use winnow::combinator::fail;
+use winnow::error::{ContextError, StrContext, StrContextValue};
 
 pub(crate) fn push_unique<T: PartialEq>(items: &mut Vec<T>, item: T) {
     if !items.contains(&item) {
@@ -540,8 +544,21 @@ impl Formulas {
         Self { formulas }
     }
 
-    pub(crate) fn formulas(&self) -> &[Formula] {
-        &self.formulas
+    pub fn iter(&self) -> std::slice::Iter<'_, Formula> {
+        self.formulas.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.formulas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.formulas.is_empty()
+    }
+
+    pub fn get_by_str<'a>(&self, source: &'a str) -> ParseResult<'a, Option<&Formula>> {
+        let query = parse_one(source)?;
+        Ok(self.iter().find(|formula| **formula == query))
     }
 
     pub fn fit(&self, data: &DataFrame) -> Result<FittedFormulas, ModelError> {
@@ -564,6 +581,34 @@ impl Formulas {
             .collect::<Result<Vec<_>, ModelError>>()?;
 
         Ok(FittedFormulas::new(entries))
+    }
+}
+
+pub(crate) fn parse_one(source: &str) -> ParseResult<'_, Formula> {
+    let mut formulas = crate::parse(source)?;
+    if formulas.len() == 1 {
+        return Ok(formulas.formulas.pop().expect("exactly one formula"));
+    }
+
+    fail::<_, _, ContextError>
+        .context(StrContext::Expected(StrContextValue::Description(
+            "exactly one formula",
+        )))
+        .parse(source)
+}
+
+impl FromIterator<Formula> for Formulas {
+    fn from_iter<T: IntoIterator<Item = Formula>>(formulas: T) -> Self {
+        Self::new(formulas.into_iter().collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a Formulas {
+    type Item = &'a Formula;
+    type IntoIter = std::slice::Iter<'a, Formula>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -877,6 +922,74 @@ mod tests {
     use polars::prelude::Scalar;
     use winnow::Parser;
 
+    mod formulas {
+        use crate::{Formula, Formulas, parse, parse_many};
+
+        #[test]
+        fn parsed_formulas_expose_expansion_order() {
+            let formulas = parse("y ~ sw(x, z) - 1").unwrap();
+
+            assert_eq!(formulas.len(), 2);
+            assert!(!formulas.is_empty());
+            assert_eq!(
+                formulas.iter().map(Formula::to_string).collect::<Vec<_>>(),
+                ["y ~ x - 1", "y ~ z - 1"],
+            );
+        }
+
+        #[test]
+        fn iteration_and_collection_preserve_order_and_duplicates() {
+            let parsed = parse_many(["y ~ x - 1", "y ~ z - 1"]).unwrap();
+            let expected = vec![
+                parsed.iter().nth(1).unwrap().clone(),
+                parsed.iter().next().unwrap().clone(),
+                parsed.iter().nth(1).unwrap().clone(),
+            ];
+            let formulas = expected.clone().into_iter().collect::<Formulas>();
+
+            let mut borrowed = Vec::new();
+            for formula in &formulas {
+                borrowed.push(formula.clone());
+            }
+            assert_eq!(borrowed, expected);
+
+            assert_eq!(formulas.len(), 3);
+        }
+
+        #[test]
+        fn lookup_matches_formula_identity() {
+            let formulas = parse("y ~ x + z - 1").unwrap();
+            let first = formulas.iter().next().unwrap();
+
+            assert!(std::ptr::eq(
+                formulas.get_by_str(" y~z+x -1 ").unwrap().unwrap(),
+                first,
+            ));
+            assert!(std::ptr::eq(
+                formulas
+                    .get_by_str("y ~ sw(x + z, x + z) - 1")
+                    .unwrap()
+                    .unwrap(),
+                first,
+            ));
+            assert!(formulas.get_by_str("y ~ missing").unwrap().is_none());
+            assert!(formulas.get_by_str("y ~").is_err());
+            let error = formulas.get_by_str("y ~ sw(x, z)").unwrap_err();
+            assert!(error.to_string().contains("exactly one formula"));
+        }
+
+        #[test]
+        fn empty_collections_support_the_same_accessors() {
+            let parsed = parse_many(std::iter::empty::<&str>()).unwrap();
+            let collected = std::iter::empty::<Formula>().collect::<Formulas>();
+
+            assert_eq!(collected, parsed);
+            assert!(parsed.is_empty());
+            assert_eq!(parsed.len(), 0);
+            assert_eq!(parsed.iter().next(), None);
+        }
+    }
+
     fn fit(source: &str, data: &DataFrame) -> FittedFormula {
         let models = crate::parse(source).unwrap().fit(data).unwrap();
         assert_eq!(models.len(), 1);
@@ -885,10 +998,30 @@ mod tests {
 
     #[test]
     fn formula_tree_preserves_local_frames_through_fit_and_transform() {
-        let mut root = crate::parse("y ~ x - 1").unwrap().formulas()[0].clone();
-        let mut child = crate::parse("a ~ z - 1").unwrap().formulas()[0].clone();
-        let grandchild = crate::parse("b ~ w - 1").unwrap().formulas()[0].clone();
-        let sibling = crate::parse("c ~ v - 1").unwrap().formulas()[0].clone();
+        let mut root = crate::parse("y ~ x - 1")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let mut child = crate::parse("a ~ z - 1")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let grandchild = crate::parse("b ~ w - 1")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let sibling = crate::parse("c ~ v - 1")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
         child
             .expressions
             .get_mut(&Role::Dependent)
@@ -956,7 +1089,12 @@ mod tests {
         )
         .unwrap();
         for with_children in [false, true] {
-            let mut formula = crate::parse("y ~ C(g) - 1").unwrap().formulas()[0].clone();
+            let mut formula = crate::parse("y ~ C(g) - 1")
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .clone();
             let cases = [
                 (Role::Dependent, Some("y"), "d"),
                 (Role::Independent, Some("g"), "i"),
@@ -964,8 +1102,12 @@ mod tests {
             ];
             if with_children {
                 for (role, _, column) in cases {
-                    let child =
-                        crate::parse(&format!("{column} ~ 1")).unwrap().formulas()[0].clone();
+                    let child = crate::parse(&format!("{column} ~ 1"))
+                        .unwrap()
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .clone();
                     formula
                         .expressions
                         .get_mut(&role)
@@ -1051,8 +1193,18 @@ mod tests {
 
     #[test]
     fn expression_addition_preserves_children_and_deduplicates_terms() {
-        let first = crate::parse("a ~ z").unwrap().formulas()[0].clone();
-        let second = crate::parse("b ~ w").unwrap().formulas()[0].clone();
+        let first = crate::parse("a ~ z")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let second = crate::parse("b ~ w")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
         let term = Term::from(Factor::from("x"));
         let left = Expression::new([term.clone()], vec![first.clone()]);
         let right = Expression::new([term.clone()], vec![second.clone(), first.clone()]);
@@ -1065,15 +1217,24 @@ mod tests {
 
     #[test]
     fn fixed_effect_encoding_preserves_attached_children() {
-        let child = crate::parse("a ~ z").unwrap().formulas()[0].clone();
+        let child = crate::parse("a ~ z")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
         let expression = Expression::new(
             [Term::intercept(), Term::from(Factor::from("firm"))],
             vec![child.clone()],
         );
 
         let encoded = encode_fixed_effects(expression);
-        let expected = crate::parse("y ~ x | firm").unwrap().formulas()[0].expressions
-            [&Role::FixedEffect]
+        let expected = crate::parse("y ~ x | firm")
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .expressions[&Role::FixedEffect]
             .clone();
 
         assert_eq!(encoded.terms, expected.terms);
@@ -1123,12 +1284,12 @@ mod tests {
             "y ~ sw(x, w) + [sw(a, b) ~ sw(z, v)]",
             "y ~ `a[b]` + [`child response` ~ log(`x[z]`) - 1]",
         ] {
-            for formula in crate::parse(source).unwrap().formulas() {
+            for formula in &crate::parse(source).unwrap() {
                 let rendered = formula.to_string();
                 let parsed = crate::parse(&rendered).unwrap();
                 assert_eq!(
-                    parsed.formulas(),
-                    std::slice::from_ref(formula),
+                    parsed,
+                    std::iter::once(formula.clone()).collect::<Formulas>(),
                     "{rendered}"
                 );
             }
@@ -1189,9 +1350,19 @@ mod tests {
             .unwrap();
             let prediction = polars::df!("y" => [2.0, 3.0], "x" => [Some(2.0), None]).unwrap();
             for as_child in [false, true] {
-                let formula = crate::parse("y ~ poly(x, degree=2)").unwrap().formulas()[0].clone();
+                let formula = crate::parse("y ~ poly(x, degree=2)")
+                    .unwrap()
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .clone();
                 let formula = if as_child {
-                    let mut parent = crate::parse("y - y ~ 0").unwrap().formulas()[0].clone();
+                    let mut parent = crate::parse("y - y ~ 0")
+                        .unwrap()
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .clone();
                     parent
                         .expressions
                         .get_mut(&Role::Independent)
@@ -1894,7 +2065,7 @@ mod tests {
         #[test]
         fn preserves_model_contents_and_order() {
             let (specification, data) = fixture();
-            assert_eq!(specification.formulas().len(), 6);
+            assert_eq!(specification.len(), 6);
             let collection = specification.fit(&data).unwrap();
             assert_eq!(collection.len(), 6);
             let expected_interaction = Column::new(
@@ -1942,7 +2113,11 @@ mod tests {
 
             for (model, &(source, response, names)) in collection.iter().zip(cases) {
                 let expected_formula = crate::parse(source).unwrap();
-                assert_eq!(model.formula(), &expected_formula.formulas()[0], "{source}");
+                assert_eq!(
+                    model.formula(),
+                    expected_formula.iter().next().unwrap(),
+                    "{source}"
+                );
                 assert_eq!(
                     model
                         .expression(Role::Dependent)
@@ -1976,7 +2151,7 @@ mod tests {
             let data =
                 polars::df!("y" => [1.0, 2.0], "g" => [0.0, 1.0], "x" => [3.0, 4.0]).unwrap();
             let specification = crate::parse("y ~ sqrt(exp(sqrt(g))) + sw0(x)").unwrap();
-            assert_eq!(specification.formulas().len(), 2);
+            assert_eq!(specification.len(), 2);
             TRANSFORM_CALLS.set((0, 0));
             let _models = specification.fit(&data).unwrap();
             // Both sqrt calls and exp each fit and transform once across all models.
@@ -2239,11 +2414,15 @@ mod tests {
         TRANSFORM_CALLS.set((0, 0));
         let mut formula = crate::parse("sqrt(g) ~ sqrt(g):x + exp(sqrt(g)) - 1")
             .unwrap()
-            .formulas()[0]
+            .iter()
+            .next()
+            .unwrap()
             .clone();
         let child = crate::parse("sqrt(g) ~ exp(sqrt(g)) - 1")
             .unwrap()
-            .formulas()[0]
+            .iter()
+            .next()
+            .unwrap()
             .clone();
         formula
             .expressions
@@ -2424,7 +2603,7 @@ mod tests {
             ("poly(x) ~ poly(x, degree=1, raw=false) - 1", 2, 0),
             ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2, 0),
         ] {
-            let formula = crate::parse(source).unwrap().formulas()[0].clone();
+            let formula = crate::parse(source).unwrap().iter().next().unwrap().clone();
             let scheduled = schedule_factors(&[
                 &formula.expressions[&Role::Dependent],
                 &formula.expressions[&Role::Independent],
@@ -2521,7 +2700,9 @@ mod tests {
     fn planning_excludes_cancelled_factors_and_intercepts() {
         let formula = crate::parse("y ~ sqrt(x) - sqrt(x) + 1")
             .unwrap()
-            .formulas()[0]
+            .iter()
+            .next()
+            .unwrap()
             .clone();
         let scheduled = schedule_factors(&[
             &formula.expressions[&Role::Dependent],
