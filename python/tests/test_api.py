@@ -334,3 +334,39 @@ def test_rust_errors_become_python_exceptions(data):
         models.transform(prediction)
     with pytest.raises(ValueError, match="x"):
         models[0].transform(prediction)
+
+
+@pytest.mark.parametrize("keyword_role", [False, True])
+def test_select_terms_returns_an_independent_fitted_formula(data, keyword_role):
+    model = formula.parse("y ~ x + z").fit(data)[0]
+    if keyword_role:
+        selected = model.select_terms("z", role=formula.Role.Independent)
+    else:
+        selected = model.select_terms("z", formula.Role.Independent)
+    assert isinstance(selected, formula.FittedFormula)
+    del model
+    assert_frame_equal(selected.frame(), data.select("z"))
+    prediction = polars.DataFrame({"z": [10.0, 20.0]})
+    assert_frame_equal(selected.transform(prediction).frame(), prediction)
+
+
+@pytest.mark.parametrize(
+    ("query", "role", "exception", "message"),
+    [
+        ("firm", formula.Role.FixedEffect, KeyError, "FixedEffect"),
+        ("missing", formula.Role.Independent, KeyError, "missing"),
+        ("x +", formula.Role.Independent, SyntaxError, None),
+        ("sw(x, z)", formula.Role.Independent, SyntaxError, "exactly one expression"),
+    ],
+)
+def test_select_terms_translates_rust_errors(data, query, role, exception, message):
+    model = formula.parse("y ~ x + z").fit(data)[0]
+    with pytest.raises(exception, match=message):
+        model.select_terms(query, role)
+
+
+@pytest.mark.parametrize("roles", [(), ("Independent",)])
+def test_select_terms_requires_a_valid_role(data, roles):
+    model = formula.parse("y ~ x").fit(data)[0]
+    with pytest.raises(TypeError):
+        model.select_terms("x", *roles)

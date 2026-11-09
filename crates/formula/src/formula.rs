@@ -1,3 +1,4 @@
+use crate::SelectionError;
 use crate::fit::{Definition, Fit};
 use crate::model::{FittedFormula, FittedFormulas, ModelError};
 use crate::parse::{
@@ -8,6 +9,7 @@ use crate::transform::{
 };
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
 use winnow::Parser;
 use winnow::combinator::fail;
@@ -394,10 +396,14 @@ impl Expression {
     ) -> Result<FittedExpression, ModelError> {
         let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
+        let mut column_ranges = Vec::with_capacity(self.terms.len());
         for term in &self.terms {
             let entry = lookup_term(transformed, term);
             terms.push(entry.term.clone());
+
+            let start = columns.len();
             columns.extend(entry.columns.iter().cloned());
+            column_ranges.push(start..columns.len());
         }
 
         let expression = Self::new(terms, self.children.clone());
@@ -408,7 +414,12 @@ impl Expression {
             .map(|child| child.assemble(height, transformed))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
-        Ok(FittedExpression::new(expression, frame, children))
+        Ok(FittedExpression::new(
+            expression,
+            frame,
+            column_ranges,
+            children,
+        ))
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -636,14 +647,21 @@ pub(crate) struct FittedTerm {
 pub(crate) struct FittedExpression {
     expression: Expression,
     frame: DataFrame,
+    column_ranges: Vec<Range<usize>>,
     children: Vec<FittedFormula>,
 }
 
 impl FittedExpression {
-    fn new(expression: Expression, frame: DataFrame, children: Vec<FittedFormula>) -> Self {
+    fn new(
+        expression: Expression,
+        frame: DataFrame,
+        column_ranges: Vec<Range<usize>>,
+        children: Vec<FittedFormula>,
+    ) -> Self {
         Self {
             expression,
             frame,
+            column_ranges,
             children,
         }
     }
@@ -658,6 +676,33 @@ impl FittedExpression {
 
     pub(crate) fn children(&self) -> &[FittedFormula] {
         &self.children
+    }
+
+    pub(crate) fn select_terms(&self, query: &Expression) -> Result<Self, SelectionError> {
+        for term in &query.terms {
+            if !self.expression.terms.contains(term) {
+                return Err(SelectionError::MissingTerm(term.render()));
+            }
+        }
+
+        let mut terms = Vec::new();
+        let mut columns = Vec::new();
+        let mut column_ranges = Vec::new();
+        for (term, range) in self.expression.terms.iter().zip(&self.column_ranges) {
+            if !query.terms.contains(term) {
+                continue;
+            }
+            terms.push(term.clone());
+
+            let start = columns.len();
+            columns.extend(self.frame.columns()[range.clone()].iter().cloned());
+            column_ranges.push(start..columns.len());
+        }
+
+        let expression = Expression::new(terms, Vec::new());
+        let frame = DataFrame::new(self.frame.height(), columns).map_err(SelectionError::Frame)?;
+
+        Ok(Self::new(expression, frame, column_ranges, Vec::new()))
     }
 }
 

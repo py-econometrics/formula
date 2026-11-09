@@ -24,10 +24,8 @@ data = polars.DataFrame(
 )
 
 formulas = formula.parse("y ~ sw(x, z) | firm")  # Parse and expand formulas
-assert len(formulas) == 2
 first_formula = formulas[0]  # Negative indices and formula-string lookup also work
-expanded_sources = [str(entry) for entry in formulas]
-fits = formulas.fit(data)  # Compute columns and learn transformation state
+fits = formulas.fit(data)  # Construct columns and learn transformation state
 fit = fits[0]  # Integer indexing follows expansion order
 same_fit = fits[fit.formula]  # Look up a fitted formula by its formula string
 
