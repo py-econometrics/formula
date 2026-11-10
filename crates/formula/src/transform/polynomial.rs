@@ -1,5 +1,5 @@
 use crate::fit::Definition;
-use crate::formula::{ColumnMetadata, ComponentKey, MaterializedColumns};
+use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::input::{argument_column_name, input_frame, validate_single_input};
 use crate::transform::{TransformDefinition, call_name, validate_numeric_input};
 use crate::{ArgumentCount, TransformError};
@@ -7,6 +7,7 @@ use polars::prelude::{
     AnyValue, Column, DataFrame, DataType, Expr, Field, Float64Chunked, IntoColumn, IntoLazy, NULL,
     PlSmallStr, Scalar, col, lit, when,
 };
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PolynomialDefinition {
@@ -15,6 +16,9 @@ pub(crate) struct PolynomialDefinition {
 }
 
 impl PolynomialDefinition {
+    pub(crate) const DEGREE_PARAMETER: &str = "degree";
+    pub(crate) const RAW_PARAMETER: &str = "raw";
+
     pub(crate) fn new(degree: Option<Scalar>, raw: Option<Scalar>) -> Result<Self, TransformError> {
         let degree = degree.unwrap_or_else(|| Scalar::from(1_i64));
         let raw = raw.unwrap_or_else(|| Scalar::from(false));
@@ -62,9 +66,16 @@ impl TransformDefinition for PolynomialDefinition {
         ArgumentCount::Exactly(1)
     }
 
+    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+        BTreeMap::from([
+            (Self::DEGREE_PARAMETER, Scalar::from(self.degree as i64)),
+            (Self::RAW_PARAMETER, Scalar::from(self.raw)),
+        ])
+    }
+
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
-        let degree = format!("degree={}", self.degree);
-        let raw = format!("raw={}", self.raw);
+        let degree = format!("{}={}", Self::DEGREE_PARAMETER, self.degree);
+        let raw = format!("{}={}", Self::RAW_PARAMETER, self.raw);
 
         call_name(
             self.name(),
@@ -272,7 +283,7 @@ pub(crate) struct PolynomialState {
 
 impl Definition<PolynomialState> for PolynomialDefinition {
     type Input = [Column];
-    type Output = MaterializedColumns;
+    type Output = MaterializedColumns<ComponentKey>;
     type Error = TransformError;
 
     fn validate(&self, state: &PolynomialState, inputs: &[Column]) -> Result<(), TransformError> {
@@ -319,7 +330,7 @@ impl Definition<PolynomialState> for PolynomialDefinition {
     ) -> Result<Self::Output, TransformError> {
         let frame = input_frame(inputs)?;
         let height = frame.height();
-        let (columns, metadata): (Vec<Column>, Vec<ColumnMetadata>) = state
+        let (columns, metadata): (Vec<Column>, Vec<ComponentKey>) = state
             .basis
             .transform(frame, self.degree)?
             .into_iter()
@@ -330,7 +341,7 @@ impl Definition<PolynomialState> for PolynomialDefinition {
                     column.with_name(self.output_name(state.field.name().as_str(), basis_index));
                 let key = ComponentKey::Scalar(Scalar::from(basis_index as i64));
 
-                (column, key.into())
+                (column, key)
             })
             .unzip();
 

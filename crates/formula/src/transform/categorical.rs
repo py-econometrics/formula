@@ -1,13 +1,14 @@
 use super::input::{input_frame, validate_single_input};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
-use crate::formula::{ColumnMetadata, ComponentKey, MaterializedColumns};
+use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr,
-    Scalar, col, lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar, col,
+    lit, when,
 };
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CategoricalDefinition {
@@ -15,6 +16,8 @@ pub(crate) struct CategoricalDefinition {
 }
 
 impl CategoricalDefinition {
+    pub(crate) const REFERENCE_PARAMETER: &str = "reference";
+
     pub(crate) fn new(reference: Option<Scalar>) -> Self {
         Self { reference }
     }
@@ -116,6 +119,14 @@ impl TransformDefinition for CategoricalDefinition {
         "C"
     }
 
+    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+        self.reference
+            .as_ref()
+            .map(|reference| (Self::REFERENCE_PARAMETER, reference.clone()))
+            .into_iter()
+            .collect()
+    }
+
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
         let reference_argument = self.reference.as_ref().map(|reference| {
             let value = match reference.as_any_value() {
@@ -124,7 +135,7 @@ impl TransformDefinition for CategoricalDefinition {
                 _ => Self::level_name(reference),
             };
 
-            format!("reference={value}")
+            format!("{}={value}", Self::REFERENCE_PARAMETER)
         });
 
         call_name(
@@ -139,7 +150,7 @@ impl TransformDefinition for CategoricalDefinition {
 
 impl Definition<CategoricalState> for CategoricalDefinition {
     type Input = [Column];
-    type Output = MaterializedColumns;
+    type Output = MaterializedColumns<ComponentKey>;
     type Error = TransformError;
 
     fn validate(&self, state: &CategoricalState, inputs: &[Column]) -> Result<(), TransformError> {
@@ -167,18 +178,27 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             levels
         };
 
-        let reference = self.reference_for_dtype(levels.dtype())?;
-        if let Some(reference) = &reference
-            && !levels
-                .equal(&reference.clone().into_column("reference".into()))?
-                .any()
-        {
-            return Err(TransformError::InvalidParameter(
-                "`reference` value is not among the fitted levels".into(),
-            ));
+        let mut reference_index = None;
+        if let Some(reference) = self.reference_for_dtype(levels.dtype())? {
+            reference_index = (0..levels.len())
+                .find_map(|index| match levels.get(index) {
+                    Ok(level) if level == reference.as_any_value() => Some(Ok(index)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .transpose()?;
+
+            if reference_index.is_none() {
+                return Err(TransformError::InvalidParameter(
+                    "`reference` value is not among the fitted levels".into(),
+                ));
+            }
         }
 
-        Ok(CategoricalState { levels, reference })
+        Ok(CategoricalState {
+            levels,
+            reference_index,
+        })
     }
 
     fn transform(
@@ -214,10 +234,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 .is_in(lit(levels.implode()?.into_series()), false)
         };
 
-        let (expressions, metadata): (Vec<_>, Vec<ColumnMetadata>) = fitted_levels
+        let (expressions, metadata): (Vec<_>, Vec<ComponentKey>) = fitted_levels
             .into_iter()
-            .filter(|level| state.reference.as_ref() != Some(level))
-            .map(|level| {
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != state.reference_index)
+            .map(|(_, level)| {
                 let column_name = self.output_name(input.name(), &level);
 
                 let expression = when(argument.clone().is_null())
@@ -227,7 +248,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                     .otherwise(lit(NULL))
                     .alias(column_name);
 
-                (expression, ComponentKey::Scalar(level).into())
+                (expression, ComponentKey::Scalar(level))
             })
             .unzip();
         // Preserve input row count even when expression is empty
@@ -244,7 +265,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
     levels: Column,
-    reference: Option<Scalar>,
+    reference_index: Option<usize>,
 }
 
 #[cfg(test)]

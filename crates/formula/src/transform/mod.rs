@@ -10,14 +10,15 @@ pub use input::ArgumentCount;
 pub(crate) use input::validate_numeric_input;
 pub(crate) use integer::IntegerEncodingDefinition;
 pub(crate) use polynomial::PolynomialDefinition;
+use std::collections::BTreeMap;
 
 use crate::fit::{Fit, FitError};
-use crate::formula::MaterializedColumns;
+use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, PlSmallStr};
+use polars::prelude::{Column, PlSmallStr, Scalar};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -42,6 +43,10 @@ pub(crate) trait TransformDefinition {
     fn expands(&self) -> bool;
 
     fn argument_count(&self) -> ArgumentCount;
+
+    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+        BTreeMap::new()
+    }
 }
 
 impl Transform {
@@ -54,12 +59,20 @@ impl Transform {
         }
     }
 
+    pub(crate) fn name(&self) -> &'static str {
+        self.definition().name()
+    }
+
     pub(crate) fn expands(&self) -> bool {
         self.definition().expands()
     }
 
     pub(crate) fn argument_count(&self) -> ArgumentCount {
         self.definition().argument_count()
+    }
+
+    pub(crate) fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+        self.definition().parameters()
     }
 
     pub(crate) fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
@@ -81,7 +94,7 @@ impl Transform {
     pub(crate) fn transform(
         &self,
         inputs: &[Column],
-    ) -> Result<MaterializedColumns, FitError<TransformError>> {
+    ) -> Result<MaterializedColumns<ComponentKey>, FitError<TransformError>> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 

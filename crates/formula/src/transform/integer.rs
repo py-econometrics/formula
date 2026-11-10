@@ -43,7 +43,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
 
 impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
     type Input = [Column];
-    type Output = MaterializedColumns;
+    type Output = MaterializedColumns<ComponentKey>;
     type Error = TransformError;
 
     fn validate(
@@ -184,7 +184,7 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
 
         Ok(MaterializedColumns::single_column(
             frame,
-            ComponentKey::None.into(),
+            ComponentKey::None,
         ))
     }
 }

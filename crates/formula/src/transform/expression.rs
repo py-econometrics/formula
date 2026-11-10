@@ -156,7 +156,7 @@ impl ExpressionTransform {
     pub(crate) fn transform(
         &self,
         inputs: &[Column],
-    ) -> Result<MaterializedColumns, TransformError> {
+    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
         self.validate_inputs(inputs)?;
         let frame = input_frame(inputs)?;
         let height = frame.height();
@@ -180,7 +180,7 @@ impl ExpressionTransform {
         }
         Ok(MaterializedColumns::single_column(
             output,
-            ComponentKey::None.into(),
+            ComponentKey::None,
         ))
     }
 }
