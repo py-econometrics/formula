@@ -251,14 +251,18 @@ impl Term {
     fn assemble_columns(
         &self,
         height: usize,
-        factor_columns: Vec<Vec<Column>>,
-    ) -> Result<Vec<Column>, TransformError> {
+        factor_columns: Vec<MaterializedColumns>,
+    ) -> Result<MaterializedColumns, TransformError> {
         if self.is_intercept() {
-            return Ok(vec![Column::new_scalar(
+            let column = Column::new_scalar(
                 Self::INTERCEPT_COLUMN_NAME.into(),
                 Scalar::from(1.0_f64),
                 height,
-            )]);
+            );
+            return Ok(MaterializedColumns::single_column(
+                column.into_frame(),
+                ColumnMetadata { keys: vec![] },
+            ));
         }
         let mut column_groups = factor_columns.into_iter();
         let mut columns = column_groups
@@ -267,25 +271,35 @@ impl Term {
         for right_columns in column_groups {
             let left_columns = columns
                 .iter()
-                .map(|column| column.cast(&DataType::Float64))
+                .map(|(column, metadata)| Ok((column.cast(&DataType::Float64)?, metadata)))
                 .collect::<PolarsResult<Vec<_>>>()?;
 
             let right_columns = right_columns
                 .iter()
-                .map(|column| column.cast(&DataType::Float64))
+                .map(|(column, metadata)| Ok((column.cast(&DataType::Float64)?, metadata)))
                 .collect::<PolarsResult<Vec<_>>>()?;
 
             let mut interactions = Vec::new();
-
-            for left in &left_columns {
-                for right in &right_columns {
-                    let mut column = (left * right)?;
-                    column.rename(format!("{}:{}", left.name(), right.name()).into());
-                    interactions.push(column);
+            let mut metadata = Vec::new();
+            for (left_column, left_metadata) in &left_columns {
+                for (right_column, right_metadata) in &right_columns {
+                    // Combine columns
+                    interactions.push((left_column * right_column)?.with_name(
+                        format!("{}:{}", left_column.name(), right_column.name()).into(),
+                    ));
+                    // Combine metadata
+                    metadata.push(ColumnMetadata {
+                        keys: left_metadata
+                            .keys
+                            .iter()
+                            .chain(&right_metadata.keys)
+                            .cloned()
+                            .collect(),
+                    });
                 }
             }
 
-            columns = interactions;
+            columns = MaterializedColumns::new(DataFrame::new(height, interactions)?, metadata);
         }
 
         Ok(columns)
@@ -295,19 +309,16 @@ impl Term {
         &self,
         height: usize,
         transformed: &[FittedFactor],
-    ) -> Result<(Self, Vec<Column>), TransformError> {
+    ) -> Result<(Self, MaterializedColumns), TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
         for factor in &self.factors {
             let result = lookup_factor(transformed, factor);
-            match factor.as_ref() {
-                Factor::Variable(_) => {
-                    let [column] = result.columns.as_slice() else {
-                        unreachable!("a variable transforms to exactly one column");
-                    };
-                    validate_numeric_input(column)?;
-                }
-                Factor::Call { .. } | Factor::Literal(_) => {}
+            if let Factor::Variable(_) = factor.as_ref() {
+                let [column] = result.columns.frame.columns() else {
+                    unreachable!("a variable transforms to exactly one column");
+                };
+                validate_numeric_input(column)?;
             }
             factors.push(Arc::clone(&result.factor));
             factor_columns.push(result.columns.clone());
@@ -396,18 +407,23 @@ impl Expression {
     ) -> Result<FittedExpression, ModelError> {
         let mut terms = Vec::with_capacity(self.terms.len());
         let mut columns = Vec::new();
+        let mut metadata = Vec::new();
         let mut column_ranges = Vec::with_capacity(self.terms.len());
         for term in &self.terms {
             let entry = lookup_term(transformed, term);
             terms.push(entry.term.clone());
 
             let start = columns.len();
-            columns.extend(entry.columns.iter().cloned());
+            for (column, column_metadata) in entry.columns.iter() {
+                columns.push(column.clone());
+                metadata.push(column_metadata.clone());
+            }
             column_ranges.push(start..columns.len());
         }
 
         let expression = Self::new(terms, self.children.clone());
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
+        let columns = MaterializedColumns::new(frame, metadata);
         let children = self
             .children
             .iter()
@@ -416,7 +432,7 @@ impl Expression {
 
         Ok(FittedExpression::new(
             expression,
-            frame,
+            columns,
             column_ranges,
             children,
         ))
@@ -633,20 +649,68 @@ pub enum ValidationError {
     InvalidTransformComposition,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ComponentKey {
+    None,
+    Scalar(Scalar),
+    Tuple(Vec<ComponentKey>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ColumnMetadata {
+    keys: Vec<ComponentKey>,
+}
+
+impl From<ComponentKey> for ColumnMetadata {
+    fn from(key: ComponentKey) -> Self {
+        Self { keys: vec![key] }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MaterializedColumns {
+    frame: DataFrame,
+    metadata: Vec<ColumnMetadata>,
+}
+
+impl MaterializedColumns {
+    pub(crate) fn frame(&self) -> &DataFrame {
+        &self.frame
+    }
+
+    pub(crate) fn new(frame: DataFrame, metadata: Vec<ColumnMetadata>) -> Self {
+        assert_eq!(
+            frame.width(),
+            metadata.len(),
+            "each materialized column must have metadata",
+        );
+
+        Self { frame, metadata }
+    }
+
+    pub(crate) fn single_column(frame: DataFrame, metadata: ColumnMetadata) -> Self {
+        Self::new(frame, vec![metadata])
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Column, &ColumnMetadata)> {
+        self.frame.columns().iter().zip(&self.metadata)
+    }
+}
+
 struct FittedFactor {
     factor: Arc<Factor>,
-    columns: Vec<Column>,
+    columns: MaterializedColumns,
 }
 
 pub(crate) struct FittedTerm {
     term: Term,
-    columns: Vec<Column>,
+    columns: MaterializedColumns,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FittedExpression {
     expression: Expression,
-    frame: DataFrame,
+    columns: MaterializedColumns,
     column_ranges: Vec<Range<usize>>,
     children: Vec<FittedFormula>,
 }
@@ -654,13 +718,13 @@ pub(crate) struct FittedExpression {
 impl FittedExpression {
     fn new(
         expression: Expression,
-        frame: DataFrame,
+        columns: MaterializedColumns,
         column_ranges: Vec<Range<usize>>,
         children: Vec<FittedFormula>,
     ) -> Self {
         Self {
             expression,
-            frame,
+            columns,
             column_ranges,
             children,
         }
@@ -671,7 +735,7 @@ impl FittedExpression {
     }
 
     pub(crate) fn frame(&self) -> &DataFrame {
-        &self.frame
+        &self.columns.frame
     }
 
     pub(crate) fn children(&self) -> &[FittedFormula] {
@@ -687,6 +751,7 @@ impl FittedExpression {
 
         let mut terms = Vec::new();
         let mut columns = Vec::new();
+        let mut metadata = Vec::new();
         let mut column_ranges = Vec::new();
         for (term, range) in self.expression.terms.iter().zip(&self.column_ranges) {
             if !query.terms.contains(term) {
@@ -695,14 +760,21 @@ impl FittedExpression {
             terms.push(term.clone());
 
             let start = columns.len();
-            columns.extend(self.frame.columns()[range.clone()].iter().cloned());
+            columns.extend(self.columns.frame.columns()[range.clone()].iter().cloned());
+            metadata.extend(self.columns.metadata[range.clone()].iter().cloned());
             column_ranges.push(start..columns.len());
         }
 
         let expression = Expression::new(terms, Vec::new());
-        let frame = DataFrame::new(self.frame.height(), columns).map_err(SelectionError::Frame)?;
+        let frame =
+            DataFrame::new(self.frame().height(), columns).map_err(SelectionError::Frame)?;
 
-        Ok(Self::new(expression, frame, column_ranges, Vec::new()))
+        Ok(Self::new(
+            expression,
+            MaterializedColumns::new(frame, metadata),
+            column_ranges,
+            Vec::new(),
+        ))
     }
 }
 
@@ -721,7 +793,10 @@ fn fit_and_transform_factors(
         let result = match factor.as_ref() {
             Factor::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
-                columns: vec![literal_column(value, data.height())],
+                columns: MaterializedColumns::single_column(
+                    literal_column(value, data.height()).into_frame(),
+                    ComponentKey::None.into(),
+                ),
             },
             Factor::Variable(variable) => {
                 let column = data
@@ -733,7 +808,10 @@ fn fit_and_transform_factors(
 
                 FittedFactor {
                     factor: Arc::new(Factor::Variable(fitted)),
-                    columns: vec![output],
+                    columns: MaterializedColumns::single_column(
+                        output.into_frame(),
+                        ComponentKey::None.into(),
+                    ),
                 }
             }
             Factor::Call {
@@ -745,7 +823,7 @@ fn fit_and_transform_factors(
                 for argument in arguments {
                     let result = lookup_factor(&transformed, argument);
                     fitted_arguments.push(Arc::clone(&result.factor));
-                    inputs.extend(result.columns.iter().cloned());
+                    inputs.extend(result.columns.frame.columns().iter().cloned());
                 }
 
                 let transform = transform.fit(&inputs).map_err(|error| {
@@ -760,7 +838,7 @@ fn fit_and_transform_factors(
                         transform,
                         arguments: fitted_arguments,
                     }),
-                    columns: output.into_columns(),
+                    columns: output,
                 }
             }
         };
@@ -777,15 +855,19 @@ fn transform_factors(
 
     for factor in scheduled {
         let columns = match factor.as_ref() {
-            Factor::Literal(value) => {
-                vec![literal_column(value, data.height())]
-            }
+            Factor::Literal(value) => MaterializedColumns::single_column(
+                literal_column(value, data.height()).into_frame(),
+                ComponentKey::None.into(),
+            ),
             Factor::Variable(variable) => {
                 let column = data
                     .column(&variable.definition().name)
                     .map_err(TransformError::from)?;
 
-                vec![variable.transform(column)?]
+                MaterializedColumns::single_column(
+                    variable.transform(column)?.into_frame(),
+                    ComponentKey::None.into(),
+                )
             }
             Factor::Call {
                 transform,
@@ -794,14 +876,11 @@ fn transform_factors(
                 let mut inputs = Vec::new();
                 for argument in arguments {
                     let result = lookup_factor(&transformed, argument);
-                    inputs.extend(result.columns.iter().cloned());
+                    inputs.extend(result.columns.frame.columns().iter().cloned());
                 }
-                transform
-                    .transform(&inputs)
-                    .map_err(|error| {
-                        ModelError::TransformCall(format!("{}: {error}", factor.render()))
-                    })?
-                    .into_columns()
+                transform.transform(&inputs).map_err(|error| {
+                    ModelError::TransformCall(format!("{}: {error}", factor.render()))
+                })?
             }
         };
         transformed.push(FittedFactor {
@@ -1721,7 +1800,7 @@ mod tests {
                 for entry in entries {
                     if let Factor::Literal(value) = entry.factor.as_ref() {
                         literal_count += 1;
-                        let [Column::Scalar(column)] = entry.columns.as_slice() else {
+                        let [Column::Scalar(column)] = entry.columns.frame().columns() else {
                             panic!("literal must retain scalar storage");
                         };
                         assert_eq!(column.scalar(), value);
@@ -3100,8 +3179,8 @@ mod tests {
                 data.column("f2").unwrap().clone(),
             ];
             let summed = inner.transform(&inputs).unwrap();
-            let expected = outer.transform(&[summed[0].clone()]).unwrap();
-            assert!(design.frame().equals_missing(&expected));
+            let expected = outer.transform(&[summed.frame()[0].clone()]).unwrap();
+            assert!(design.frame().equals_missing(expected.frame()));
         }
     }
 }

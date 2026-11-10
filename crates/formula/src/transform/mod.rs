@@ -12,11 +12,12 @@ pub(crate) use integer::IntegerEncodingDefinition;
 pub(crate) use polynomial::PolynomialDefinition;
 
 use crate::fit::{Fit, FitError};
+use crate::formula::MaterializedColumns;
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, DataFrame, PlSmallStr};
+use polars::prelude::{Column, PlSmallStr};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -80,7 +81,7 @@ impl Transform {
     pub(crate) fn transform(
         &self,
         inputs: &[Column],
-    ) -> Result<DataFrame, FitError<TransformError>> {
+    ) -> Result<MaterializedColumns, FitError<TransformError>> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 
@@ -205,9 +206,9 @@ mod tests {
 
         let transform = transform.fit(&inputs)?;
         let output = transform.transform(&inputs).unwrap();
-        assert_eq!(output.get_column_names(), ["group"]);
+        assert_eq!(output.frame().get_column_names(), ["group"]);
         assert_eq!(
-            output[0].u32()?.iter().collect::<Vec<_>>(),
+            output.frame()[0].u32()?.iter().collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(0)]
         );
         Ok(())
