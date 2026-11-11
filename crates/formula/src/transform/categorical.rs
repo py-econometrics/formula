@@ -1,12 +1,14 @@
 use super::input::{input_frame, validate_single_input};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
+use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr,
-    Scalar, col, lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar, col,
+    lit, when,
 };
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CategoricalDefinition {
@@ -14,6 +16,8 @@ pub(crate) struct CategoricalDefinition {
 }
 
 impl CategoricalDefinition {
+    pub(crate) const REFERENCE_PARAMETER: &str = "reference";
+
     pub(crate) fn new(reference: Option<Scalar>) -> Self {
         Self { reference }
     }
@@ -115,6 +119,14 @@ impl TransformDefinition for CategoricalDefinition {
         "C"
     }
 
+    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+        self.reference
+            .as_ref()
+            .map(|reference| (Self::REFERENCE_PARAMETER, reference.clone()))
+            .into_iter()
+            .collect()
+    }
+
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
         let reference_argument = self.reference.as_ref().map(|reference| {
             let value = match reference.as_any_value() {
@@ -123,7 +135,7 @@ impl TransformDefinition for CategoricalDefinition {
                 _ => Self::level_name(reference),
             };
 
-            format!("reference={value}")
+            format!("{}={value}", Self::REFERENCE_PARAMETER)
         });
 
         call_name(
@@ -138,7 +150,7 @@ impl TransformDefinition for CategoricalDefinition {
 
 impl Definition<CategoricalState> for CategoricalDefinition {
     type Input = [Column];
-    type Output = DataFrame;
+    type Output = MaterializedColumns<ComponentKey>;
     type Error = TransformError;
 
     fn validate(&self, state: &CategoricalState, inputs: &[Column]) -> Result<(), TransformError> {
@@ -166,30 +178,39 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             levels
         };
 
-        if let Some(reference) = self.reference_for_dtype(levels.dtype())?
-            && !levels
-                .equal(&reference.into_column("reference".into()))?
-                .any()
-        {
-            return Err(TransformError::InvalidParameter(
-                "`reference` value is not among the fitted levels".into(),
-            ));
+        let mut reference_index = None;
+        if let Some(reference) = self.reference_for_dtype(levels.dtype())? {
+            reference_index = (0..levels.len())
+                .find_map(|index| match levels.get(index) {
+                    Ok(level) if level == reference.as_any_value() => Some(Ok(index)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .transpose()?;
+
+            if reference_index.is_none() {
+                return Err(TransformError::InvalidParameter(
+                    "`reference` value is not among the fitted levels".into(),
+                ));
+            }
         }
 
-        Ok(CategoricalState { levels })
+        Ok(CategoricalState {
+            levels,
+            reference_index,
+        })
     }
 
     fn transform(
         &self,
         state: &CategoricalState,
         inputs: &[Column],
-    ) -> Result<DataFrame, TransformError> {
+    ) -> Result<Self::Output, TransformError> {
         let input = &inputs[0]; // Already validated in Self::validate
         let levels = &state.levels;
         let frame = input_frame(inputs)?;
 
         let argument = col(frame.columns()[0].name().clone());
-        let reference = self.reference_for_dtype(input.dtype())?;
         let fitted_levels = (0..levels.len())
             .map(|i| {
                 Ok(Scalar::new(
@@ -213,31 +234,38 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 .is_in(lit(levels.implode()?.into_series()), false)
         };
 
-        let expressions = fitted_levels
+        let (expressions, metadata): (Vec<_>, Vec<ComponentKey>) = fitted_levels
             .into_iter()
-            .filter(|level| reference.as_ref() != Some(level))
-            .map(|level| {
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != state.reference_index)
+            .map(|(_, level)| {
                 let column_name = self.output_name(input.name(), &level);
-                when(argument.clone().is_null())
+
+                let expression = when(argument.clone().is_null())
                     .then(lit(NULL))
                     .when(level_was_seen.clone())
-                    .then(argument.clone().eq(lit(level)))
+                    .then(argument.clone().eq(lit(level.clone())))
                     .otherwise(lit(NULL))
-                    .alias(column_name)
+                    .alias(column_name);
+
+                (expression, ComponentKey::Scalar(level))
             })
-            .collect::<Vec<_>>();
+            .unzip();
         // Preserve input row count even when expression is empty
-        if expressions.is_empty() {
-            return Ok(DataFrame::empty_with_height(input.len()));
-        }
-        let result = frame.lazy().select(expressions).collect()?;
-        Ok(result)
+        let result = if expressions.is_empty() {
+            DataFrame::empty_with_height(input.len())
+        } else {
+            frame.lazy().select(expressions).collect()?
+        };
+
+        Ok(MaterializedColumns::new(result, metadata))
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
     levels: Column,
+    reference_index: Option<usize>,
 }
 
 #[cfg(test)]
@@ -272,12 +300,12 @@ mod tests {
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
             let output = fitted.transform(&training)?;
 
-            assert_eq!(output.get_column_names(), ["C(x)[d]", "C(x)[b]"]);
+            assert_eq!(output.frame().get_column_names(), ["C(x)[d]", "C(x)[b]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &training,
-                &output,
+                output.frame(),
                 &[
                     &[Some(true), Some(false), Some(true)],
                     &[Some(false), Some(true), Some(false)],
@@ -301,7 +329,7 @@ mod tests {
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                &fitted.transform(&input)?,
+                fitted.transform(&input)?.frame(),
                 &[
                     &[Some(false), None, None, Some(true), None],
                     &[Some(true), None, None, Some(false), None],
@@ -322,12 +350,15 @@ mod tests {
                 Column::new("x".into(), [Some("b"), Some("a"), None, Some("d")]).cast(&dtype)?,
             ];
             let output = fitted.transform(&input)?;
-            assert_eq!(output.get_column_names(), ["C(x, reference='b')[T.d]"]);
+            assert_eq!(
+                output.frame().get_column_names(),
+                ["C(x, reference='b')[T.d]"]
+            );
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                &output,
+                output.frame(),
                 &[&[Some(false), None, None, Some(true)]],
             );
         }
@@ -376,15 +407,23 @@ mod tests {
 
         for _ in 0..2 {
             let output = fitted.transform(&input)?;
-            assert_eq!(output.get_column_names(), original.get_column_names());
+            assert_eq!(
+                output.frame().get_column_names(),
+                original.frame().get_column_names()
+            );
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                &output,
+                output.frame(),
                 &[&[None, Some(false), None], &[None, Some(true), None]],
             );
-            assert!(fitted.transform(&training)?.equals_missing(&original));
+            assert!(
+                fitted
+                    .transform(&training)?
+                    .frame()
+                    .equals_missing(original.frame())
+            );
         }
         Ok(())
     }
@@ -417,7 +456,7 @@ mod tests {
                 let training = [Column::new("x".into(), values).cast(&dtype)?];
                 let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
                 let input = [Column::new("x".into(), [Some("a"), None, Some("b")]).cast(&dtype)?];
-                assert_eq!(fitted.transform(&input)?.shape(), (3, 0));
+                assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
             }
         }
         Ok(())
@@ -434,9 +473,12 @@ mod tests {
                 let height = values.len();
                 let input = [Column::new("x".into(), values).cast(&dtype)?];
                 let output = fitted.transform(&input)?;
-                assert_eq!(output.shape(), (height, 2));
-                assert_eq!(output.get_column_names(), original.get_column_names());
-                for column in output.columns() {
+                assert_eq!(output.frame().shape(), (height, 2));
+                assert_eq!(
+                    output.frame().get_column_names(),
+                    original.frame().get_column_names()
+                );
+                for column in output.frame().columns() {
                     assert_eq!(column.dtype(), &DataType::Boolean);
                     assert_eq!(column.null_count(), height);
                 }
@@ -452,7 +494,7 @@ mod tests {
             let reference = Scalar::from(PlSmallStr::from_static("b"));
             let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
             let input = [Column::new("x".into(), [Some("b"), Some("a"), None]).cast(&dtype)?];
-            assert_eq!(fitted.transform(&input)?.shape(), (3, 0));
+            assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
         }
         Ok(())
     }
@@ -462,7 +504,10 @@ mod tests {
         let inputs = [Column::new("group".into(), [1_i32, 1, 1])];
         let definition = CategoricalDefinition::new(Some(Scalar::from(1_i64)));
         let transform = definition.fit(&inputs)?;
-        assert_eq!(definition.transform(&transform, &inputs)?.shape(), (3, 0));
+        assert_eq!(
+            definition.transform(&transform, &inputs)?.frame().shape(),
+            (3, 0)
+        );
         Ok(())
     }
 
@@ -478,7 +523,10 @@ mod tests {
             let inputs = [inputs[0].cast(training.dtype())?];
             let definition = CategoricalDefinition::new(None);
             let transform = definition.fit(&[training])?;
-            assert_eq!(definition.transform(&transform, &inputs)?.shape(), (2, 0));
+            assert_eq!(
+                definition.transform(&transform, &inputs)?.frame().shape(),
+                (2, 0)
+            );
         }
         Ok(())
     }
@@ -511,7 +559,7 @@ mod tests {
                 &definition,
                 &state,
                 &inputs,
-                &definition.transform(&state, &inputs)?,
+                definition.transform(&state, &inputs)?.frame(),
                 &[
                     &[Some(true), None, None, Some(false), None, Some(true), None],
                     &[Some(false), None, None, Some(true), None, Some(false), None],
@@ -541,7 +589,7 @@ mod tests {
             &categorical.definition,
             &categorical.state,
             &input,
-            &output,
+            output.frame(),
             &[&[Some(false), Some(true)]],
         );
         Ok(())
@@ -622,14 +670,14 @@ mod tests {
             &definition,
             &first,
             &input,
-            &definition.transform(&first, &input)?,
+            definition.transform(&first, &input)?.frame(),
             &[&[Some(false), Some(true), None]],
         );
         assert_output(
             &definition,
             &second,
             &input,
-            &definition.transform(&second, &input)?,
+            definition.transform(&second, &input)?.frame(),
             &[&[Some(false), None, Some(true)]],
         );
 
@@ -653,7 +701,8 @@ mod tests {
             transform
                 .transform(&training)
                 .unwrap()
-                .equals_missing(&original)
+                .frame()
+                .equals_missing(original.frame())
         );
         assert_eq!(transform.definition(), &definition);
         Ok(())
@@ -688,7 +737,7 @@ mod tests {
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                &output,
+                output.frame(),
                 &expected,
             );
             let names = levels[..count]
@@ -697,6 +746,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
+                    .frame()
                     .get_column_names()
                     .iter()
                     .map(|name| name.as_str())
@@ -740,7 +790,7 @@ mod tests {
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                &output,
+                output.frame(),
                 &expected,
             );
             let names = levels[1..count]
@@ -749,6 +799,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
+                    .frame()
                     .get_column_names()
                     .iter()
                     .map(|name| name.as_str())
@@ -774,7 +825,7 @@ mod tests {
                 &definition,
                 &transform,
                 &input,
-                &definition.transform(&transform, &input)?,
+                definition.transform(&transform, &input)?.frame(),
                 &[&[Some(false), Some(true), Some(false)]],
             );
         }
@@ -791,7 +842,7 @@ mod tests {
             &definition,
             &transform,
             &input,
-            &definition.transform(&transform, &input)?,
+            definition.transform(&transform, &input)?.frame(),
             &[&[Some(false), Some(true), Some(false)]],
         );
         Ok(())
@@ -807,7 +858,7 @@ mod tests {
             &definition,
             &transform,
             &input,
-            &definition.transform(&transform, &input)?,
+            definition.transform(&transform, &input)?.frame(),
             &[&[Some(true), Some(false), None]],
         );
         Ok(())
@@ -926,7 +977,8 @@ mod tests {
             original
                 .transform(&input)
                 .unwrap()
-                .equals_missing(&original_output)
+                .frame()
+                .equals_missing(original_output.frame())
         );
 
         let Fit::Fitted(transform) = transform else {
@@ -937,7 +989,7 @@ mod tests {
             &transform.definition,
             &transform.state,
             &input,
-            &transform.transform(&input)?,
+            transform.transform(&input)?.frame(),
             &[
                 &[None, Some(true), Some(false)],
                 &[None, Some(false), Some(true)],

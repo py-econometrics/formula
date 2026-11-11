@@ -1,7 +1,8 @@
 use super::input::{input_frame, validate_numeric_input};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::error::PolarsError;
-use polars::prelude::{Column, DataFrame, DataType, Expr, IntoLazy, PlSmallStr, col, lit};
+use polars::prelude::{Column, DataType, Expr, IntoLazy, PlSmallStr, col, lit};
 
 type ExpressionBuilder = fn(&[Expr]) -> Result<Expr, TransformError>;
 
@@ -152,7 +153,10 @@ impl ExpressionTransform {
         self.clone()
     }
 
-    pub(crate) fn transform(&self, inputs: &[Column]) -> Result<DataFrame, TransformError> {
+    pub(crate) fn transform(
+        &self,
+        inputs: &[Column],
+    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
         self.validate_inputs(inputs)?;
         let frame = input_frame(inputs)?;
         let height = frame.height();
@@ -174,7 +178,10 @@ impl ExpressionTransform {
             )
             .into());
         }
-        Ok(output)
+        Ok(MaterializedColumns::single_column(
+            output,
+            ComponentKey::None,
+        ))
     }
 }
 
@@ -183,6 +190,7 @@ mod tests {
     use super::*;
     use crate::parse::parse_expression;
     use crate::transform::Transform;
+    use polars::prelude::DataFrame;
     use winnow::Parser;
 
     fn fit(source: &str, data: &DataFrame) -> crate::FittedFormula {
@@ -420,7 +428,7 @@ mod tests {
         assert!(!transform.expands());
         let transform = transform.fit(&input)?;
         assert_numeric_output(
-            &transform.transform(&input).unwrap(),
+            transform.transform(&input).unwrap().frame(),
             "log(x)",
             &[Some(0.0), Some(1.0), None],
         );
@@ -438,7 +446,7 @@ mod tests {
         assert!(!transform.expands());
         let transform = transform.fit(&input)?;
         assert_numeric_output(
-            &transform.transform(&input).unwrap(),
+            transform.transform(&input).unwrap().frame(),
             "exp(x)",
             &[
                 Some(1.0),
@@ -463,16 +471,18 @@ mod tests {
 
         for input in cases {
             assert_numeric_output(
-                &Transform::Expression(ExpressionTransform::LOG)
+                Transform::Expression(ExpressionTransform::LOG)
                     .transform(&input)
-                    .unwrap(),
+                    .unwrap()
+                    .frame(),
                 "log(x)",
                 &[Some(0.0), Some(std::f64::consts::LN_2)],
             );
             assert_numeric_output(
-                &Transform::Expression(ExpressionTransform::EXP)
+                Transform::Expression(ExpressionTransform::EXP)
                     .transform(&input)
-                    .unwrap(),
+                    .unwrap()
+                    .frame(),
                 "exp(x)",
                 &[Some(std::f64::consts::E), Some(std::f64::consts::E.powi(2))],
             );
@@ -541,9 +551,9 @@ mod tests {
             (Transform::Expression(ExpressionTransform::LOG), "log(x)"),
             (Transform::Expression(ExpressionTransform::EXP), "exp(x)"),
         ] {
-            assert_numeric_output(&transform.transform(&empty).unwrap(), name, &[]);
+            assert_numeric_output(transform.transform(&empty).unwrap().frame(), name, &[]);
             assert_numeric_output(
-                &transform.transform(&all_null).unwrap(),
+                transform.transform(&all_null).unwrap().frame(),
                 name,
                 &[None, None],
             );
@@ -556,18 +566,20 @@ mod tests {
     {
         let input = [Column::new("x".into(), [-1.0_f64, 0.0, 1.0])];
         assert_numeric_output(
-            &Transform::Expression(ExpressionTransform::LOG)
+            Transform::Expression(ExpressionTransform::LOG)
                 .transform(&input)
-                .unwrap(),
+                .unwrap()
+                .frame(),
             "log(x)",
             &[Some(f64::NAN), Some(f64::NEG_INFINITY), Some(0.0)],
         );
 
         let input = [Column::new("x".into(), [1000.0_f64])];
         assert_numeric_output(
-            &Transform::Expression(ExpressionTransform::EXP)
+            Transform::Expression(ExpressionTransform::EXP)
                 .transform(&input)
-                .unwrap(),
+                .unwrap()
+                .frame(),
             "exp(x)",
             &[Some(f64::INFINITY)],
         );

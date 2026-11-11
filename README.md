@@ -9,6 +9,8 @@ not ready for production use.
 
 ## Python API
 
+### Parsing formula strings
+
 ```python
 import polars
 
@@ -32,7 +34,9 @@ first_formula = formulas[0]  # Parsed formulas are an indexable collection
 same_formula = formulas[str(first_formula)]  # Look-up by formula-string also work
 ```
 
-A `Formula` object can "materialize" data according to the instructions of a formula string. This retains state for future materializations, for example categorical encoding.
+### Materializing formula data
+
+A `Formula` object can "materialize" data according to the instructions encoded in a formula string. This retains state for future materializations, for example categorical encoding.
 
 ```python
 fits = formulas.fit(data)  # Construct columns and learn transformation state
@@ -40,7 +44,7 @@ fit = fits[0]  # Integer indexing follows expansion order
 same_fit = fits[fit.formula]  # Look up a fitted formula by its formula string
 ```
 
-A `FittedFormula` exposes its data as a `DataFrame` that can be queried for specific `Role`s, for example dependent or independent variables. It is also possible to query specific formula terms using `FittedFormula.select_terms`.
+A `FittedFormula` exposes its data as a `DataFrame` that can be queried for specific `Role`s, for example dependent or independent variables.
 
 ```python
 frame = fit.frame()  # Get the materialized data as a single frame
@@ -49,7 +53,11 @@ frame = fit.frame()  # Get the materialized data as a single frame
 dependent = fit.select(formula.Role.Dependent).frame()
 independent = fit.select(formula.Role.Independent).frame()
 fixed_effects = fit.select(formula.Role.FixedEffect).frame()
+```
 
+It is also possible to query specific formula terms using `FittedFormula.select_terms`.
+
+```python
 # Select terms by their formula strings
 interaction_terms = fit.select_terms("log(x1)*sqrt(x2)", role=formula.Role.Independent)
 # Select the categorical term in the second formula
@@ -73,6 +81,28 @@ new_data = polars.DataFrame(
     }
 )
 transformed = predictors.transform(new_data)
+```
+
+### Insepecting metadata
+
+Data materialized by a formula expose metadata on their provenance.
+
+```python
+interaction = fit.select_terms("log(x1):sqrt(x2)", role=formula.Role.Independent)
+for column in interaction.columns(role=formula.Role.Independent):
+    # What are the `Factor`s contributing to a column?
+    contributions = column.contributions
+    print(contributions)
+
+for column in categorical_terms.columns(role=formula.Role.Independent):
+    # What are the `Factor`s contributing to a column?
+    contributions = column.contributions
+    for contribution in column.contributions:
+        # Metadata on the contribution's factor
+        print(contribution.factor)
+        # The column's level encoded by C(category, reference='a')
+        print(contribution.key)
+
 ```
 
 ## Rust API

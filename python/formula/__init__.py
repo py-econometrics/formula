@@ -1,9 +1,30 @@
 from collections.abc import Sequence
 
 from . import _formula
-from ._formula import FittedFormula, FittedFormulas, Formula, Formulas, Role
+from ._formula import (
+    Factor,
+    FactorContribution,
+    FittedFormula,
+    FittedFormulas,
+    Formula,
+    FormulaColumn,
+    Formulas,
+    Role,
+    TransformCall,
+)
 
-__all__ = ["FittedFormula", "FittedFormulas", "Formula", "Formulas", "Role", "parse"]
+__all__ = [
+    "Factor",
+    "FactorContribution",
+    "FittedFormula",
+    "FittedFormulas",
+    "Formula",
+    "FormulaColumn",
+    "Formulas",
+    "Role",
+    "TransformCall",
+    "parse",
+]
 
 
 def parse(formulas: str | Sequence[str]) -> Formulas:

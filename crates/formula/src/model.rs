@@ -1,10 +1,10 @@
-use crate::Formula;
 use crate::fit::FitError;
 use crate::formula::{
     Expression, FittedExpression, FittedTerm, Role, ValidationError, parse_one, transform_terms,
 };
 use crate::parse::{ParseResult, parse_term};
 use crate::transform::TransformError;
+use crate::{Formula, FormulaColumn};
 use polars::error::PolarsResult;
 use polars::prelude::DataFrame;
 use std::collections::BTreeMap;
@@ -47,6 +47,17 @@ impl FittedFormula {
             .collect();
 
         DataFrame::new(self.height, columns)
+    }
+
+    pub fn columns(
+        &self,
+        role: Role,
+    ) -> Result<impl Iterator<Item = FormulaColumn<'_>>, SelectionError> {
+        let expression = self
+            .expression(role)
+            .ok_or(SelectionError::MissingRole(role))?;
+
+        Ok(expression.columns())
     }
 
     fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
@@ -279,6 +290,271 @@ impl std::error::Error for SelectionError {}
 #[cfg(test)]
 mod tests {
     use super::{Role, SelectionError};
+
+    mod column_provenance {
+        use super::*;
+        use crate::{ComponentKey, FittedFormula};
+        use polars::prelude::{DataFrame, PlSmallStr, Scalar};
+
+        fn fit(source: &str, data: &DataFrame) -> FittedFormula {
+            crate::parse(source)
+                .unwrap()
+                .fit(data)
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .clone()
+        }
+
+        #[test]
+        fn categorical_interactions_identify_factors_and_levels() {
+            let data =
+                polars::df!("y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [2.0, 3.0, 4.0])
+                    .unwrap();
+            let fitted = fit("y ~ C(g, reference='a'):x - 1", &data);
+            let columns = fitted
+                .columns(Role::Independent)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(columns.len(), 2);
+
+            for (column, level, expected) in [
+                (&columns[0], "b", [Some(0.0), Some(3.0), Some(0.0)]),
+                (&columns[1], "c", [Some(0.0), Some(0.0), Some(4.0)]),
+            ] {
+                let contributions = column.contributions().collect::<Vec<_>>();
+                assert_eq!(contributions.len(), 2);
+                let (categorical, key) = contributions[0];
+                assert!(categorical.name().is_none());
+                assert_eq!(categorical.transform().unwrap().name(), "C");
+                assert_eq!(
+                    key,
+                    &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level)))
+                );
+                assert_eq!(
+                    categorical.transform().unwrap().parameters()["reference"],
+                    Scalar::from(PlSmallStr::from_static("a")),
+                );
+                let inputs = categorical
+                    .transform()
+                    .unwrap()
+                    .inputs()
+                    .collect::<Vec<_>>();
+                assert_eq!(inputs.len(), 1);
+                assert_eq!(inputs[0].name(), Some("g"));
+
+                let (variable, key) = contributions[1];
+                assert_eq!(variable.name(), Some("x"));
+                assert_eq!(key, &ComponentKey::None);
+                assert!(variable.transform().is_none());
+                assert_eq!(
+                    column.term().factors().collect::<Vec<_>>(),
+                    vec![categorical, variable],
+                );
+                assert_eq!(
+                    column.data().f64().unwrap().iter().collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn expanding_interactions_pair_levels_with_basis_indices() {
+            let data =
+                polars::df!("y" => [1.0, 2.0], "g" => ["a", "b"], "x" => [2.0, 3.0]).unwrap();
+            let fitted = fit("y ~ C(g):poly(x, degree=2, raw=true) - 1", &data);
+            let columns = fitted
+                .columns(Role::Independent)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(columns.len(), 4);
+
+            for (column, (level, basis, expected)) in columns.iter().zip([
+                ("a", 1_i64, [Some(2.0), Some(0.0)]),
+                ("a", 2, [Some(4.0), Some(0.0)]),
+                ("b", 1, [Some(0.0), Some(3.0)]),
+                ("b", 2, [Some(0.0), Some(9.0)]),
+            ]) {
+                let contributions = column.contributions().collect::<Vec<_>>();
+                assert_eq!(contributions.len(), 2);
+                assert_eq!(contributions[0].0.transform().unwrap().name(), "C");
+                assert_eq!(
+                    contributions[0].1,
+                    &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level))),
+                );
+                assert_eq!(contributions[1].0.transform().unwrap().name(), "poly");
+                assert_eq!(
+                    contributions[1].1,
+                    &ComponentKey::Scalar(Scalar::from(basis))
+                );
+                assert_eq!(
+                    column.data().f64().unwrap().iter().collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn selection_and_prediction_preserve_contributions_and_fitted_order() {
+            let training = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [2.0, 3.0, 4.0], "z" => [5.0, 6.0, 7.0],
+            )
+            .unwrap();
+            let fitted = fit("y ~ z + C(g, reference='a')*x", &training);
+            let selected = fitted
+                .select_terms("x:C(g, reference='a')", Role::Independent)
+                .unwrap()
+                .select_terms("C(g, reference='a'):x", Role::Independent)
+                .unwrap();
+            let input = polars::df!(
+                "g" => ["c", "b", "a", "new"], "x" => [10.0, 20.0, 30.0, 40.0],
+            )
+            .unwrap();
+            let predicted = selected.transform(&input).unwrap();
+
+            for model in [&selected, &predicted] {
+                let columns = model
+                    .columns(Role::Independent)
+                    .unwrap()
+                    .collect::<Vec<_>>();
+                assert_eq!(columns.len(), 2);
+                for (column, level) in columns.iter().zip(["b", "c"]) {
+                    let contributions = column.contributions().collect::<Vec<_>>();
+                    assert_eq!(contributions.len(), 2);
+                    assert_eq!(contributions[0].0.transform().unwrap().name(), "C");
+                    assert_eq!(
+                        contributions[0].1,
+                        &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level))),
+                    );
+                    assert_eq!(contributions[1].0.name(), Some("x"));
+                    assert_eq!(contributions[1].1, &ComponentKey::None);
+                }
+            }
+            let columns = predicted
+                .columns(Role::Independent)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                columns[0].data().f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(0.0), Some(20.0), Some(0.0), None],
+            );
+            assert_eq!(
+                columns[1].data().f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(10.0), Some(0.0), Some(0.0), None],
+            );
+        }
+
+        #[test]
+        fn nested_transforms_expose_inputs_and_configuration() {
+            let data = polars::df!("y" => [1.0, 2.0], "x" => [1.0, std::f64::consts::E]).unwrap();
+            let fitted = fit("y ~ poly(log(x), degree=2, raw=true) - 1", &data);
+            let columns = fitted
+                .columns(Role::Independent)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(columns.len(), 2);
+
+            for (column, basis) in columns.iter().zip([1_i64, 2]) {
+                let contributions = column.contributions().collect::<Vec<_>>();
+                assert_eq!(contributions.len(), 1);
+                let (polynomial, key) = contributions[0];
+                assert!(polynomial.name().is_none());
+                assert_eq!(polynomial.transform().unwrap().name(), "poly");
+                assert_eq!(key, &ComponentKey::Scalar(Scalar::from(basis)));
+                let parameters = polynomial.transform().unwrap().parameters();
+                assert_eq!(parameters.len(), 2);
+                assert_eq!(parameters["degree"], Scalar::from(2_i64));
+                assert_eq!(parameters["raw"], Scalar::from(true));
+
+                let inputs = polynomial.transform().unwrap().inputs().collect::<Vec<_>>();
+                assert_eq!(inputs.len(), 1);
+                let logarithm = inputs[0];
+                assert!(logarithm.name().is_none());
+                assert_eq!(logarithm.transform().unwrap().name(), "log");
+                assert!(logarithm.transform().unwrap().parameters().is_empty());
+                let inputs = logarithm.transform().unwrap().inputs().collect::<Vec<_>>();
+                assert_eq!(inputs.len(), 1);
+                assert_eq!(inputs[0].name(), Some("x"));
+                assert!(inputs[0].transform().is_none());
+
+                for (actual, expected) in column.data().f64().unwrap().iter().zip([0.0, 1.0]) {
+                    assert!((actual.unwrap() - expected).abs() < 1e-12);
+                }
+            }
+        }
+
+        #[test]
+        fn literal_transform_inputs_preserve_values_and_types() {
+            let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0]).unwrap();
+            for (source, expected) in [
+                ("y ~ add(x, 2) - 1", Scalar::from(2_i64)),
+                ("y ~ add(x, 2.0) - 1", Scalar::from(2.0_f64)),
+            ] {
+                let fitted = fit(source, &data);
+                let column = fitted.columns(Role::Independent).unwrap().next().unwrap();
+                let contributions = column.contributions().collect::<Vec<_>>();
+                assert_eq!(contributions.len(), 1);
+                let (factor, key) = contributions[0];
+                assert!(factor.name().is_none());
+                assert!(factor.value().is_none());
+                assert_eq!(key, &ComponentKey::None);
+                let call = factor.transform().unwrap();
+                assert_eq!(call.name(), "add");
+                assert!(call.parameters().is_empty());
+                let inputs = call.inputs().collect::<Vec<_>>();
+                assert_eq!(inputs.len(), 2);
+                assert_eq!(inputs[0].name(), Some("x"));
+                assert!(inputs[0].value().is_none());
+                assert!(inputs[0].transform().is_none());
+                assert!(inputs[1].name().is_none());
+                assert_eq!(inputs[1].value(), Some(&expected));
+                assert!(inputs[1].transform().is_none());
+            }
+        }
+
+        #[test]
+        fn intercepts_and_zero_column_terms_preserve_their_semantics() {
+            let training = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
+            let fitted = fit("y ~ C(g, reference='a')", &training);
+            let columns = fitted
+                .columns(Role::Independent)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(columns.len(), 1);
+            assert!(columns[0].term().factors().next().is_none());
+            assert!(columns[0].contributions().next().is_none());
+            assert_eq!(
+                columns[0].data().f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(1.0), Some(1.0)],
+            );
+
+            let selected = fitted
+                .select_terms("C(g, reference='a')", Role::Independent)
+                .unwrap();
+            let input = polars::df!("g" => ["a", "new", "a"]).unwrap();
+            for data in [&input, &input.head(Some(0))] {
+                let predicted = selected.transform(data).unwrap();
+                assert_eq!(predicted.columns(Role::Independent).unwrap().count(), 0);
+                assert_eq!(predicted.frame().unwrap().shape(), (data.height(), 0));
+                assert!(
+                    predicted
+                        .select_terms("C(g, reference='a')", Role::Independent)
+                        .is_ok()
+                );
+            }
+        }
+
+        #[test]
+        fn columns_report_missing_roles() {
+            let data = polars::df!("y" => [1.0, 2.0], "x" => [1.0, 2.0]).unwrap();
+            let fitted = fit("y ~ x", &data);
+            assert!(matches!(
+                fitted.columns(Role::FixedEffect),
+                Err(SelectionError::MissingRole(Role::FixedEffect)),
+            ));
+        }
+    }
 
     mod term_selection {
         use super::*;

@@ -639,6 +639,7 @@ name = "formula-py"
 version = "0.1.0"
 dependencies = [
  "formula",
+ "polars",
  "pyo3",
  "pyo3-polars",
 ]

@@ -459,7 +459,9 @@ impl Construct for Multistage {
 
 impl Construct for FixedEffect {
     fn term(term: crate::formula::Term) -> Result<Self::Operand, ConstructionError> {
-        if let Some(crate::formula::Factor::Variable(variable)) = term.as_factor() {
+        if let Some(crate::formula::FactorKind::Variable(variable)) =
+            term.as_factor().map(|factor| &factor.kind)
+        {
             Ok(variable.definition().name().to_owned())
         } else {
             Err(ConstructionError::ExpectedFixedEffectColumn)

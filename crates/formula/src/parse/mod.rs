@@ -2,7 +2,7 @@ mod ast;
 
 use crate::Role;
 use crate::fit::Fit;
-use crate::formula::Expression;
+use crate::formula::{Expression, FactorKind};
 use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::Stepwise;
 use crate::transform::{
@@ -254,7 +254,9 @@ fn parse_transform_argument(cursor: &mut &str) -> ModalResult<TransformCallArgum
 
 fn parse_transform_argument_positional(cursor: &mut &str) -> ModalResult<Factor> {
     alt((
-        terminated(parse_literal_number, parse_argument_boundary).map(Factor::Literal),
+        terminated(parse_literal_number, parse_argument_boundary).map(|value| Factor {
+            kind: FactorKind::Literal(value),
+        }),
         parse_factor,
     ))
     .parse_next(cursor)
@@ -582,13 +584,13 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::Expression(ExpressionTransform::DIV)
             }
             "C" => {
-                let reference = keywords.remove("reference");
+                let reference = keywords.remove(CategoricalDefinition::REFERENCE_PARAMETER);
                 reject_keywords("C", keywords)?;
                 Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
             }
             "poly" => {
-                let degree = keywords.remove("degree");
-                let raw = keywords.remove("raw");
+                let degree = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
+                let raw = keywords.remove(PolynomialDefinition::RAW_PARAMETER);
                 reject_keywords("poly", keywords)?;
 
                 let definition = PolynomialDefinition::new(degree, raw).map_err(|error| {
@@ -603,9 +605,11 @@ impl TryFrom<TransformCall> for Factor {
             _ => return Err(TransformCallError::UnknownTransform(call.name)),
         };
 
-        Ok(Self::Call {
-            transform,
-            arguments,
+        Ok(Self {
+            kind: FactorKind::Call {
+                transform,
+                arguments,
+            },
         })
     }
 }
@@ -1064,12 +1068,17 @@ mod tests {
             ("poly(x, degree=3)", 3, false),
             ("poly(x, degree=2, raw=true)", 2, true),
         ] {
-            let expected = Factor::Call {
-                transform: Transform::Poly(Fit::Unfitted(
-                    PolynomialDefinition::new(Some(Scalar::from(degree)), Some(Scalar::from(raw)))
+            let expected = Factor {
+                kind: FactorKind::Call {
+                    transform: Transform::Poly(Fit::Unfitted(
+                        PolynomialDefinition::new(
+                            Some(Scalar::from(degree)),
+                            Some(Scalar::from(raw)),
+                        )
                         .unwrap(),
-                )),
-                arguments: vec![Arc::new(Factor::from("x"))],
+                    )),
+                    arguments: vec![Arc::new(Factor::from("x"))],
+                },
             };
             assert_eq!(parse_factor.parse(source).unwrap(), expected, "{source}");
         }
@@ -1116,7 +1125,9 @@ mod tests {
         ] {
             assert_eq!(
                 parse_transform_argument_positional.parse(source).unwrap(),
-                Factor::Literal(value),
+                Factor {
+                    kind: FactorKind::Literal(value)
+                },
                 "{source}"
             );
         }
@@ -1124,18 +1135,26 @@ mod tests {
 
     #[test]
     fn positional_numbers_work_in_nested_calls() {
-        let expected = Factor::Call {
-            transform: Transform::Expression(ExpressionTransform::MUL),
-            arguments: vec![
-                Arc::new(Factor::Call {
-                    transform: Transform::Expression(ExpressionTransform::ADD),
-                    arguments: vec![
-                        Arc::new(Factor::from("x")),
-                        Arc::new(Factor::Literal(Scalar::from(-2_i64))),
-                    ],
-                }),
-                Arc::new(Factor::Literal(Scalar::from(3.0_f64))),
-            ],
+        let expected = Factor {
+            kind: FactorKind::Call {
+                transform: Transform::Expression(ExpressionTransform::MUL),
+                arguments: vec![
+                    Arc::new(Factor {
+                        kind: FactorKind::Call {
+                            transform: Transform::Expression(ExpressionTransform::ADD),
+                            arguments: vec![
+                                Arc::new(Factor::from("x")),
+                                Arc::new(Factor {
+                                    kind: FactorKind::Literal(Scalar::from(-2_i64)),
+                                }),
+                            ],
+                        },
+                    }),
+                    Arc::new(Factor {
+                        kind: FactorKind::Literal(Scalar::from(3.0_f64)),
+                    }),
+                ],
+            },
         };
         assert_eq!(
             parse_factor.parse("mul(add(x, -2), 3.0)").unwrap(),
@@ -1190,9 +1209,11 @@ mod tests {
 
     #[test]
     fn quoted_columns_work_throughout_formulas() {
-        let call = |transform, arguments: Vec<Factor>| Factor::Call {
-            transform,
-            arguments: arguments.into_iter().map(Arc::new).collect(),
+        let call = |transform, arguments: Vec<Factor>| Factor {
+            kind: FactorKind::Call {
+                transform,
+                arguments: arguments.into_iter().map(Arc::new).collect(),
+            },
         };
         let nested = call(
             Transform::Expression(ExpressionTransform::LOG),
@@ -1495,30 +1516,38 @@ mod tests {
         let cases = [
             (
                 "log(x)",
-                Factor::Call {
-                    transform: Transform::Expression(ExpressionTransform::LOG),
-                    arguments: vec![Arc::new(Factor::from("x"))],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: Transform::Expression(ExpressionTransform::LOG),
+                        arguments: vec![Arc::new(Factor::from("x"))],
+                    },
                 },
             ),
             (
                 "exp(x)",
-                Factor::Call {
-                    transform: Transform::Expression(ExpressionTransform::EXP),
-                    arguments: vec![Arc::new(Factor::from("x"))],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: Transform::Expression(ExpressionTransform::EXP),
+                        arguments: vec![Arc::new(Factor::from("x"))],
+                    },
                 },
             ),
             (
                 "C(group)",
-                Factor::Call {
-                    transform: categorical(None),
-                    arguments: vec![Arc::new(Factor::from("group"))],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: categorical(None),
+                        arguments: vec![Arc::new(Factor::from("group"))],
+                    },
                 },
             ),
             (
                 "C(group, reference='a')",
-                Factor::Call {
-                    transform: categorical(Some(Scalar::from(PlSmallStr::from_static("a")))),
-                    arguments: vec![Arc::new(Factor::from("group"))],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: categorical(Some(Scalar::from(PlSmallStr::from_static("a")))),
+                        arguments: vec![Arc::new(Factor::from("group"))],
+                    },
                 },
             ),
         ];
@@ -1531,9 +1560,11 @@ mod tests {
             );
         }
 
-        let expected = Expression::from(Term::from(Factor::Call {
-            transform: categorical(Some(Scalar::from(1_i64))),
-            arguments: vec![Arc::new(Factor::from("x"))],
+        let expected = Expression::from(Term::from(Factor {
+            kind: FactorKind::Call {
+                transform: categorical(Some(Scalar::from(1_i64))),
+                arguments: vec![Arc::new(Factor::from("x"))],
+            },
         }));
         for source in [
             "C(x, reference=1)",
@@ -1728,32 +1759,46 @@ mod tests {
         let cases = [
             (
                 "log(C(x))",
-                Factor::Call {
-                    transform: Transform::Expression(ExpressionTransform::LOG),
-                    arguments: vec![Arc::new(Factor::Call {
-                        transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
-                        arguments: vec![Arc::new(Factor::from("x"))],
-                    })],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: Transform::Expression(ExpressionTransform::LOG),
+                        arguments: vec![Arc::new(Factor {
+                            kind: FactorKind::Call {
+                                transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+                                    None,
+                                ))),
+                                arguments: vec![Arc::new(Factor::from("x"))],
+                            },
+                        })],
+                    },
                 },
             ),
             (
                 "C(log(x))",
-                Factor::Call {
-                    transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
-                    arguments: vec![Arc::new(Factor::Call {
-                        transform: Transform::Expression(ExpressionTransform::LOG),
-                        arguments: vec![Arc::new(Factor::from("x"))],
-                    })],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+                        arguments: vec![Arc::new(Factor {
+                            kind: FactorKind::Call {
+                                transform: Transform::Expression(ExpressionTransform::LOG),
+                                arguments: vec![Arc::new(Factor::from("x"))],
+                            },
+                        })],
+                    },
                 },
             ),
             (
                 "log(exp(x))",
-                Factor::Call {
-                    transform: Transform::Expression(ExpressionTransform::LOG),
-                    arguments: vec![Arc::new(Factor::Call {
-                        transform: Transform::Expression(ExpressionTransform::EXP),
-                        arguments: vec![Arc::new(Factor::from("x"))],
-                    })],
+                Factor {
+                    kind: FactorKind::Call {
+                        transform: Transform::Expression(ExpressionTransform::LOG),
+                        arguments: vec![Arc::new(Factor {
+                            kind: FactorKind::Call {
+                                transform: Transform::Expression(ExpressionTransform::EXP),
+                                arguments: vec![Arc::new(Factor::from("x"))],
+                            },
+                        })],
+                    },
                 },
             ),
         ];
