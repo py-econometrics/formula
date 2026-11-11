@@ -1158,6 +1158,28 @@ mod tests {
     use polars::prelude::Scalar;
     use winnow::Parser;
 
+    #[test]
+    fn grouped_output_keys_identify_group_and_loading() -> Result<(), TransformError> {
+        let inputs = [
+            Column::new("firm".into(), [0_u32, 1]),
+            Column::new("time".into(), [1.0, 2.0]),
+        ];
+        let output = crate::transform::GroupedTransform.transform(&inputs)?;
+
+        assert_eq!(
+            output.metadata,
+            vec![
+                ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                    "group",
+                ))),
+                ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                    "loading",
+                ))),
+            ],
+        );
+        Ok(())
+    }
+
     mod formulas {
         use crate::{Formula, Formulas, parse, parse_many};
 
