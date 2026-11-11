@@ -1,11 +1,13 @@
 mod categorical;
 mod expression;
+mod grouped;
 mod input;
 mod integer;
 mod polynomial;
 
 pub(crate) use categorical::CategoricalDefinition;
 pub(crate) use expression::ExpressionTransform;
+pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
 pub(crate) use input::validate_numeric_input;
 pub(crate) use integer::IntegerEncodingDefinition;
@@ -29,8 +31,9 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
 pub(crate) enum Transform {
     Expression(ExpressionTransform),
     C(Fit<CategoricalDefinition, CategoricalState>),
-    F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
     Poly(Fit<PolynomialDefinition, PolynomialState>),
+    F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
+    G(GroupedTransform),
 }
 
 pub(crate) trait TransformDefinition {
@@ -54,8 +57,9 @@ impl Transform {
         match self {
             Self::Expression(expression) => expression,
             Self::C(categorical) => categorical.definition(),
-            Self::F(integer) => integer.definition(),
             Self::Poly(polynomial) => polynomial.definition(),
+            Self::F(integer) => integer.definition(),
+            Self::G(grouped) => grouped,
         }
     }
 
@@ -86,8 +90,9 @@ impl Transform {
         match self {
             Self::Expression(expression) => Ok(Self::Expression(expression.fit())),
             Self::C(categorical) => Ok(Self::C(categorical.fit(inputs)?)),
-            Self::F(integer) => Ok(Self::F(integer.fit(inputs)?)),
             Self::Poly(polynomial) => Ok(Self::Poly(polynomial.fit(inputs)?)),
+            Self::F(integer) => Ok(Self::F(integer.fit(inputs)?)),
+            Self::G(grouped) => Ok(Self::G(*grouped)),
         }
     }
 
@@ -103,8 +108,9 @@ impl Transform {
                 expression.transform(inputs).map_err(FitError::Transform)
             }
             Self::C(categorical) => categorical.transform(inputs),
-            Self::F(integer) => integer.transform(inputs),
             Self::Poly(polynomial) => polynomial.transform(inputs),
+            Self::F(integer) => integer.transform(inputs),
+            Self::G(grouped) => grouped.transform(inputs).map_err(FitError::Transform),
         }
     }
 }

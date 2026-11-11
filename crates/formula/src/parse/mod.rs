@@ -14,8 +14,8 @@ use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat, separated,
-    terminated,
+    Postfix, Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat,
+    separated, terminated,
 };
 use winnow::error::{
     ContextError, ErrMode, FromExternalError, ParseError, StrContext, StrContextValue,
@@ -27,6 +27,7 @@ pub(crate) const FORMULA_SEPARATOR: char = '~';
 pub(crate) const PIPE_SEPARATOR: char = '|';
 const SUM_PRECEDENCE: i64 = 10;
 const PRODUCT_PRECEDENCE: i64 = 20;
+const GROUPED_PRECEDENCE: i64 = 25;
 const INTERACTION_PRECEDENCE: i64 = 30;
 const PREFIX_PRECEDENCE: i64 = 40;
 
@@ -99,7 +100,7 @@ pub(crate) fn is_identifier_character(c: char) -> bool {
 }
 
 fn is_argument_boundary(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ',' | ')')
+    c.is_whitespace() || matches!(c, ',' | ')' | ']')
 }
 
 fn parse_bare_token<'i>(cursor: &mut &'i str) -> ModalResult<&'i str> {
@@ -187,6 +188,28 @@ fn parse_literal_number(cursor: &mut &str) -> ModalResult<Scalar> {
 
 fn parse_argument_boundary(cursor: &mut &str) -> ModalResult<()> {
     peek(alt((one_of(is_argument_boundary).void(), eof.void()))).parse_next(cursor)
+}
+
+fn parse_loadings(cursor: &mut &str) -> ModalResult<(Arc<Factor>, Vec<Arc<Factor>>)> {
+    multispace0.parse_next(cursor)?;
+
+    let first = cut_err(parse_transform_argument_positional.context(StrContext::Label("loading")))
+        .map(Arc::new)
+        .parse_next(cursor)?;
+
+    let rest = repeat(
+        0..,
+        preceded(
+            (multispace0, ',', multispace0),
+            cut_err(parse_transform_argument_positional.context(StrContext::Label("loading")))
+                .map(Arc::new),
+        ),
+    )
+    .parse_next(cursor)?;
+
+    multispace0.parse_next(cursor)?;
+
+    Ok((first, rest))
 }
 
 fn parse_factor(cursor: &mut &str) -> ModalResult<Factor> {
@@ -335,6 +358,26 @@ fn parse_node<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expressi
                 construction_result(cursor, ast::Expression::<K>::interact(left, right))
             })),
         )))
+        .postfix(alt((
+            "[[".value(Postfix(
+                GROUPED_PRECEDENCE,
+                |cursor, group: ast::Expression<K>| {
+                    let (first, rest) = cut_err(terminated(parse_loadings, ("]]", multispace0)))
+                        .parse_next(cursor)?;
+
+                    construction_result(cursor, group.grouped(false, first, rest))
+                },
+            )),
+            '['.value(Postfix(
+                GROUPED_PRECEDENCE,
+                |cursor, group: ast::Expression<K>| {
+                    let (first, rest) = cut_err(terminated(parse_loadings, (']', multispace0)))
+                        .parse_next(cursor)?;
+
+                    construction_result(cursor, group.grouped(true, first, rest))
+                },
+            )),
+        )))
         .parse_next(cursor)
 }
 
@@ -396,7 +439,7 @@ fn parse_node_parenthesized<K: ast::Construct>(
     )
     .parse_next(cursor)?;
 
-    Ok(ast::Expression::Group(Box::new(node)))
+    Ok(ast::Expression::Parenthesized(Box::new(node)))
 }
 
 fn parse_operand<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
@@ -455,7 +498,7 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::Formula> {
     let fixed_effects = opt(preceded(
         PIPE_SEPARATOR,
         cut_err(
-            parse_node::<ast::FixedEffect>.context(StrContext::Label("fixed-effect expression")),
+            parse_node::<ast::VaryingSlope>.context(StrContext::Label("fixed-effect expression")),
         ),
     ))
     .parse_next(cursor)?;
@@ -503,11 +546,8 @@ pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression
                 node.expand()
             }
             Role::FixedEffect => {
-                let node = parse_node::<ast::FixedEffect>(cursor)?;
-                node.expand()
-                    .into_iter()
-                    .map(crate::formula::encode_fixed_effects)
-                    .collect()
+                let node = parse_node::<ast::VaryingSlope>(cursor)?;
+                node.expand().into_iter().collect()
             }
         };
 
@@ -633,6 +673,187 @@ mod tests {
     use super::*;
     use crate::formula::Role;
     use crate::parse::ast as typed;
+
+    mod varying_slopes {
+        use super::*;
+
+        #[test]
+        fn normalization_preserves_grouping_and_deduplicates_terms() {
+            for (source, expected) in [
+                ("firm[time, time]", "firm[time]"),
+                ("firm[time] + firm[time]", "firm[time]"),
+                ("firm[[time, exposure, time]]", "firm[[time, exposure]]"),
+                ("firm[time, exposure, time]", "firm[time, exposure]"),
+                ("firm:year[time] + sector", "(firm:year)[time] + sector"),
+                ("(firm + year)[time]", "firm[time] + year[time]"),
+                (
+                    "firm[[log(time), add(time, 2), log(time)]]",
+                    "firm[[log(time), add(time, 2)]]",
+                ),
+                (
+                    " `firm name` : year [[ time , exposure ]] ",
+                    "(`firm name`:year)[[time, exposure]]",
+                ),
+            ] {
+                assert_eq!(
+                    parse(&format!("y ~ x | {source}")).unwrap(),
+                    parse(&format!("y ~ x | {expected}")).unwrap(),
+                    "{source}",
+                );
+            }
+        }
+
+        #[test]
+        fn normalization_preserves_first_occurrence_order_and_round_trips() {
+            let specification =
+                parse("y ~ x | firm[[exposure, time, exposure]] + firm + firm[time]").unwrap();
+            let formula = specification.iter().next().unwrap();
+            let rendered = formula.to_string();
+            assert_eq!(
+                rendered,
+                "y ~ x - 1 | firm[[exposure, time]] + firm + firm[time]",
+            );
+            assert_eq!(parse(&rendered).unwrap(), specification);
+        }
+
+        #[test]
+        fn numeric_loadings_end_at_closing_brackets_and_preserve_literal_types() {
+            for (source, value, intercept) in [
+                ("firm[2]", Scalar::from(2_i64), true),
+                ("firm[[2]]", Scalar::from(2_i64), false),
+                ("firm[[2.0]]", Scalar::from(2_f64), false),
+                ("firm[[-2.5]]", Scalar::from(-2.5_f64), false),
+            ] {
+                let node = parse_node::<typed::VaryingSlope>.parse(source).unwrap();
+                let typed::Expression::Grouped(group) = node else {
+                    panic!("expected grouped loadings for {source}");
+                };
+                let actual = group.first.value().expect("expected a numeric literal");
+                assert_eq!(actual.dtype(), value.dtype(), "{source}");
+                assert_eq!(actual, &value, "{source}");
+                assert_eq!(group.intercept, intercept, "{source}");
+            }
+        }
+
+        #[test]
+        fn global_intercept_depends_on_group_intercepts_and_explicit_removal() {
+            for (source, intercept) in [
+                ("y ~ x | firm[time]", false),
+                ("y ~ x | firm[time, exposure]", false),
+                ("y ~ x | firm[[time]]", true),
+                ("y ~ x | firm:year[[time]]", true),
+                ("y ~ x - 1 | firm[[time]]", false),
+                ("y ~ x + 1 | firm[time]", false),
+                ("y ~ x | firm[[time]] + year", false),
+                ("y ~ x | firm[[time]] + year[[exposure]]", true),
+            ] {
+                let specification = parse(source).unwrap();
+                let formula = specification.iter().next().unwrap();
+                let expected = if intercept {
+                    expression(&[&[], &["x"]])
+                } else {
+                    expression(&[&["x"]])
+                };
+                assert_eq!(
+                    formula.expressions[&Role::Independent],
+                    expected,
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn stepwise_expansion_preserves_loadings_and_local_intercept_policy() {
+            for (source, expected) in [
+                (
+                    "y ~ x | sw(firm[time], year[[time]])",
+                    vec!["y ~ x | firm[time]", "y ~ x | year[[time]]"],
+                ),
+                (
+                    "y ~ x | sw0(firm[time])",
+                    vec!["y ~ x", "y ~ x | firm[time]"],
+                ),
+                (
+                    "y ~ x | csw(firm[[time]], year[exposure])",
+                    vec![
+                        "y ~ x | firm[[time]]",
+                        "y ~ x | firm[[time]] + year[exposure]",
+                    ],
+                ),
+                (
+                    "y ~ x | sw(firm, year)[time]",
+                    vec!["y ~ x | firm[time]", "y ~ x | year[time]"],
+                ),
+            ] {
+                assert_eq!(
+                    parse(source).unwrap(),
+                    parse_many(expected).unwrap(),
+                    "{source}"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_or_unsupported_loading_syntax_is_rejected() {
+            for source in [
+                "firm[]",
+                "firm[[]]",
+                "firm[time,]",
+                "firm[,time]",
+                "firm[[time,]]",
+                "firm[[,time]]",
+                "firm[time",
+                "firm[[time]",
+                "firm[time]]",
+                "firm[[time]]]",
+                "firm[time + exposure]",
+                "firm[time:exposure]",
+                "firm[time[exposure]]",
+                "firm[sw(time, exposure)]",
+                "log(firm)[time]",
+            ] {
+                let source = format!("y ~ x | {source}");
+                assert!(parse(&source).is_err(), "{source}");
+            }
+        }
+
+        #[test]
+        fn loadings_cannot_be_reused_as_grouping_operands() {
+            for source in [
+                "firm[[time]]:year",
+                "firm:(year[[time]])",
+                "(firm[[time]] + year):sector",
+                "sw(firm, year[[time]]):sector",
+                "firm[[time]][exposure]",
+                "(firm[[time]])[exposure]",
+            ] {
+                let source = format!("y ~ x | {source}");
+                let error = parse(&source).unwrap_err();
+                assert_eq!(
+                    construction_error(error.inner()),
+                    &typed::ConstructionError::ExpectedFixedEffectGroup,
+                    "{source}: {error}",
+                );
+            }
+        }
+
+        #[test]
+        fn loadings_are_restricted_to_the_fixed_effect_pipe() {
+            for source in [
+                "y ~ x[time]",
+                "y ~ x[[time]]",
+                "y[time] ~ x",
+                "y ~ [a ~ b[time]]",
+            ] {
+                let error = parse(source).unwrap_err();
+                assert_eq!(
+                    construction_error(error.inner()),
+                    &typed::ConstructionError::GroupedNotAllowed,
+                    "{source}: {error}",
+                );
+            }
+        }
+    }
 
     mod multistage {
         use super::*;
@@ -786,10 +1007,41 @@ mod tests {
             let ast = parse_formula_ast.parse("y ~ x | firm").unwrap();
             assert_term(&ast.left, "y");
             assert_term(&ast.right, "x");
-            assert!(matches!(
-                ast.fixed_effects,
-                Some(Ast::Operand(name)) if name == "firm"
-            ));
+            let Some(Ast::Operand(group)) = ast.fixed_effects else {
+                panic!("expected fixed-effect group");
+            };
+            assert!(matches!(group, Ast::Operand(name) if name == "firm"));
+        }
+
+        #[test]
+        fn varying_slope_interactions_construct_inner_groupings() {
+            for source in [
+                "firm:year",
+                "(firm + year):sector",
+                "sw0(firm):year",
+                "csw(firm, year):sector",
+            ] {
+                let node = parse_node::<typed::VaryingSlope>.parse(source).unwrap();
+                let Ast::Operand(Ast::Interact(_)) = &node else {
+                    panic!("expected inner grouping interaction for {source}");
+                };
+                assert_eq!(
+                    node.into_fixed_effect().unwrap().expand(),
+                    parse_fixed_effects.parse(source).unwrap(),
+                    "{source}",
+                );
+            }
+        }
+
+        #[test]
+        fn fixed_effect_grouping_rejects_nested_formulas_and_loadings() {
+            for (source, expected) in [
+                ("[y ~ x]", typed::ConstructionError::MultistageNotAllowed),
+                ("firm[time]", typed::ConstructionError::GroupedNotAllowed),
+            ] {
+                let error = parse_fixed_effects.parse(source).unwrap_err();
+                assert_eq!(construction_error(error.inner()), &expected, "{source}");
+            }
         }
 
         #[test]
@@ -821,7 +1073,7 @@ mod tests {
                 panic!("expected subtraction");
             };
             assert_term(&node.left, "x");
-            let Ast::Group(group) = node.right.as_ref() else {
+            let Ast::Parenthesized(group) = node.right.as_ref() else {
                 panic!("expected group");
             };
             let Ast::Negate(value) = group.as_ref() else {
@@ -838,7 +1090,7 @@ mod tests {
                 panic!("expected stepwise call");
             };
             assert!(matches!(call.operator, Stepwise::Sw));
-            assert!(matches!(call.first.as_ref(), Ast::Group(_)));
+            assert!(matches!(call.first.as_ref(), Ast::Parenthesized(_)));
             assert_eq!(call.rest.len(), 1);
             assert_term(&call.rest[0], "z");
 
@@ -975,7 +1227,10 @@ mod tests {
             let error = parse_fixed_effects.parse(source).unwrap_err();
             assert_eq!(
                 construction_error(error.inner()),
-                &typed::ConstructionError::FixedEffectOperator(operator),
+                &typed::ConstructionError::InvalidOperator {
+                    operator,
+                    context: "fixed-effect expressions",
+                },
                 "{source}: {error}",
             );
 
@@ -983,7 +1238,10 @@ mod tests {
             let error = parse(&formula).unwrap_err();
             assert_eq!(
                 construction_error(error.inner()),
-                &typed::ConstructionError::FixedEffectOperator(operator),
+                &typed::ConstructionError::InvalidOperator {
+                    operator,
+                    context: "varying-slope expressions",
+                },
                 "{formula}: {error}",
             );
             assert!(
@@ -1898,7 +2156,7 @@ mod tests {
 
             assert_eq!(removed().apply_to(seed.clone()), [expression(&[&["x"]])]);
 
-            let grouped = Ast::Group(Box::new(removed()));
+            let grouped = Ast::Parenthesized(Box::new(removed()));
             assert_eq!(grouped.apply_to(seed.clone()), [expression(&[&[], &["x"]])]);
 
             let restored = Ast::add(removed(), intercept()).unwrap();

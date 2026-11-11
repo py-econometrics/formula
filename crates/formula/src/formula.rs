@@ -5,7 +5,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
+    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, Transform, TransformError,
+    validate_numeric_input,
 };
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
@@ -89,6 +90,44 @@ impl Definition<VariableState> for VariableDefinition {
 
     fn transform(&self, _state: &VariableState, input: &Column) -> Result<Column, TransformError> {
         Ok(input.clone())
+    }
+}
+
+struct FixedEffect<'a> {
+    group: &'a [Arc<Factor>],
+    loadings: &'a [Arc<Factor>],
+    intercept: bool,
+}
+
+impl FixedEffect<'_> {
+    fn is_intercept(&self) -> bool {
+        self.intercept
+    }
+
+    fn render(&self) -> String {
+        let group = self
+            .group
+            .iter()
+            .map(|factor| factor.render())
+            .collect::<Vec<_>>()
+            .join(":");
+
+        if self.loadings.is_empty() {
+            return group;
+        }
+
+        let loadings = self
+            .loadings
+            .iter()
+            .map(|factor| factor.render())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if self.intercept {
+            format!("{group}[{loadings}]")
+        } else {
+            format!("{group}[[{loadings}]]")
+        }
     }
 }
 
@@ -260,6 +299,47 @@ impl From<Factor> for Term {
 impl Term {
     const INTERCEPT_COLUMN_NAME: &'static str = "Intercept";
 
+    fn fixed_effect(group: Vec<Arc<Factor>>, loadings: Vec<Arc<Factor>>, intercept: bool) -> Self {
+        let group = Arc::new(Factor {
+            kind: FactorKind::Call {
+                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+                arguments: group,
+            },
+        });
+
+        Self::from(Factor {
+            kind: FactorKind::Call {
+                transform: Transform::G(GroupedTransform::new(intercept)),
+                arguments: std::iter::once(group).chain(loadings).collect(),
+            },
+        })
+    }
+
+    fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
+        let FactorKind::Call {
+            transform: Transform::G(grouped),
+            arguments,
+        } = &self.as_factor()?.kind
+        else {
+            return None;
+        };
+
+        let (group, loadings) = arguments.as_slice().split_first()?;
+
+        let FactorKind::Call {
+            transform: Transform::F(_),
+            arguments,
+        } = &group.kind
+        else {
+            return None;
+        };
+
+        Some(FixedEffect {
+            group: arguments,
+            loadings,
+            intercept: grouped.intercept(),
+        })
+    }
     pub fn factors(&self) -> impl Iterator<Item = &Factor> {
         self.factors.iter().map(Arc::as_ref)
     }
@@ -443,6 +523,13 @@ impl Expression {
 
     fn has_intercept(&self) -> bool {
         self.terms.iter().any(Term::is_intercept)
+    }
+
+    pub(crate) fn has_fixed_effect_intercept(&self) -> bool {
+        self.terms.iter().any(|term| {
+            term.as_fixed_effect()
+                .is_some_and(|effect| effect.is_intercept())
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1081,20 +1168,19 @@ fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term) -> &'a FittedTerm
         .expect("every term must have an transformed entry")
 }
 
-pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
+pub(crate) fn encode_fixed_effects(
+    expression: Expression,
+    intercept: bool,
+    loadings: impl IntoIterator<Item = Arc<Factor>>,
+) -> Expression {
+    let loadings = collect_unique(loadings);
+
     Expression::new(
         expression
             .terms
             .into_iter()
             .filter(|term| !term.is_intercept())
-            .map(|term| {
-                Term::from(Factor {
-                    kind: FactorKind::Call {
-                        transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                        arguments: term.factors,
-                    },
-                })
-            }),
+            .map(|term| Term::fixed_effect(term.factors, loadings.clone(), intercept)),
         expression.children,
     )
 }
@@ -1104,22 +1190,9 @@ fn render_fixed_effects(expression: &Expression) -> String {
         .terms
         .iter()
         .map(|term| {
-            let [factor] = term.factors.as_slice() else {
-                unreachable!("fixed-effect terms contain one encoded factor");
-            };
-            let FactorKind::Call {
-                transform: Transform::F(_),
-                arguments,
-            } = &factor.kind
-            else {
-                unreachable!("fixed-effect terms use F encoding");
-            };
-
-            arguments
-                .iter()
-                .map(|argument| argument.render())
-                .collect::<Vec<_>>()
-                .join(":")
+            term.as_fixed_effect()
+                .expect("fixed-effect terms use G with an encoded group and optional loadings")
+                .render()
         })
         .collect::<Vec<_>>()
         .join(" + ")
@@ -1157,6 +1230,38 @@ mod tests {
     };
     use polars::prelude::Scalar;
     use winnow::Parser;
+
+    #[test]
+    fn grouped_output_keys_identify_group_and_loading_positions() -> Result<(), TransformError> {
+        let inputs = [
+            Column::new("firm".into(), [0_u32, 1]),
+            Column::new("time".into(), [1.0, 2.0]),
+            Column::new("exposure".into(), [0.5, 1.0]),
+        ];
+        let output = crate::transform::GroupedTransform::new(false).transform(&inputs)?;
+
+        assert_eq!(
+            output.metadata,
+            vec![
+                ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                    "group",
+                ))),
+                ComponentKey::Tuple(vec![
+                    ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                        "loading"
+                    ))),
+                    ComponentKey::Scalar(Scalar::from(1_u64)),
+                ]),
+                ComponentKey::Tuple(vec![
+                    ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                        "loading"
+                    ))),
+                    ComponentKey::Scalar(Scalar::from(2_u64)),
+                ]),
+            ],
+        );
+        Ok(())
+    }
 
     mod formulas {
         use crate::{Formula, Formulas, parse, parse_many};
@@ -1464,7 +1569,7 @@ mod tests {
             vec![child.clone()],
         );
 
-        let encoded = encode_fixed_effects(expression);
+        let encoded = encode_fixed_effects(expression, true, []);
         let expected = crate::parse("y ~ x | firm")
             .unwrap()
             .iter()
@@ -3245,8 +3350,11 @@ mod tests {
         let transformed = model.transform(&input).unwrap();
         let output = transformed.expression(Role::FixedEffect).unwrap().frame();
 
-        assert_eq!(output.width(), 1);
-        assert_eq!(output[0].name().as_str(), "f1:f2");
+        assert_eq!(output.shape(), (4, 1));
+        assert_eq!(
+            output.get_column_names(),
+            ["G(f1:f2, intercept=true)[group]"]
+        );
         assert_eq!(output[0].dtype(), &DataType::UInt32);
         assert_eq!(
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),

@@ -93,13 +93,15 @@ def test_role_frames_preserve_rows_and_nulls(data):
     assert_frame_equal(independent, data.select("x"))
     fixed_effects = model.select(formula.Role.FixedEffect).frame()
     assert fixed_effects.shape == (data.height, 1)
-    assert fixed_effects.schema == {"firm": polars.UInt32}
+    assert fixed_effects.schema == {
+        "G(firm, intercept=true)[group]": polars.UInt32,
+    }
 
     frame = model.frame()
     assert_frame_equal(frame, data.select("y", "x").hstack(fixed_effects))
     assert_frame_equal(
         model.select([formula.Role.Dependent, formula.Role.FixedEffect]).frame(),
-        frame.select("y", "firm"),
+        data.select("y").hstack(fixed_effects),
     )
     keep = frame.select(polars.all_horizontal(polars.all().is_not_null())).to_series()
     assert keep.to_list() == [True, False, True]
@@ -370,3 +372,51 @@ def test_select_terms_requires_a_valid_role(data, roles):
     model = formula.parse("y ~ x").fit(data)[0]
     with pytest.raises(TypeError):
         model.select_terms("x", *roles)
+
+
+def test_varying_slope_selection_exports_typed_prediction_columns(data):
+    training = data.with_columns(
+        polars.Series("time", [1, 2, 3], dtype=polars.Int32),
+        polars.Series("exposure", [0.5, 1.0, 1.5]),
+    )
+    model = formula.parse("y ~ x | firm[[time, exposure]]").fit(training)[0]
+    selected = model.select_terms(
+        "firm[[time, exposure]]", role=formula.Role.FixedEffect
+    )
+    del model
+
+    predicted = selected.transform(
+        polars.DataFrame(
+            {
+                "firm": ["b", "a", "unseen"],
+                "time": polars.Series([4, 5, None], dtype=polars.Int32),
+                "exposure": [2.0, 2.5, 3.0],
+            }
+        )
+    ).frame()
+    expected = polars.DataFrame(
+        {
+            "G(firm, time, exposure)[group]": polars.Series(
+                [1, 0, None], dtype=polars.UInt32
+            ),
+            "G(firm, time, exposure)[loading:1]": polars.Series(
+                [4.0, 5.0, None], dtype=polars.Float64
+            ),
+            "G(firm, time, exposure)[loading:2]": polars.Series(
+                [2.0, 2.5, 3.0], dtype=polars.Float64
+            ),
+        }
+    )
+    assert_frame_equal(predicted, expected)
+
+
+def test_varying_slope_fit_errors_are_value_errors(data):
+    with pytest.raises(ValueError, match="expected a primitive numeric dtype"):
+        formula.parse("y ~ x | firm[[firm]]").fit(data)
+    with pytest.raises(ValueError, match="expanding transform"):
+        formula.parse("y ~ x | firm[[C(firm)]]").fit(data)
+
+
+def test_varying_slope_syntax_errors_are_syntax_errors():
+    with pytest.raises(SyntaxError):
+        formula.parse("y ~ x | firm[]")
