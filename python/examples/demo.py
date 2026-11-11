@@ -40,20 +40,17 @@ categorical_terms = fits["y ~ C(category, reference='a') | firm + year"].select_
 )
 
 # Inspect metadata of materialized columns
-interaction = fit.select_terms("log(x1):sqrt(x2)", role=formula.Role.Independent)
-for column in interaction.columns(role=formula.Role.Independent):
-    # What are the `Factor`s contributing to a column?
-    contributions = column.contributions
-    print(contributions)
+for term in interaction_terms.terms(role=formula.Role.Independent):
+    print("Factors:", term.factors)
+    print("Columns:", [column.data.name for column in term.columns])
 
-for column in categorical_terms.columns(role=formula.Role.Independent):
-    # What are the `Factor`s contributing to a column?
-    contributions = column.contributions
-    for contribution in column.contributions:
-        # Metadata on the contribution's factor
-        print(contribution.factor)
-        # The column's level encoded by C(category, reference='a')
-        print(contribution.key)
+for term in categorical_terms.terms(role=formula.Role.Independent):
+    for factor in term.factors:
+        print(factor)
+
+    for column in term.columns:
+        for contribution in column.contributions:
+            print(contribution.key, column.data)
 
 # Select roles before transforming data that has no dependent column.
 predictors = fits.select(roles=[formula.Role.Independent, formula.Role.FixedEffect])
