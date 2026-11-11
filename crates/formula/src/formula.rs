@@ -120,9 +120,8 @@ impl From<&str> for Factor {
 impl Factor {
     pub fn name(&self) -> Option<&str> {
         match &self.kind {
-            FactorKind::Literal(_) => None,
             FactorKind::Variable(variable) => Some(variable.definition().name()),
-            FactorKind::Call { transform, .. } => Some(transform.name()),
+            _ => None,
         }
     }
 
@@ -133,19 +132,16 @@ impl Factor {
         }
     }
 
-    pub fn transform_inputs(&self) -> impl Iterator<Item = &Factor> {
-        let arguments: &[Arc<Factor>] = match &self.kind {
-            FactorKind::Call { arguments, .. } => arguments,
-            _ => &[],
-        };
-
-        arguments.iter().map(Arc::as_ref)
-    }
-
-    pub fn transform_parameters(&self) -> BTreeMap<&'static str, Scalar> {
+    pub fn transform(&self) -> Option<TransformCall<'_>> {
         match &self.kind {
-            FactorKind::Call { transform, .. } => transform.parameters(),
-            _ => BTreeMap::new(),
+            FactorKind::Call {
+                transform,
+                arguments,
+            } => Some(TransformCall {
+                transform,
+                inputs: arguments,
+            }),
+            _ => None,
         }
     }
 
@@ -200,6 +196,26 @@ impl Factor {
                 transform.call_name(&names).to_string()
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TransformCall<'a> {
+    transform: &'a Transform,
+    inputs: &'a [Arc<Factor>],
+}
+
+impl<'a> TransformCall<'a> {
+    pub fn name(&self) -> &'static str {
+        self.transform.name()
+    }
+
+    pub fn inputs(&self) -> impl Iterator<Item = &'a Factor> + 'a {
+        self.inputs.iter().map(Arc::as_ref)
+    }
+
+    pub fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+        self.transform.parameters()
     }
 }
 

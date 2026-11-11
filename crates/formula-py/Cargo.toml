@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 formula = { path = "../formula" }
 pyo3 = "0.29"
 pyo3-polars = { version = "0.28", default-features = false, features = ["dtype-categorical"] }
+polars = { version = "0.55.2", default-features = false }
