@@ -14,14 +14,27 @@ def data():
     )
 
 
-def test_selected_column_provenance_survives_prediction_and_owner_deletion(data):
+def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
     model = formula.parse("y ~ C(g, reference='a')*x").fit(data)[0]
     selected = model.select_terms("x:C(g, reference='a')", formula.Role.Independent)
     prediction = selected.transform(
         polars.DataFrame({"g": ["c", "b", "new"], "x": [10.0, 20.0, 30.0]})
     )
-    columns = prediction.columns(role=formula.Role.Independent)
-    del model, selected, prediction
+    terms = prediction.terms(role=formula.Role.Independent)
+    assert isinstance(terms, list)
+    (term,) = terms
+    assert isinstance(term, formula.FittedTerm)
+    del model, selected, prediction, terms
+
+    assert isinstance(term.factors, tuple)
+    assert len(term.factors) == 2
+    call = term.factors[0].transform
+    assert call is not None
+    assert call.name == "C"
+    assert term.factors[1].name == "x"
+    columns = term.columns
+    assert isinstance(columns, tuple)
+    del term
 
     assert len(columns) == 2
     for column, level, values in zip(
@@ -140,12 +153,15 @@ def test_literal_transform_inputs_preserve_python_types(data, literal, expected)
 
 def test_provenance_properties_are_read_only_and_containers_are_copies(data):
     model = formula.parse("y ~ C(g, reference='a') - 1").fit(data)[0]
-    column = model.columns(formula.Role.Independent)[0]
+    term = model.terms(formula.Role.Independent)[0]
+    column = term.columns[0]
     contribution = column.contributions[0]
     factor = contribution.factor
     call = factor.transform
     assert call is not None
     for target, attribute, value in [
+        (term, "factors", ()),
+        (term, "columns", ()),
         (column, "data", None),
         (column, "term", ()),
         (column, "contributions", ()),
@@ -169,27 +185,21 @@ def test_provenance_properties_are_read_only_and_containers_are_copies(data):
     assert call.inputs[0].name == "g"
     assert call.parameters == {"reference": "a"}
 
+    exported = term.columns[0].data
+    exported[0] = 99.0
+    assert_series_equal(term.columns[0].data, column.data)
 
-def test_intercept_and_zero_column_provenance():
+
+def test_zero_column_term_has_empty_python_tuple():
     training = polars.DataFrame({"y": [1.0, 2.0], "g": ["a", "a"]})
     model = formula.parse("y ~ C(g, reference='a')").fit(training)[0]
-    columns = model.columns(formula.Role.Independent)
-    assert len(columns) == 1
-    assert columns[0].term == ()
-    assert columns[0].contributions == ()
-    assert columns[0].data.to_list() == [1.0, 1.0]
-    selected = model.select_terms("C(g, reference='a')", formula.Role.Independent)
-    assert selected.columns(formula.Role.Independent) == []
-    prediction = polars.DataFrame({"g": ["a", "new", "a"]})
-    for data in [prediction, prediction.head(0)]:
-        transformed = selected.transform(data)
-        assert transformed.columns(formula.Role.Independent) == []
-        assert (
-            transformed.select_terms(
-                "C(g, reference='a')", formula.Role.Independent
-            ).columns(formula.Role.Independent)
-            == []
-        )
+    intercept, categorical = model.terms(formula.Role.Independent)
+    assert intercept.factors == ()
+    assert categorical.columns == ()
+    (factor,) = categorical.factors
+    assert isinstance(factor, formula.Factor)
+    assert factor.transform is not None
+    assert factor.transform.name == "C"
 
 
 @pytest.mark.xfail(
@@ -206,12 +216,14 @@ def test_zero_column_frame_export_preserves_height():
     assert selected.frame().shape == (data.height, 0)
 
 
-def test_columns_reject_missing_or_invalid_roles(data):
+@pytest.mark.parametrize("accessor", ["columns", "terms"])
+def test_columns_and_terms_reject_missing_or_invalid_roles(data, accessor):
     model = formula.parse("y ~ x").fit(data)[0]
+    method = getattr(model, accessor)
     with pytest.raises(KeyError, match="FixedEffect"):
-        model.columns(formula.Role.FixedEffect)
+        method(formula.Role.FixedEffect)
     with pytest.raises(TypeError):
-        model.columns("Independent")  # ty: ignore[invalid-argument-type]
+        method("Independent")
 
 
 def test_varying_slope_provenance_survives_owner_deletion():

@@ -1,11 +1,7 @@
 # formula
 
 `formula` is  [`Polars`](https://pola.rs)-powered implementation of Wilkinson formulas in Rust with a Python API. It parses formula strings and constructs data frames for regression
-analysis. It is primarily designed for [`PyFixest`](https://github.com/py-econometrics/pyfixest).
-
-> [!NOTE]
-> `formula` is in early development and its scope, syntax, API is subject to change. It is
-not ready for production use.
+analysis. Its design is inspired by [`PyFixest`](https://github.com/py-econometrics/pyfixest) but intended to be generic.
 
 ## Python API
 
@@ -83,26 +79,23 @@ new_data = polars.DataFrame(
 transformed = predictors.transform(new_data)
 ```
 
-### Insepecting metadata
+### Inspecting materialized data
 
-Data materialized by a formula expose metadata on their provenance.
+Materialized data expose metadata from their underlying formula. This makes it possible to inspect the semantics of a column and identify its provenance in the underlying formula:
 
 ```python
-interaction = fit.select_terms("log(x1):sqrt(x2)", role=formula.Role.Independent)
-for column in interaction.columns(role=formula.Role.Independent):
-    # What are the `Factor`s contributing to a column?
-    contributions = column.contributions
-    print(contributions)
+for term in interaction_terms.terms(role=formula.Role.Independent):
+    print("Factors:", term.factors)
+    print("Columns:", [column.data.name for column in term.columns])
 
-for column in categorical_terms.columns(role=formula.Role.Independent):
-    # What are the `Factor`s contributing to a column?
-    contributions = column.contributions
-    for contribution in column.contributions:
-        # Metadata on the contribution's factor
-        print(contribution.factor)
-        # The column's level encoded by C(category, reference='a')
-        print(contribution.key)
-
+for term in categorical_terms.terms(role=formula.Role.Independent):
+    # Inspect the factors constituting a term
+    for factor in term.factors:
+        print(factor)
+    # Inspect the columns a term produces
+    for column in term.columns:
+        for contribution in column.contributions:
+            print(contribution.key, column.data)
 ```
 
 ## Rust API

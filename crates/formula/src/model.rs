@@ -60,6 +60,14 @@ impl FittedFormula {
         Ok(expression.columns())
     }
 
+    pub fn terms(&self, role: Role) -> Result<&[FittedTerm], SelectionError> {
+        let expression = self
+            .expression(role)
+            .ok_or(SelectionError::MissingRole(role))?;
+
+        Ok(expression.terms())
+    }
+
     fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
         let expressions = self
             .expressions
@@ -494,10 +502,10 @@ mod tests {
             let predicted = model.transform(&input).unwrap();
 
             for model in [&model, &predicted] {
-                let columns = model
-                    .columns(Role::FixedEffect)
-                    .unwrap()
-                    .collect::<Vec<_>>();
+                let [term] = model.terms(Role::FixedEffect).unwrap() else {
+                    panic!("expected one grouped term");
+                };
+                let columns = term.columns().collect::<Vec<_>>();
                 assert_eq!(columns.len(), 3);
                 for (index, column) in columns.iter().enumerate() {
                     let contributions = column.contributions().collect::<Vec<_>>();
@@ -521,6 +529,7 @@ mod tests {
                             &DataType::Float64
                         }
                     );
+                    assert_eq!(term.factors().collect::<Vec<_>>(), vec![*factor]);
                     assert_eq!(column.term().factors().collect::<Vec<_>>(), vec![*factor]);
                     let call = factor.transform().unwrap();
                     assert_eq!(call.name(), "G");
@@ -757,10 +766,15 @@ mod tests {
             let predicted = selected.transform(&input).unwrap();
 
             for model in [&selected, &predicted] {
-                let columns = model
-                    .columns(Role::Independent)
-                    .unwrap()
-                    .collect::<Vec<_>>();
+                let terms = model.terms(Role::Independent).unwrap();
+                let [term] = terms else {
+                    panic!("expected one selected interaction term");
+                };
+                let factors = term.factors().collect::<Vec<_>>();
+                assert_eq!(factors.len(), 2);
+                assert_eq!(factors[0].transform().unwrap().name(), "C");
+                assert_eq!(factors[1].name(), Some("x"));
+                let columns = term.columns().collect::<Vec<_>>();
                 assert_eq!(columns.len(), 2);
                 for (column, level) in columns.iter().zip(["b", "c"]) {
                     let contributions = column.contributions().collect::<Vec<_>>();
@@ -860,6 +874,15 @@ mod tests {
         fn intercepts_and_zero_column_terms_preserve_their_semantics() {
             let training = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
             let fitted = fit("y ~ C(g, reference='a')", &training);
+            let terms = fitted.terms(Role::Independent).unwrap();
+            assert_eq!(terms.len(), 2);
+            assert_eq!(terms[0].factors().count(), 0);
+            assert_eq!(terms[0].columns().count(), 1);
+            assert_eq!(terms[1].columns().count(), 0);
+            let factors = terms[1].factors().collect::<Vec<_>>();
+            assert_eq!(factors.len(), 1);
+            assert_eq!(factors[0].transform().unwrap().name(), "C");
+
             let columns = fitted
                 .columns(Role::Independent)
                 .unwrap()
@@ -878,6 +901,10 @@ mod tests {
             let input = polars::df!("g" => ["a", "new", "a"]).unwrap();
             for data in [&input, &input.head(Some(0))] {
                 let predicted = selected.transform(data).unwrap();
+                let terms = predicted.terms(Role::Independent).unwrap();
+                assert_eq!(terms.len(), 1);
+                assert_eq!(terms[0].columns().count(), 0);
+                assert_eq!(terms[0].factors().collect::<Vec<_>>(), factors);
                 assert_eq!(predicted.columns(Role::Independent).unwrap().count(), 0);
                 assert_eq!(predicted.frame().unwrap().shape(), (data.height(), 0));
                 assert!(
@@ -889,9 +916,13 @@ mod tests {
         }
 
         #[test]
-        fn columns_report_missing_roles() {
+        fn columns_and_terms_report_missing_roles() {
             let data = polars::df!("y" => [1.0, 2.0], "x" => [1.0, 2.0]).unwrap();
             let fitted = fit("y ~ x", &data);
+            assert!(matches!(
+                fitted.terms(Role::FixedEffect),
+                Err(SelectionError::MissingRole(Role::FixedEffect)),
+            ));
             assert!(matches!(
                 fitted.columns(Role::FixedEffect),
                 Err(SelectionError::MissingRole(Role::FixedEffect)),
@@ -933,6 +964,17 @@ mod tests {
                     selected.frame().unwrap().equals_missing(&expected),
                     "{query}"
                 );
+                let terms = selected.terms(Role::Independent).unwrap();
+                assert_eq!(
+                    terms
+                        .iter()
+                        .map(|term| term
+                            .factors()
+                            .map(|factor| factor.name().unwrap())
+                            .collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                    vec![vec!["z"], vec!["z", "x"], vec!["x"]],
+                );
                 assert_eq!(selected.formula(), model.formula());
                 assert!(selected.expression(Role::Dependent).is_none());
             }
@@ -945,7 +987,7 @@ mod tests {
         }
 
         #[test]
-        fn multicolumn_selection_rebases_ranges_for_repeated_selection() {
+        fn multicolumn_selection_preserves_terms_for_repeated_selection() {
             let data = polars::df!(
                 "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
                 "g" => ["a", "b", "c"], "z" => [7.0, 8.0, 9.0],
