@@ -5,7 +5,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, IntegerEncodingDefinition, Transform, TransformError, validate_numeric_input,
+    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, Transform, TransformError,
+    validate_numeric_input,
 };
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
@@ -89,6 +90,32 @@ impl Definition<VariableState> for VariableDefinition {
 
     fn transform(&self, _state: &VariableState, input: &Column) -> Result<Column, TransformError> {
         Ok(input.clone())
+    }
+}
+
+struct FixedEffect<'a> {
+    group: &'a [Arc<Factor>],
+    loading: &'a Factor,
+}
+
+impl FixedEffect<'_> {
+    fn is_intercept(&self) -> bool {
+        self.loading.value() == Some(&Scalar::from(1_i64))
+    }
+
+    fn render(&self) -> String {
+        let group = self
+            .group
+            .iter()
+            .map(|factor| factor.render())
+            .collect::<Vec<_>>()
+            .join(":");
+
+        if self.is_intercept() {
+            group
+        } else {
+            format!("{group}[[{}]]", self.loading.render())
+        }
     }
 }
 
@@ -260,6 +287,48 @@ impl From<Factor> for Term {
 impl Term {
     const INTERCEPT_COLUMN_NAME: &'static str = "Intercept";
 
+    fn fixed_effect(group: Vec<Arc<Factor>>, loading: Arc<Factor>) -> Self {
+        let group = Arc::new(Factor {
+            kind: FactorKind::Call {
+                transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+                arguments: group,
+            },
+        });
+
+        Self::from(Factor {
+            kind: FactorKind::Call {
+                transform: Transform::G(GroupedTransform),
+                arguments: vec![group, loading],
+            },
+        })
+    }
+
+    fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
+        let FactorKind::Call {
+            transform: Transform::G(_),
+            arguments,
+        } = &self.as_factor()?.kind
+        else {
+            return None;
+        };
+
+        let [group, loading] = arguments.as_slice() else {
+            return None;
+        };
+
+        let FactorKind::Call {
+            transform: Transform::F(_),
+            arguments,
+        } = &group.kind
+        else {
+            return None;
+        };
+
+        Some(FixedEffect {
+            group: arguments,
+            loading,
+        })
+    }
     pub fn factors(&self) -> impl Iterator<Item = &Factor> {
         self.factors.iter().map(Arc::as_ref)
     }
@@ -443,6 +512,13 @@ impl Expression {
 
     fn has_intercept(&self) -> bool {
         self.terms.iter().any(Term::is_intercept)
+    }
+
+    pub(crate) fn has_fixed_effect_intercept(&self) -> bool {
+        self.terms.iter().any(|term| {
+            term.as_fixed_effect()
+                .is_some_and(|effect| effect.is_intercept())
+        })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1088,12 +1164,11 @@ pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
             .into_iter()
             .filter(|term| !term.is_intercept())
             .map(|term| {
-                Term::from(Factor {
-                    kind: FactorKind::Call {
-                        transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
-                        arguments: term.factors,
-                    },
-                })
+                let loading = Arc::new(Factor {
+                    kind: FactorKind::Literal(Scalar::from(1_i64)),
+                });
+
+                Term::fixed_effect(term.factors, loading)
             }),
         expression.children,
     )
@@ -1104,22 +1179,9 @@ fn render_fixed_effects(expression: &Expression) -> String {
         .terms
         .iter()
         .map(|term| {
-            let [factor] = term.factors.as_slice() else {
-                unreachable!("fixed-effect terms contain one encoded factor");
-            };
-            let FactorKind::Call {
-                transform: Transform::F(_),
-                arguments,
-            } = &factor.kind
-            else {
-                unreachable!("fixed-effect terms use F encoding");
-            };
-
-            arguments
-                .iter()
-                .map(|argument| argument.render())
-                .collect::<Vec<_>>()
-                .join(":")
+            term.as_fixed_effect()
+                .expect("fixed-effect terms use G(F(...), loading)")
+                .render()
         })
         .collect::<Vec<_>>()
         .join(" + ")
@@ -3267,12 +3329,19 @@ mod tests {
         let transformed = model.transform(&input).unwrap();
         let output = transformed.expression(Role::FixedEffect).unwrap().frame();
 
-        assert_eq!(output.width(), 1);
-        assert_eq!(output[0].name().as_str(), "f1:f2");
+        assert_eq!(output.shape(), (4, 2));
+        assert_eq!(
+            output.get_column_names(),
+            ["G(f1:f2, 1)[group]", "G(f1:f2, 1)[loading]"],
+        );
         assert_eq!(output[0].dtype(), &DataType::UInt32);
         assert_eq!(
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),
             vec![Some(2), Some(1), Some(0), None]
+        );
+        assert_eq!(
+            output[1].f64().unwrap().iter().collect::<Vec<_>>(),
+            [Some(1.0); 4],
         );
         assert_eq!(
             transformed.expression(Role::Dependent).unwrap().frame()[0].len(),

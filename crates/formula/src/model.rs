@@ -705,11 +705,19 @@ mod tests {
             assert!(selected.expression(Role::Independent).is_none());
             let input = polars::df!("f" => ["b", "a", "new"], "h" => ["u", "u", "u"]).unwrap();
             let frame = selected.transform(&input).unwrap().frame().unwrap();
-            assert_eq!(frame.shape(), (3, 1));
+            assert_eq!(frame.shape(), (3, 2));
+            assert_eq!(
+                frame.get_column_names(),
+                ["G(f:h, 1)[group]", "G(f:h, 1)[loading]"],
+            );
             assert_eq!(frame[0].dtype(), &DataType::UInt32);
             assert_eq!(
                 frame[0].u32().unwrap().iter().collect::<Vec<_>>(),
                 [Some(2), Some(0), None]
+            );
+            assert_eq!(
+                frame[1].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(1.0); 3],
             );
         }
 
@@ -982,9 +990,17 @@ mod tests {
             ["x"]
         );
         let fixed_effects = model.expression(Role::FixedEffect).unwrap().frame();
-        assert_eq!(fixed_effects.shape(), (4, 1));
-        assert_eq!(fixed_effects.get_column_names(), ["f1:f2"]);
+        assert_eq!(fixed_effects.shape(), (4, 2));
+        assert_eq!(
+            fixed_effects.get_column_names(),
+            ["G(f1:f2, 1)[group]", "G(f1:f2, 1)[loading]"],
+        );
+        assert_eq!(fixed_effects[0].dtype(), &polars::prelude::DataType::UInt32);
         assert_eq!(fixed_effects[0].n_unique().unwrap(), 3);
+        assert_eq!(
+            fixed_effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
+            [Some(1.0); 4],
+        );
     }
 
     #[test]
@@ -1005,10 +1021,15 @@ mod tests {
         let applied = models.transform(&input).unwrap();
 
         for models in [&models, &applied] {
-            for (model, expected) in models
-                .iter()
-                .zip([vec!["firm name", "firm name:f2"], vec!["f2:firm name"]])
-            {
+            for (model, expected) in models.iter().zip([
+                vec![
+                    "G(firm name, 1)[group]",
+                    "G(firm name, 1)[loading]",
+                    "G(firm name:f2, 1)[group]",
+                    "G(firm name:f2, 1)[loading]",
+                ],
+                vec!["G(f2:firm name, 1)[group]", "G(f2:firm name, 1)[loading]"],
+            ]) {
                 assert_eq!(
                     model
                         .expression(Role::FixedEffect)

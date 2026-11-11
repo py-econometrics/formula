@@ -358,10 +358,10 @@ impl Formula {
         let sides = super::combine_alternatives(&left, &right, |left, right| (left, right));
         super::combine_alternatives(&sides, &fixed_effects, |(left, right), fixed_effects| {
             let fixed_effects = formula::encode_fixed_effects(fixed_effects);
-            let right = if fixed_effects.is_empty() {
-                right
-            } else {
+            let right = if fixed_effects.has_fixed_effect_intercept() {
                 right.without_intercept()
+            } else {
+                right
             };
 
             formula::Formula {
