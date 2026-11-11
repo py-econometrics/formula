@@ -95,12 +95,13 @@ impl Definition<VariableState> for VariableDefinition {
 
 struct FixedEffect<'a> {
     group: &'a [Arc<Factor>],
-    loading: &'a Factor,
+    loadings: &'a [Arc<Factor>],
+    intercept: bool,
 }
 
 impl FixedEffect<'_> {
     fn is_intercept(&self) -> bool {
-        self.loading.value() == Some(&Scalar::from(1_i64))
+        self.intercept
     }
 
     fn render(&self) -> String {
@@ -111,10 +112,21 @@ impl FixedEffect<'_> {
             .collect::<Vec<_>>()
             .join(":");
 
-        if self.is_intercept() {
-            group
+        if self.loadings.is_empty() {
+            return group;
+        }
+
+        let loadings = self
+            .loadings
+            .iter()
+            .map(|factor| factor.render())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if self.intercept {
+            format!("{group}[{loadings}]")
         } else {
-            format!("{group}[[{}]]", self.loading.render())
+            format!("{group}[[{loadings}]]")
         }
     }
 }
@@ -287,7 +299,7 @@ impl From<Factor> for Term {
 impl Term {
     const INTERCEPT_COLUMN_NAME: &'static str = "Intercept";
 
-    fn fixed_effect(group: Vec<Arc<Factor>>, loading: Arc<Factor>) -> Self {
+    fn fixed_effect(group: Vec<Arc<Factor>>, loadings: Vec<Arc<Factor>>, intercept: bool) -> Self {
         let group = Arc::new(Factor {
             kind: FactorKind::Call {
                 transform: Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
@@ -297,24 +309,22 @@ impl Term {
 
         Self::from(Factor {
             kind: FactorKind::Call {
-                transform: Transform::G(GroupedTransform),
-                arguments: vec![group, loading],
+                transform: Transform::G(GroupedTransform::new(intercept)),
+                arguments: std::iter::once(group).chain(loadings).collect(),
             },
         })
     }
 
     fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
         let FactorKind::Call {
-            transform: Transform::G(_),
+            transform: Transform::G(grouped),
             arguments,
         } = &self.as_factor()?.kind
         else {
             return None;
         };
 
-        let [group, loading] = arguments.as_slice() else {
-            return None;
-        };
+        let (group, loadings) = arguments.as_slice().split_first()?;
 
         let FactorKind::Call {
             transform: Transform::F(_),
@@ -326,7 +336,8 @@ impl Term {
 
         Some(FixedEffect {
             group: arguments,
-            loading,
+            loadings,
+            intercept: grouped.intercept(),
         })
     }
     pub fn factors(&self) -> impl Iterator<Item = &Factor> {
@@ -1162,27 +1173,14 @@ pub(crate) fn encode_fixed_effects(
     intercept: bool,
     loadings: impl IntoIterator<Item = Arc<Factor>>,
 ) -> Expression {
-    let intercept_loading = intercept.then(|| {
-        Arc::new(Factor {
-            kind: FactorKind::Literal(Scalar::from(1_i64)),
-        })
-    });
-
-    let loadings = intercept_loading
-        .into_iter()
-        .chain(loadings)
-        .collect::<Vec<_>>();
+    let loadings = collect_unique(loadings);
 
     Expression::new(
         expression
             .terms
             .into_iter()
             .filter(|term| !term.is_intercept())
-            .flat_map(|term| {
-                loadings.iter().map(move |loading| {
-                    Term::fixed_effect(term.factors.clone(), Arc::clone(loading))
-                })
-            }),
+            .map(|term| Term::fixed_effect(term.factors, loadings.clone(), intercept)),
         expression.children,
     )
 }
@@ -1193,7 +1191,7 @@ fn render_fixed_effects(expression: &Expression) -> String {
         .iter()
         .map(|term| {
             term.as_fixed_effect()
-                .expect("fixed-effect terms use G(F(...), loading)")
+                .expect("fixed-effect terms use G with an encoded group and optional loadings")
                 .render()
         })
         .collect::<Vec<_>>()
@@ -1234,12 +1232,13 @@ mod tests {
     use winnow::Parser;
 
     #[test]
-    fn grouped_output_keys_identify_group_and_loading() -> Result<(), TransformError> {
+    fn grouped_output_keys_identify_group_and_loading_positions() -> Result<(), TransformError> {
         let inputs = [
             Column::new("firm".into(), [0_u32, 1]),
             Column::new("time".into(), [1.0, 2.0]),
+            Column::new("exposure".into(), [0.5, 1.0]),
         ];
-        let output = crate::transform::GroupedTransform.transform(&inputs)?;
+        let output = crate::transform::GroupedTransform::new(false).transform(&inputs)?;
 
         assert_eq!(
             output.metadata,
@@ -1247,9 +1246,18 @@ mod tests {
                 ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
                     "group",
                 ))),
-                ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
-                    "loading",
-                ))),
+                ComponentKey::Tuple(vec![
+                    ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                        "loading"
+                    ))),
+                    ComponentKey::Scalar(Scalar::from(1_u64)),
+                ]),
+                ComponentKey::Tuple(vec![
+                    ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
+                        "loading"
+                    ))),
+                    ComponentKey::Scalar(Scalar::from(2_u64)),
+                ]),
             ],
         );
         Ok(())
@@ -3342,19 +3350,15 @@ mod tests {
         let transformed = model.transform(&input).unwrap();
         let output = transformed.expression(Role::FixedEffect).unwrap().frame();
 
-        assert_eq!(output.shape(), (4, 2));
+        assert_eq!(output.shape(), (4, 1));
         assert_eq!(
             output.get_column_names(),
-            ["G(f1:f2, 1)[group]", "G(f1:f2, 1)[loading]"],
+            ["G(f1:f2, intercept=true)[group]"]
         );
         assert_eq!(output[0].dtype(), &DataType::UInt32);
         assert_eq!(
             output[0].u32().unwrap().iter().collect::<Vec<_>>(),
             vec![Some(2), Some(1), Some(0), None]
-        );
-        assert_eq!(
-            output[1].f64().unwrap().iter().collect::<Vec<_>>(),
-            [Some(1.0); 4],
         );
         assert_eq!(
             transformed.expression(Role::Dependent).unwrap().frame()[0].len(),

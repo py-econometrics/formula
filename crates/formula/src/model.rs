@@ -316,13 +316,11 @@ mod tests {
             .unwrap();
             let model = fit("y ~ x | firm[time]", &training);
             let fitted = model.expression(Role::FixedEffect).unwrap().frame();
-            assert_eq!(fitted.shape(), (3, 4));
-            for index in [0, 2] {
-                assert_eq!(
-                    fitted[index].u32().unwrap().iter().collect::<Vec<_>>(),
-                    [Some(0), Some(1), Some(0)],
-                );
-            }
+            assert_eq!(fitted.shape(), (3, 2));
+            assert_eq!(
+                fitted[0].u32().unwrap().iter().collect::<Vec<_>>(),
+                [Some(0), Some(1), Some(0)],
+            );
             assert_eq!(
                 model
                     .expression(Role::Independent)
@@ -339,20 +337,14 @@ mod tests {
             .unwrap();
             let predicted = model.transform(&input).unwrap();
             let effects = predicted.expression(Role::FixedEffect).unwrap().frame();
-            assert_eq!(effects.shape(), (3, 4));
+            assert_eq!(effects.shape(), (3, 2));
             assert_eq!(effects.get_column_names(), fitted.get_column_names());
-            for index in [0, 2] {
-                assert_eq!(
-                    effects[index].u32().unwrap().iter().collect::<Vec<_>>(),
-                    [Some(1), Some(0), None],
-                );
-            }
             assert_eq!(
-                effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
-                [Some(1.0); 3],
+                effects[0].u32().unwrap().iter().collect::<Vec<_>>(),
+                [Some(1), Some(0), None],
             );
             assert_eq!(
-                effects[3].f64().unwrap().iter().collect::<Vec<_>>(),
+                effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
                 [Some(40.0), Some(50.0), Some(60.0)],
             );
         }
@@ -376,61 +368,72 @@ mod tests {
                 ["Intercept", "x"],
             );
             let effects = model.expression(Role::FixedEffect).unwrap().frame();
-            assert_eq!(effects.shape(), (3, 4));
-            for index in [0, 2] {
-                assert_eq!(
-                    effects[index].u32().unwrap().iter().collect::<Vec<_>>(),
-                    [Some(0), Some(1), Some(2)],
-                );
-            }
+            assert_eq!(effects.shape(), (3, 3));
+            assert_eq!(
+                effects[0].u32().unwrap().iter().collect::<Vec<_>>(),
+                [Some(0), Some(1), Some(2)],
+            );
             assert_eq!(
                 effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
                 [Some(2.0), None, Some(4.0)],
             );
             assert_eq!(
-                effects[3].f64().unwrap().iter().collect::<Vec<_>>(),
+                effects[2].f64().unwrap().iter().collect::<Vec<_>>(),
                 [Some(0.5), Some(1.0), None],
             );
 
             let predicted = model.transform(&data.head(Some(0))).unwrap();
             let empty = predicted.expression(Role::FixedEffect).unwrap().frame();
-            assert_eq!(empty.shape(), (0, 4));
+            assert_eq!(empty.shape(), (0, 3));
             assert_eq!(empty.schema(), effects.schema());
         }
 
         #[test]
-        fn term_selection_preserves_fitted_order_and_prediction_dependencies() {
+        fn term_selection_preserves_complete_terms_and_prediction_dependencies() {
             let data = polars::df!(
                 "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
                 "firm" => ["a", "b", "a"], "year" => [2020_i32, 2021, 2020],
                 "time" => [10_i32, 20, 30], "exposure" => [0.5, 1.0, 1.5],
             )
             .unwrap();
-            let model = fit("y ~ x | firm[time, exposure] + year", &data);
+            let model = fit("y ~ x | firm[[time, exposure]] + year", &data);
             let selected = model
-                .select_terms("firm[[exposure, time, exposure]]", Role::FixedEffect)
+                .select_terms("firm[[time, exposure, time]]", Role::FixedEffect)
                 .unwrap();
             assert_eq!(
                 selected.frame().unwrap().get_column_names(),
                 [
-                    "G(firm, time)[group]",
-                    "G(firm, time)[loading]",
-                    "G(firm, exposure)[group]",
-                    "G(firm, exposure)[loading]",
+                    "G(firm, time, exposure)[group]",
+                    "G(firm, time, exposure)[loading:1]",
+                    "G(firm, time, exposure)[loading:2]",
                 ],
             );
             let repeated = selected
-                .select_terms("firm[[exposure]]", Role::FixedEffect)
+                .select_terms("firm[[time, exposure]]", Role::FixedEffect)
                 .unwrap();
-            assert_eq!(repeated.frame().unwrap().shape(), (3, 2));
+            assert_eq!(repeated.frame().unwrap().shape(), (3, 3));
             assert_eq!(
-                repeated.frame().unwrap()[1]
+                repeated.frame().unwrap()[2]
                     .f64()
                     .unwrap()
                     .iter()
                     .collect::<Vec<_>>(),
                 [Some(0.5), Some(1.0), Some(1.5)],
             );
+            for query in [
+                "firm[[time]]",
+                "firm[[exposure]]",
+                "firm[[exposure, time]]",
+                "firm[time, exposure]",
+            ] {
+                assert!(
+                    matches!(
+                        selected.select_terms(query, Role::FixedEffect),
+                        Err(SelectionError::MissingTerm(_)),
+                    ),
+                    "{query}"
+                );
+            }
             drop(model);
 
             let input = polars::df!(
@@ -440,19 +443,17 @@ mod tests {
             .unwrap();
             let predicted = selected.transform(&input).unwrap();
             let frame = predicted.frame().unwrap();
-            assert_eq!(frame.shape(), (2, 4));
-            for index in [0, 2] {
-                assert_eq!(
-                    frame[index].u32().unwrap().iter().collect::<Vec<_>>(),
-                    [Some(1), None],
-                );
-            }
+            assert_eq!(frame.shape(), (2, 3));
+            assert_eq!(
+                frame[0].u32().unwrap().iter().collect::<Vec<_>>(),
+                [Some(1), None],
+            );
             assert_eq!(
                 frame[1].f64().unwrap().iter().collect::<Vec<_>>(),
                 [Some(40.0), Some(50.0)],
             );
             assert_eq!(
-                frame[3].f64().unwrap().iter().collect::<Vec<_>>(),
+                frame[2].f64().unwrap().iter().collect::<Vec<_>>(),
                 [Some(2.0), Some(2.5)],
             );
         }
@@ -497,60 +498,60 @@ mod tests {
                     .columns(Role::FixedEffect)
                     .unwrap()
                     .collect::<Vec<_>>();
-                assert_eq!(columns.len(), 6);
-                let (terms, _) = columns.as_chunks::<2>();
-                for (term_index, pair) in terms.iter().enumerate() {
-                    for (column, role, dtype) in [
-                        (&pair[0], "group", DataType::UInt32),
-                        (&pair[1], "loading", DataType::Float64),
-                    ] {
-                        let contributions = column.contributions().collect::<Vec<_>>();
-                        let [(factor, key)] = contributions.as_slice() else {
-                            panic!("expected one grouped-factor contribution");
-                        };
-                        assert_eq!(
-                            *key,
-                            &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(role))),
-                        );
-                        assert_eq!(column.data().dtype(), &dtype);
-                        assert_eq!(column.term().factors().collect::<Vec<_>>(), vec![*factor]);
-                        let call = factor.transform().unwrap();
-                        assert_eq!(call.name(), "G");
-                        assert!(call.parameters().is_empty());
-                        let inputs = call.inputs().collect::<Vec<_>>();
-                        let [group, loading] = inputs.as_slice() else {
-                            panic!("expected a group and a loading");
-                        };
-                        let encoding = group.transform().unwrap();
-                        assert_eq!(encoding.name(), "F");
-                        assert_eq!(
-                            encoding
-                                .inputs()
-                                .map(|factor| factor.name())
-                                .collect::<Vec<_>>(),
-                            [Some("firm"), Some("year")],
-                        );
-                        match term_index {
-                            0 => assert_eq!(loading.value(), Some(&Scalar::from(1_i64))),
-                            1 => {
-                                let transform = loading.transform().unwrap();
-                                assert_eq!(transform.name(), "log");
-                                assert_eq!(
-                                    transform
-                                        .inputs()
-                                        .map(|factor| factor.name())
-                                        .collect::<Vec<_>>(),
-                                    [Some("time")],
-                                );
-                            }
-                            2 => assert_eq!(loading.name(), Some("exposure")),
-                            _ => unreachable!(),
+                assert_eq!(columns.len(), 3);
+                for (index, column) in columns.iter().enumerate() {
+                    let contributions = column.contributions().collect::<Vec<_>>();
+                    let [(factor, key)] = contributions.as_slice() else {
+                        panic!("expected one grouped-factor contribution");
+                    };
+                    let expected_key = if index == 0 {
+                        ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static("group")))
+                    } else {
+                        ComponentKey::Tuple(vec![
+                            ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static("loading"))),
+                            ComponentKey::Scalar(Scalar::from(index as u64)),
+                        ])
+                    };
+                    assert_eq!(**key, expected_key);
+                    assert_eq!(
+                        column.data().dtype(),
+                        if index == 0 {
+                            &DataType::UInt32
+                        } else {
+                            &DataType::Float64
                         }
-                    }
+                    );
+                    assert_eq!(column.term().factors().collect::<Vec<_>>(), vec![*factor]);
+                    let call = factor.transform().unwrap();
+                    assert_eq!(call.name(), "G");
+                    assert_eq!(call.parameters()["intercept"], Scalar::from(true));
+                    let inputs = call.inputs().collect::<Vec<_>>();
+                    let [group, time, exposure] = inputs.as_slice() else {
+                        panic!("expected a group and two loadings");
+                    };
+                    let encoding = group.transform().unwrap();
+                    assert_eq!(encoding.name(), "F");
+                    assert_eq!(
+                        encoding
+                            .inputs()
+                            .map(|factor| factor.name())
+                            .collect::<Vec<_>>(),
+                        [Some("firm"), Some("year")]
+                    );
+                    let transform = time.transform().unwrap();
+                    assert_eq!(transform.name(), "log");
+                    assert_eq!(
+                        transform
+                            .inputs()
+                            .map(|factor| factor.name())
+                            .collect::<Vec<_>>(),
+                        [Some("time")]
+                    );
+                    assert_eq!(exposure.name(), Some("exposure"));
                 }
             }
             assert_eq!(
-                predicted.expression(Role::FixedEffect).unwrap().frame()[3]
+                predicted.expression(Role::FixedEffect).unwrap().frame()[1]
                     .f64()
                     .unwrap()
                     .iter()
@@ -1047,19 +1048,12 @@ mod tests {
             assert!(selected.expression(Role::Independent).is_none());
             let input = polars::df!("f" => ["b", "a", "new"], "h" => ["u", "u", "u"]).unwrap();
             let frame = selected.transform(&input).unwrap().frame().unwrap();
-            assert_eq!(frame.shape(), (3, 2));
-            assert_eq!(
-                frame.get_column_names(),
-                ["G(f:h, 1)[group]", "G(f:h, 1)[loading]"],
-            );
+            assert_eq!(frame.shape(), (3, 1));
+            assert_eq!(frame.get_column_names(), ["G(f:h, intercept=true)[group]"]);
             assert_eq!(frame[0].dtype(), &DataType::UInt32);
             assert_eq!(
                 frame[0].u32().unwrap().iter().collect::<Vec<_>>(),
                 [Some(2), Some(0), None]
-            );
-            assert_eq!(
-                frame[1].f64().unwrap().iter().collect::<Vec<_>>(),
-                [Some(1.0); 3],
             );
         }
 
@@ -1332,17 +1326,13 @@ mod tests {
             ["x"]
         );
         let fixed_effects = model.expression(Role::FixedEffect).unwrap().frame();
-        assert_eq!(fixed_effects.shape(), (4, 2));
+        assert_eq!(fixed_effects.shape(), (4, 1));
         assert_eq!(
             fixed_effects.get_column_names(),
-            ["G(f1:f2, 1)[group]", "G(f1:f2, 1)[loading]"],
+            ["G(f1:f2, intercept=true)[group]"]
         );
         assert_eq!(fixed_effects[0].dtype(), &polars::prelude::DataType::UInt32);
         assert_eq!(fixed_effects[0].n_unique().unwrap(), 3);
-        assert_eq!(
-            fixed_effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
-            [Some(1.0); 4],
-        );
     }
 
     #[test]
@@ -1365,12 +1355,10 @@ mod tests {
         for models in [&models, &applied] {
             for (model, expected) in models.iter().zip([
                 vec![
-                    "G(firm name, 1)[group]",
-                    "G(firm name, 1)[loading]",
-                    "G(firm name:f2, 1)[group]",
-                    "G(firm name:f2, 1)[loading]",
+                    "G(firm name, intercept=true)[group]",
+                    "G(firm name:f2, intercept=true)[group]",
                 ],
-                vec!["G(f2:firm name, 1)[group]", "G(f2:firm name, 1)[loading]"],
+                vec!["G(f2:firm name, intercept=true)[group]"],
             ]) {
                 assert_eq!(
                     model

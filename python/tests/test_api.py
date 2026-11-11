@@ -92,10 +92,9 @@ def test_role_frames_preserve_rows_and_nulls(data):
     assert_frame_equal(dependent, data.select("y"))
     assert_frame_equal(independent, data.select("x"))
     fixed_effects = model.select(formula.Role.FixedEffect).frame()
-    assert fixed_effects.shape == (data.height, 2)
+    assert fixed_effects.shape == (data.height, 1)
     assert fixed_effects.schema == {
-        "G(firm, 1)[group]": polars.UInt32,
-        "G(firm, 1)[loading]": polars.Float64,
+        "G(firm, intercept=true)[group]": polars.UInt32,
     }
 
     frame = model.frame()
@@ -380,7 +379,7 @@ def test_varying_slope_selection_exports_typed_prediction_columns(data):
         polars.Series("time", [1, 2, 3], dtype=polars.Int32),
         polars.Series("exposure", [0.5, 1.0, 1.5]),
     )
-    model = formula.parse("y ~ x | firm[time, exposure]").fit(training)[0]
+    model = formula.parse("y ~ x | firm[[time, exposure]]").fit(training)[0]
     selected = model.select_terms(
         "firm[[time, exposure]]", role=formula.Role.FixedEffect
     )
@@ -397,14 +396,13 @@ def test_varying_slope_selection_exports_typed_prediction_columns(data):
     ).frame()
     expected = polars.DataFrame(
         {
-            "G(firm, time)[group]": polars.Series([1, 0, None], dtype=polars.UInt32),
-            "G(firm, time)[loading]": polars.Series(
-                [4.0, 5.0, None], dtype=polars.Float64
-            ),
-            "G(firm, exposure)[group]": polars.Series(
+            "G(firm, time, exposure)[group]": polars.Series(
                 [1, 0, None], dtype=polars.UInt32
             ),
-            "G(firm, exposure)[loading]": polars.Series(
+            "G(firm, time, exposure)[loading:1]": polars.Series(
+                [4.0, 5.0, None], dtype=polars.Float64
+            ),
+            "G(firm, time, exposure)[loading:2]": polars.Series(
                 [2.0, 2.5, 3.0], dtype=polars.Float64
             ),
         }

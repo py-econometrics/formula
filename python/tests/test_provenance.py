@@ -233,12 +233,16 @@ def test_varying_slope_provenance_survives_owner_deletion():
     columns = predicted.columns(role=formula.Role.FixedEffect)
     del model, selected, predicted
 
-    assert len(columns) == 6
+    assert len(columns) == 3
     for index, column in enumerate(columns):
         (contribution,) = column.contributions
-        role = "group" if index % 2 == 0 else "loading"
-        assert contribution.key == role
-        assert type(contribution.key) is str
+        role = "group" if index == 0 else "loading"
+        assert contribution.key == ("group" if index == 0 else ("loading", index))
+        if index == 0:
+            assert type(contribution.key) is str
+        else:
+            assert type(contribution.key) is tuple
+            assert type(contribution.key[1]) is int
         assert column.data.dtype == (
             polars.UInt32 if role == "group" else polars.Float64
         )
@@ -250,20 +254,17 @@ def test_varying_slope_provenance_survives_owner_deletion():
         call = contribution.factor.transform
         assert call is not None
         assert call.name == "G"
-        assert call.parameters == {}
-        group, loading = call.inputs
+        assert call.parameters == {"intercept": True}
+        assert type(call.parameters["intercept"]) is bool
+        assert term_call.parameters == call.parameters
+        group, time, exposure = call.inputs
         encoding = group.transform
         assert encoding is not None
         assert encoding.name == "F"
         assert [factor.name for factor in encoding.inputs] == ["firm", "year"]
 
-        if index < 2:
-            assert type(loading.value) is int
-            assert loading.value == 1
-        elif index < 4:
-            transform = loading.transform
-            assert transform is not None
-            assert transform.name == "log"
-            assert [factor.name for factor in transform.inputs] == ["time"]
-        else:
-            assert loading.name == "exposure"
+        transform = time.transform
+        assert transform is not None
+        assert transform.name == "log"
+        assert [factor.name for factor in transform.inputs] == ["time"]
+        assert exposure.name == "exposure"

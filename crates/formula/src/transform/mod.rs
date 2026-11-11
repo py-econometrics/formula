@@ -92,7 +92,7 @@ impl Transform {
             Self::C(categorical) => Ok(Self::C(categorical.fit(inputs)?)),
             Self::Poly(polynomial) => Ok(Self::Poly(polynomial.fit(inputs)?)),
             Self::F(integer) => Ok(Self::F(integer.fit(inputs)?)),
-            Self::G(_) => Ok(Self::G(GroupedTransform)),
+            Self::G(grouped) => Ok(Self::G(*grouped)),
         }
     }
 

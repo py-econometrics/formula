@@ -680,29 +680,19 @@ mod tests {
         #[test]
         fn normalization_preserves_grouping_and_deduplicates_terms() {
             for (source, expected) in [
-                ("firm[time]", "firm + firm[[time]]"),
                 ("firm[time, time]", "firm[time]"),
                 ("firm[time] + firm[time]", "firm[time]"),
-                ("firm[[time, exposure]]", "firm[[time]] + firm[[exposure]]"),
+                ("firm[[time, exposure, time]]", "firm[[time, exposure]]"),
+                ("firm[time, exposure, time]", "firm[time, exposure]"),
+                ("firm:year[time] + sector", "(firm:year)[time] + sector"),
+                ("(firm + year)[time]", "firm[time] + year[time]"),
                 (
-                    "firm[time, exposure]",
-                    "firm + firm[[time]] + firm[[exposure]]",
-                ),
-                (
-                    "firm:year[time] + sector",
-                    "firm:year + (firm:year)[[time]] + sector",
-                ),
-                (
-                    "(firm + year)[time]",
-                    "firm + firm[[time]] + year + year[[time]]",
-                ),
-                (
+                    "firm[[log(time), add(time, 2), log(time)]]",
                     "firm[[log(time), add(time, 2)]]",
-                    "firm[[log(time)]] + firm[[add(time, 2)]]",
                 ),
                 (
                     " `firm name` : year [[ time , exposure ]] ",
-                    "(`firm name`:year)[[time]] + (`firm name`:year)[[exposure]]",
+                    "(`firm name`:year)[[time, exposure]]",
                 ),
             ] {
                 assert_eq!(
@@ -721,7 +711,7 @@ mod tests {
             let rendered = formula.to_string();
             assert_eq!(
                 rendered,
-                "y ~ x - 1 | firm[[exposure]] + firm[[time]] + firm",
+                "y ~ x - 1 | firm[[exposure, time]] + firm + firm[time]",
             );
             assert_eq!(parse(&rendered).unwrap(), specification);
         }
