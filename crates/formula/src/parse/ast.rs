@@ -5,8 +5,8 @@ pub(super) enum Forbidden {}
 
 pub(super) enum Simple {}
 pub(super) enum Multistage {}
+pub(super) enum TermQuery {}
 pub(super) enum VaryingSlope {}
-
 pub(super) enum FixedEffect {}
 
 pub(super) struct Formula {
@@ -112,6 +112,18 @@ impl Kind for Multistage {
     type Nesting = Binary<Expression<Simple>>;
     type Grouped = Forbidden;
     type Stepwise = StepwiseCall<Expression<Self>>;
+}
+
+impl Kind for TermQuery {
+    type Operand = formula::Term;
+    type Addition = Binary<Expression<Self>>;
+    type Subtraction = Binary<Expression<Self>>;
+    type Negation = Box<Expression<Self>>;
+    type Interaction = Binary<Expression<Self>>;
+    type FullInteraction = Binary<Expression<Self>>;
+    type Nesting = Binary<Expression<Self>>;
+    type Grouped = Forbidden;
+    type Stepwise = Forbidden;
 }
 
 impl Kind for VaryingSlope {
@@ -626,6 +638,61 @@ impl Construct for Multistage {
     }
 }
 
+impl Construct for TermQuery {
+    fn term(term: formula::Term) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Operand(term))
+    }
+
+    fn add(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Add(Binary::new(left, right)))
+    }
+
+    fn subtract(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Subtract(Binary::new(left, right)))
+    }
+
+    fn interact(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Interact(Binary::new(left, right)))
+    }
+
+    fn interact_fully(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::InteractFully(Binary::new(left, right)))
+    }
+
+    fn nest(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Nesting(Binary::new(left, right)))
+    }
+
+    fn negate(value: Expression<Self>) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Negate(Box::new(value)))
+    }
+
+    fn multistage(_: Formula) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::MultistageNotAllowed)
+    }
+
+    fn stepwise(
+        _call: StepwiseCall<Expression<Self>>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::StepwiseNotAllowed)
+    }
+}
+
 impl Construct for VaryingSlope {
     fn term(term: formula::Term) -> Result<Expression<Self>, ConstructionError> {
         Expression::<FixedEffect>::term(term).map(Expression::Operand)
@@ -811,6 +878,7 @@ pub(super) enum ConstructionError {
     },
     ExpectedFixedEffectGroup,
     GroupedNotAllowed,
+    StepwiseNotAllowed,
 }
 
 impl std::fmt::Display for ConstructionError {
@@ -828,6 +896,7 @@ impl std::fmt::Display for ConstructionError {
                 f.write_str("expected a grouping expression without loadings")
             }
             Self::GroupedNotAllowed => f.write_str("grouped loadings are not allowed here"),
+            Self::StepwiseNotAllowed => f.write_str("stepwise calls are not allowed here"),
         }
     }
 }
@@ -838,6 +907,124 @@ impl std::error::Error for ConstructionError {}
 mod tests {
     use super::*;
     use crate::formula::Term;
+
+    mod term_query {
+        use super::*;
+        use crate::formula::Factor;
+        use winnow::error::ErrMode;
+
+        type Expr = Expression<TermQuery>;
+
+        fn term() -> Expr {
+            Expr::term(Term::from(Factor::from("x"))).unwrap()
+        }
+
+        #[test]
+        fn constructors_preserve_arithmetic_nodes() {
+            assert!(matches!(term(), Expr::Operand(_)));
+            assert!(matches!(Expr::add(term(), term()), Ok(Expr::Add(_))));
+            assert!(matches!(
+                Expr::subtract(term(), term()),
+                Ok(Expr::Subtract(_))
+            ));
+            assert!(matches!(Expr::negate(term()), Ok(Expr::Negate(_))));
+            assert!(matches!(
+                Expr::interact(term(), term()),
+                Ok(Expr::Interact(_))
+            ));
+            assert!(matches!(
+                Expr::interact_fully(term(), term()),
+                Ok(Expr::InteractFully(_))
+            ));
+            assert!(matches!(Expr::nest(term(), term()), Ok(Expr::Nesting(_))));
+        }
+
+        #[test]
+        fn constructors_reject_child_formulas_and_all_stepwise_operators() {
+            let formula = Formula {
+                left: Expression::Operand(MultistageOperand::Term(Term::intercept())),
+                right: Expression::Operand(MultistageOperand::Term(Term::intercept())),
+                fixed_effects: None,
+            };
+            assert!(matches!(
+                Expr::multistage(formula),
+                Err(ConstructionError::MultistageNotAllowed)
+            ));
+
+            for operator in [Stepwise::Sw, Stepwise::Sw0, Stepwise::Csw, Stepwise::Csw0] {
+                assert!(matches!(
+                    Expr::stepwise(StepwiseCall {
+                        operator,
+                        first: Box::new(term()),
+                        rest: vec![],
+                    }),
+                    Err(ConstructionError::StepwiseNotAllowed)
+                ));
+            }
+            assert_eq!(
+                ConstructionError::StepwiseNotAllowed.to_string(),
+                "stepwise calls are not allowed here"
+            );
+        }
+
+        #[test]
+        fn parser_accepts_supported_expressions() {
+            for source in [
+                "x", "log(x)", "x + z", "x - z", "-x", "x:z", "x*z", "x/z", "(x + z)",
+            ] {
+                let mut cursor = source;
+                assert!(
+                    crate::parse::parse_node::<TermQuery>(&mut cursor).is_ok(),
+                    "{source}"
+                );
+                assert!(cursor.is_empty(), "{source}");
+            }
+        }
+
+        #[test]
+        fn parser_commits_to_rejecting_nested_stepwise_calls() {
+            for operator in ["sw", "sw0", "csw", "csw0"] {
+                for source in [
+                    format!("{operator}(x)"),
+                    format!("{operator}(x, z)"),
+                    format!("({operator}(x))"),
+                    format!("x + {operator}(z)"),
+                    format!("x - {operator}(z)"),
+                    format!("-{operator}(x)"),
+                    format!("x:{operator}(z)"),
+                    format!("x*{operator}(z)"),
+                    format!("x/{operator}(z)"),
+                ] {
+                    let mut cursor = source.as_str();
+                    match crate::parse::parse_node::<TermQuery>(&mut cursor) {
+                        Err(ErrMode::Cut(error)) => assert!(
+                            error
+                                .to_string()
+                                .contains("stepwise calls are not allowed here"),
+                            "{source}: {error}"
+                        ),
+                        _ => panic!("expected committed stepwise construction error for {source}"),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn parser_rejects_nested_child_formulas() {
+            for source in ["[x ~ z]", "([x ~ z])", "x + [z ~ w]", "x:[z ~ w]"] {
+                let mut cursor = source;
+                match crate::parse::parse_node::<TermQuery>(&mut cursor) {
+                    Err(ErrMode::Cut(error)) => assert!(
+                        error
+                            .to_string()
+                            .contains("multistage formulas are not allowed here"),
+                        "{source}: {error}"
+                    ),
+                    _ => panic!("expected committed child-formula construction error for {source}"),
+                }
+            }
+        }
+    }
 
     mod conversion {
         use super::*;
