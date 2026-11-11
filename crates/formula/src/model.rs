@@ -3,7 +3,7 @@ use crate::fit::FitError;
 use crate::formula::{
     Expression, FittedExpression, FittedTerm, Role, ValidationError, parse_one, transform_terms,
 };
-use crate::parse::ParseResult;
+use crate::parse::{ParseResult, parse_term};
 use crate::transform::TransformError;
 use polars::error::PolarsResult;
 use polars::prelude::DataFrame;
@@ -93,6 +93,23 @@ impl FittedFormula {
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
         Ok(Self::new(self.formula.clone(), expressions, self.height))
+    }
+
+    pub fn select_terms(&self, source: &str, role: Role) -> Result<Self, SelectionError> {
+        let expression = self
+            .expression(role)
+            .ok_or(SelectionError::MissingRole(role))?;
+
+        let query = parse_term(source, role)
+            .map_err(|error| SelectionError::InvalidQuery(error.to_string()))?;
+
+        let selected = expression.select_terms(&query)?;
+
+        Ok(Self::new(
+            self.formula.clone(),
+            BTreeMap::from([(role, selected)]),
+            self.height,
+        ))
     }
 
     pub fn children(&self, role: Role) -> Result<&[Self], SelectionError> {
@@ -236,6 +253,9 @@ impl std::error::Error for ModelError {}
 pub enum SelectionError {
     EmptySelection,
     MissingRole(Role),
+    InvalidQuery(String),
+    MissingTerm(String),
+    Frame(polars::error::PolarsError),
 }
 
 impl std::fmt::Display for SelectionError {
@@ -245,6 +265,11 @@ impl std::fmt::Display for SelectionError {
             Self::MissingRole(role) => {
                 write!(f, "model does not contain role {role:?}")
             }
+            Self::InvalidQuery(message) => f.write_str(message),
+            Self::MissingTerm(term) => {
+                write!(f, "model does not contain term {term}")
+            }
+            Self::Frame(error) => error.fmt(f),
         }
     }
 }
@@ -254,6 +279,252 @@ impl std::error::Error for SelectionError {}
 #[cfg(test)]
 mod tests {
     use super::{Role, SelectionError};
+
+    mod term_selection {
+        use super::*;
+        use crate::FittedFormula;
+        use polars::prelude::{DataFrame, DataType};
+
+        fn fit(source: &str, data: &DataFrame) -> FittedFormula {
+            crate::parse(source)
+                .unwrap()
+                .fit(data)
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .clone()
+        }
+
+        #[test]
+        fn expansion_preserves_fitted_order_and_deduplicates_outputs() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0], "x" => [3.0, 4.0],
+                "z" => [5.0, 6.0], "w" => [7.0, 8.0],
+            )
+            .unwrap();
+            let model = fit("y ~ w + z + z:x + x", &data);
+            let expected = polars::df!(
+                "z" => [5.0, 6.0], "z:x" => [15.0, 24.0], "x" => [3.0, 4.0],
+            )
+            .unwrap();
+            for query in ["x*z", "x + x:z + z + z:x", "(x*z + w) - w"] {
+                let selected = model.select_terms(query, Role::Independent).unwrap();
+                assert!(
+                    selected.frame().unwrap().equals_missing(&expected),
+                    "{query}"
+                );
+                assert_eq!(selected.formula(), model.formula());
+                assert!(selected.expression(Role::Dependent).is_none());
+            }
+            let intercept = model.select_terms("1", Role::Independent).unwrap();
+            assert_eq!(intercept.frame().unwrap().shape(), (2, 1));
+            assert_eq!(
+                intercept.frame().unwrap()[0].f64().unwrap().get(0),
+                Some(1.0)
+            );
+        }
+
+        #[test]
+        fn multicolumn_selection_rebases_ranges_for_repeated_selection() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+                "g" => ["a", "b", "c"], "z" => [7.0, 8.0, 9.0],
+            )
+            .unwrap();
+            let model = fit("y ~ x + C(g, reference='a') + z", &data);
+            let original = model.select(&[Role::Independent]).unwrap().frame().unwrap();
+            let selected = model
+                .select_terms("z + C(g, reference='a')", Role::Independent)
+                .unwrap();
+            assert!(
+                selected
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&original.select(&original.get_column_names()[2..]).unwrap())
+            );
+            let categorical = selected
+                .select_terms("C(g, reference='a')", Role::Independent)
+                .unwrap();
+            let frame = categorical.frame().unwrap();
+            assert_eq!(frame.width(), 2);
+            assert_eq!(
+                frame[0].bool().unwrap().iter().collect::<Vec<_>>(),
+                [Some(false), Some(true), Some(false)]
+            );
+            assert_eq!(
+                frame[1].bool().unwrap().iter().collect::<Vec<_>>(),
+                [Some(false), Some(false), Some(true)]
+            );
+            assert!(
+                selected
+                    .select_terms("z", Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&data.select(["z"]).unwrap())
+            );
+        }
+
+        #[test]
+        fn selection_retains_fitted_categories_and_only_selected_dependencies() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0], "g" => ["a", "b", "c"],
+            )
+            .unwrap();
+            let model = fit("y ~ x + C(g, reference='a')", &data);
+            let selected = model
+                .select_terms("C(g, reference='a')", Role::Independent)
+                .unwrap();
+            let input = polars::df!("g" => ["c", "b", "unseen"]).unwrap();
+            let applied = selected.transform(&input).unwrap();
+            let frame = applied.frame().unwrap();
+            assert_eq!(
+                frame.get_column_names(),
+                selected.frame().unwrap().get_column_names()
+            );
+            assert_eq!(
+                frame[0].bool().unwrap().iter().collect::<Vec<_>>(),
+                [Some(false), Some(true), None]
+            );
+            assert_eq!(
+                frame[1].bool().unwrap().iter().collect::<Vec<_>>(),
+                [Some(true), Some(false), None]
+            );
+            assert!(
+                applied
+                    .select_terms("C(g, reference='a')", Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&frame)
+            );
+            assert_eq!(
+                selected.frame().unwrap()[1].bool().unwrap().get(0),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn selection_uses_role_specific_grammar_and_fitted_group_encoding() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+                "f" => ["a", "a", "b"], "h" => ["u", "v", "u"],
+            )
+            .unwrap();
+            let model = fit("y ~ x | f + f:h", &data);
+            assert!(
+                model
+                    .select_terms("y", Role::Dependent)
+                    .unwrap()
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&data.select(["y"]).unwrap())
+            );
+            let selected = model
+                .select(&[Role::FixedEffect])
+                .unwrap()
+                .select_terms("f:h", Role::FixedEffect)
+                .unwrap();
+            assert!(selected.expression(Role::Independent).is_none());
+            let input = polars::df!("f" => ["b", "a", "new"], "h" => ["u", "u", "u"]).unwrap();
+            let frame = selected.transform(&input).unwrap().frame().unwrap();
+            assert_eq!(frame.shape(), (3, 1));
+            assert_eq!(frame[0].dtype(), &DataType::UInt32);
+            assert_eq!(
+                frame[0].u32().unwrap().iter().collect::<Vec<_>>(),
+                [Some(2), Some(0), None]
+            );
+        }
+
+        #[test]
+        fn empty_selections_and_zero_column_terms_preserve_rows() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "a"],
+            )
+            .unwrap();
+            let model = fit("y ~ x + C(g, reference='a')", &data);
+            for query in ["x - x", "C(g, reference='a')"] {
+                let selected = model.select_terms(query, Role::Independent).unwrap();
+                assert_eq!(selected.frame().unwrap().shape(), (2, 0));
+                for input in [&data, &data.head(Some(0))] {
+                    assert_eq!(
+                        selected.transform(input).unwrap().frame().unwrap().shape(),
+                        (input.height(), 0)
+                    );
+                }
+            }
+            // A zero-width term remains present and selectable.
+            let selected = model
+                .select_terms("C(g, reference='a')", Role::Independent)
+                .unwrap();
+            assert!(
+                selected
+                    .select_terms("C(g, reference='a')", Role::Independent)
+                    .is_ok()
+            );
+        }
+
+        #[test]
+        fn selection_errors_distinguish_absent_roles_and_terms() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"],
+            )
+            .unwrap();
+            let model = fit("y ~ x + C(g, reference='a') - 1", &data);
+            assert!(matches!(
+                model.select_terms("g", Role::FixedEffect),
+                Err(SelectionError::MissingRole(Role::FixedEffect))
+            ));
+            for query in ["missing", "x + missing", "C(g, reference='b')", "1"] {
+                assert!(
+                    matches!(
+                        model.select_terms(query, Role::Independent),
+                        Err(SelectionError::MissingTerm(_))
+                    ),
+                    "{query}"
+                );
+            }
+            let with_fe = fit("y ~ x | g", &data);
+            assert!(matches!(
+                with_fe.select_terms("1", Role::Independent),
+                Err(SelectionError::MissingTerm(_))
+            ));
+        }
+
+        #[test]
+        fn queries_reject_unsupported_shapes_and_multiple_alternatives() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"],
+            )
+            .unwrap();
+            let model = fit("y ~ x | g", &data);
+            for (query, role) in [
+                ("x +", Role::Independent),
+                ("[y ~ x]", Role::Independent),
+                ("sw(x, x)", Role::Independent),
+                ("x + (sw0(x))", Role::Independent),
+                ("g*g", Role::FixedEffect),
+                ("sw(g, g)", Role::FixedEffect),
+            ] {
+                assert!(
+                    matches!(
+                        model.select_terms(query, role),
+                        Err(SelectionError::InvalidQuery(_))
+                    ),
+                    "{query}"
+                );
+            }
+            // Until #92, single-alternative stepwise calls are accepted.
+            let selected = model.select_terms("sw(x)", Role::Independent).unwrap();
+            assert!(
+                selected
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&data.select(["x"]).unwrap())
+            );
+        }
+    }
 
     #[test]
     fn model_frame_combines_roles_and_preserves_prediction_values() {

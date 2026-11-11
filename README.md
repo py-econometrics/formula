@@ -16,46 +16,64 @@ import formula
 
 data = polars.DataFrame(
     {
-        "y": [1.0, 2.0, 3.0],
-        "x": [4.0, 5.0, 6.0],
-        "z": [7.0, 8.0, 9.0],
-        "firm": ["a", "b", "a"],
+        "y": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "x1": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        "x2": [3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        "category": ["a", "b", "a", "b", "a", "b"],
+        "firm": ["firm_a", "firm_b", "firm_c", "firm_a", "firm_b", "firm_c"],
+        "year": [2020, 2021, 2022, 2020, 2021, 2022],
     }
 )
 
-formulas = formula.parse("y ~ sw(x, z) | firm")  # Parse and expand formulas
-assert len(formulas) == 2
-first_formula = formulas[0]  # Negative indices and formula-string lookup also work
-expanded_sources = [str(entry) for entry in formulas]
-fits = formulas.fit(data)  # Compute columns and learn transformation state
+# Parsing formula strings returns a collection of `Formula` objects
+source = "y ~ sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year"
+formulas = formula.parse(source)  # Parse and expand formulas
+first_formula = formulas[0]  # Parsed formulas are an indexable collection
+same_formula = formulas[str(first_formula)]  # Look-up by formula-string also work
+```
+
+A `Formula` object can "materialize" data according to the instructions of a formula string. This retains state for future materializations, for example categorical encoding.
+
+```python
+fits = formulas.fit(data)  # Construct columns and learn transformation state
 fit = fits[0]  # Integer indexing follows expansion order
 same_fit = fits[fit.formula]  # Look up a fitted formula by its formula string
+```
 
-# Access the complete frame or select specific roles
-frame = fit.frame()
+A `FittedFormula` exposes its data as a `DataFrame` that can be queried for specific `Role`s, for example dependent or independent variables. It is also possible to query specific formula terms using `FittedFormula.select_terms`.
+
+```python
+frame = fit.frame()  # Get the materialized data as a single frame
+
+# Select specific `Role`s, e.g., dependent variables, independent variables, and fixed effects
 dependent = fit.select(formula.Role.Dependent).frame()
 independent = fit.select(formula.Role.Independent).frame()
 fixed_effects = fit.select(formula.Role.FixedEffect).frame()
 
-# Select roles before transforming data that has no dependent column.
-predictors = fits.select([formula.Role.Independent, formula.Role.FixedEffect])
-new_data = polars.DataFrame({"x": [8.0], "z": [9.0], "firm": ["a"]})
-transformed = predictors.transform(new_data)
+# Select terms by their formula strings
+interaction_terms = fit.select_terms("log(x1)*sqrt(x2)", role=formula.Role.Independent)
+# Select the categorical term in the second formula
+categorical_fit = fits["y ~ C(category, reference='a') | firm + year"]
+categorical_terms = categorical_fit.select_terms(
+    "C(category, reference='a')", role=formula.Role.Independent
+)
 ```
 
-`parse` accepts one formula string or a sequence of strings and returns a
-`Formulas` collection. Its `fit` method returns `FittedFormulas`, containing one
-`FittedFormula` per expanded formula, with the computed columns and learned
-transformation state. `transform` computes columns
-for new data using that learned state. Fitting does not estimate regression coefficients.
-`frame()` returns a Polars `DataFrame` containing all selected roles. `select` and
-`transform` return new fitted formulas and retain fitted transform state. Selecting an absent
-role raises `KeyError`.
+It is possible to retain only part of a `FittedFormula` to apply it to new data. This is useful for prediction:
 
-`Formulas` supports length, iteration, and indexing by integer or formula string,
-like `FittedFormulas`. Its entries are unfitted `Formula` objects;
-`str(entry)` returns the canonical formula string. An entry remains usable after
-its collection is dropped.
+```python
+predictors = fits.select(roles=[formula.Role.Independent, formula.Role.FixedEffect])
+new_data = polars.DataFrame(
+    {
+        "x1": [8.0],
+        "x2": [9.0],
+        "category": ["b"],
+        "firm": ["firm_a"],
+        "year": [2020],
+    }
+)
+transformed = predictors.transform(new_data)
+```
 
 ## Rust API
 

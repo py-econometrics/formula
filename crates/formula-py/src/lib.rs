@@ -128,6 +128,11 @@ impl FittedFormulas {
             .map_err(|error| match &error {
                 formula::SelectionError::EmptySelection => PyValueError::new_err(error.to_string()),
                 formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::InvalidQuery(_) => {
+                    PySyntaxError::new_err(error.to_string())
+                }
+                formula::SelectionError::MissingTerm(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
             })
     }
 }
@@ -166,6 +171,26 @@ impl FittedFormula {
             .map_err(|error| match &error {
                 formula::SelectionError::EmptySelection => PyValueError::new_err(error.to_string()),
                 formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::InvalidQuery(_) => {
+                    PySyntaxError::new_err(error.to_string())
+                }
+                formula::SelectionError::MissingTerm(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
+            })
+    }
+
+    fn select_terms(&self, source: &str, role: Role) -> PyResult<Self> {
+        self.inner
+            .select_terms(source, role.into())
+            .map(|inner| Self { inner })
+            .map_err(|error| match &error {
+                formula::SelectionError::EmptySelection => PyValueError::new_err(error.to_string()),
+                formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::InvalidQuery(_) => {
+                    PySyntaxError::new_err(error.to_string())
+                }
+                formula::SelectionError::MissingTerm(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
             })
     }
 

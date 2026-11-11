@@ -1,7 +1,7 @@
 mod ast;
 
+use crate::Role;
 use crate::fit::Fit;
-#[cfg(test)]
 use crate::formula::Expression;
 use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::Stepwise;
@@ -490,6 +490,38 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
     }
 
     Ok(Formulas::new(formulas))
+}
+
+pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression> {
+    let parser = |cursor: &mut &str| -> ModalResult<Expression> {
+        let mut alternatives = match role {
+            Role::Dependent | Role::Independent => {
+                let node = parse_node::<ast::Multistage>(cursor)?;
+                let node = construction_result(cursor, node.into_simple())?;
+                node.expand()
+            }
+            Role::FixedEffect => {
+                let node = parse_node::<ast::FixedEffect>(cursor)?;
+                node.expand()
+                    .into_iter()
+                    .map(crate::formula::encode_fixed_effects)
+                    .collect()
+            }
+        };
+
+        if alternatives.len() != 1 {
+            return cut_err(
+                fail.context(StrContext::Expected(StrContextValue::Description(
+                    "a term query that expands to exactly one expression",
+                ))),
+            )
+            .parse_next(cursor);
+        }
+
+        Ok(alternatives.remove(0))
+    };
+
+    delimited(multispace0, parser, (multispace0, eof)).parse(source)
 }
 
 impl TryFrom<TransformCall> for Factor {
