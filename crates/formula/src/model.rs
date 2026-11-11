@@ -60,6 +60,14 @@ impl FittedFormula {
         Ok(expression.columns())
     }
 
+    pub fn terms(&self, role: Role) -> Result<&[FittedTerm], SelectionError> {
+        let expression = self
+            .expression(role)
+            .ok_or(SelectionError::MissingRole(role))?;
+
+        Ok(expression.terms())
+    }
+
     fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
         let expressions = self
             .expressions

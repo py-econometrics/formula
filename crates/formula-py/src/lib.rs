@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 mod _formula {
     #[pymodule_export]
     use super::{
-        Factor, FactorContribution, FittedFormula, FittedFormulas, Formula, FormulaColumn,
-        Formulas, Role, TransformCall, parse, parse_many,
+        Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, Formula,
+        FormulaColumn, Formulas, Role, TransformCall, parse, parse_many,
     };
 }
 
@@ -223,6 +223,21 @@ impl FittedFormula {
                 formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
             })
     }
+
+    fn terms(&self, role: Role) -> PyResult<Vec<FittedTerm>> {
+        self.inner
+            .terms(role.into())
+            .map(|terms| terms.iter().map(FittedTerm::from).collect())
+            .map_err(|error| match &error {
+                formula::SelectionError::EmptySelection => PyValueError::new_err(error.to_string()),
+                formula::SelectionError::MissingRole(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::InvalidQuery(_) => {
+                    PySyntaxError::new_err(error.to_string())
+                }
+                formula::SelectionError::MissingTerm(_) => PyKeyError::new_err(error.to_string()),
+                formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
+            })
+    }
 }
 
 #[pyclass(frozen, eq, from_py_object, module = "formula")]
@@ -354,6 +369,46 @@ impl Factor {
     #[getter]
     fn transform(&self) -> Option<TransformCall> {
         self.transform.clone()
+    }
+}
+
+#[pyclass(frozen, module = "formula")]
+struct FittedTerm {
+    inner: formula::FittedTerm,
+}
+
+impl From<&formula::FittedTerm> for FittedTerm {
+    fn from(term: &formula::FittedTerm) -> Self {
+        Self {
+            inner: term.clone(),
+        }
+    }
+}
+
+#[pymethods]
+impl FittedTerm {
+    #[getter]
+    fn factors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let factors = self
+            .inner
+            .factors()
+            .map(Factor::from)
+            .map(|factor| Py::new(py, factor))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        PyTuple::new(py, factors)
+    }
+
+    #[getter]
+    fn columns<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let columns = self
+            .inner
+            .columns()
+            .map(FormulaColumn::from)
+            .map(|column| Py::new(py, column))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        PyTuple::new(py, columns)
     }
 }
 

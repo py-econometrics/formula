@@ -10,7 +10,6 @@ use crate::transform::{
 };
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
-use std::ops::Range;
 use std::sync::Arc;
 use winnow::Parser;
 use winnow::combinator::fail;
@@ -557,37 +556,30 @@ impl Expression {
         height: usize,
         transformed: &[FittedTerm],
     ) -> Result<FittedExpression, ModelError> {
-        let mut terms = Vec::with_capacity(self.terms.len());
-        let mut columns = Vec::new();
-        let mut metadata = Vec::new();
-        let mut column_ranges = Vec::with_capacity(self.terms.len());
-        for term in &self.terms {
-            let entry = lookup_term(transformed, term);
-            terms.push(entry.term.clone());
+        let terms = self
+            .terms
+            .iter()
+            .map(|term| lookup_term(transformed, term).clone())
+            .collect::<Vec<_>>();
 
-            let start = columns.len();
-            for (column, column_metadata) in entry.columns.iter() {
-                columns.push(column.clone());
-                metadata.push(column_metadata.clone());
-            }
-            column_ranges.push(start..columns.len());
-        }
+        let expression = Self::new(
+            terms.iter().map(|term| term.term.clone()),
+            self.children.clone(),
+        );
 
-        let expression = Self::new(terms, self.children.clone());
+        let columns = terms
+            .iter()
+            .flat_map(|term| term.columns.frame().columns().iter().cloned())
+            .collect();
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
-        let columns = MaterializedColumns::new(frame, metadata);
+
         let children = self
             .children
             .iter()
             .map(|child| child.assemble(height, transformed))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
-        Ok(FittedExpression::new(
-            expression,
-            columns,
-            column_ranges,
-            children,
-        ))
+        Ok(FittedExpression::new(expression, terms, frame, children))
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -861,46 +853,57 @@ struct FittedFactor {
     columns: MaterializedColumns<ComponentKey>,
 }
 
-pub(crate) struct FittedTerm {
+#[derive(Clone, Debug)]
+pub struct FittedTerm {
     term: Term,
     columns: MaterializedColumns<ColumnMetadata>,
+}
+
+impl FittedTerm {
+    pub fn factors(&self) -> impl Iterator<Item = &Factor> {
+        self.term.factors()
+    }
+
+    pub fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
+        self.columns
+            .iter()
+            .map(move |(data, metadata)| FormulaColumn {
+                data,
+                term: &self.term,
+                metadata,
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FittedExpression {
     expression: Expression,
-    columns: MaterializedColumns<ColumnMetadata>,
-    column_ranges: Vec<Range<usize>>,
+    terms: Vec<FittedTerm>,
+    frame: DataFrame,
     children: Vec<FittedFormula>,
 }
 
 impl FittedExpression {
     fn new(
         expression: Expression,
-        columns: MaterializedColumns<ColumnMetadata>,
-        column_ranges: Vec<Range<usize>>,
+        terms: Vec<FittedTerm>,
+        frame: DataFrame,
         children: Vec<FittedFormula>,
     ) -> Self {
         Self {
             expression,
-            columns,
-            column_ranges,
+            terms,
+            frame,
             children,
         }
     }
 
     pub(crate) fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
-        self.expression
-            .terms
-            .iter()
-            .zip(&self.column_ranges)
-            .flat_map(move |(term, range)| {
-                range.clone().map(move |index| FormulaColumn {
-                    data: &self.columns.frame.columns()[index],
-                    term,
-                    metadata: &self.columns.metadata[index],
-                })
-            })
+        self.terms.iter().flat_map(FittedTerm::columns)
+    }
+
+    pub(crate) fn terms(&self) -> &[FittedTerm] {
+        &self.terms
     }
 
     pub(crate) fn expression(&self) -> &Expression {
@@ -908,7 +911,7 @@ impl FittedExpression {
     }
 
     pub(crate) fn frame(&self) -> &DataFrame {
-        self.columns.frame()
+        &self.frame
     }
 
     pub(crate) fn children(&self) -> &[FittedFormula] {
@@ -922,32 +925,22 @@ impl FittedExpression {
             }
         }
 
-        let mut terms = Vec::new();
-        let mut columns = Vec::new();
-        let mut metadata = Vec::new();
-        let mut column_ranges = Vec::new();
-        for (term, range) in self.expression.terms.iter().zip(&self.column_ranges) {
-            if !query.terms.contains(term) {
-                continue;
-            }
-            terms.push(term.clone());
+        let terms = self
+            .terms
+            .iter()
+            .filter(|term| query.terms.contains(&term.term))
+            .cloned()
+            .collect::<Vec<_>>();
 
-            let start = columns.len();
-            columns.extend(self.columns.frame.columns()[range.clone()].iter().cloned());
-            metadata.extend(self.columns.metadata[range.clone()].iter().cloned());
-            column_ranges.push(start..columns.len());
-        }
+        let expression = Expression::new(terms.iter().map(|term| term.term.clone()), Vec::new());
 
-        let expression = Expression::new(terms, Vec::new());
-        let frame =
-            DataFrame::new(self.frame().height(), columns).map_err(SelectionError::Frame)?;
+        let columns = terms
+            .iter()
+            .flat_map(|term| term.columns.frame().columns().iter().cloned())
+            .collect();
+        let frame = DataFrame::new(self.frame.height(), columns).map_err(SelectionError::Frame)?;
 
-        Ok(Self::new(
-            expression,
-            MaterializedColumns::new(frame, metadata),
-            column_ranges,
-            Vec::new(),
-        ))
+        Ok(Self::new(expression, terms, frame, Vec::new()))
     }
 }
 
