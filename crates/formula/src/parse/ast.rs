@@ -87,6 +87,7 @@ pub(super) trait Kind: Sized {
     type FullInteraction;
     type Nesting;
     type Grouped;
+    type Stepwise;
 }
 
 impl Kind for Simple {
@@ -98,6 +99,7 @@ impl Kind for Simple {
     type FullInteraction = Binary<Expression<Self>>;
     type Nesting = Binary<Expression<Self>>;
     type Grouped = Forbidden;
+    type Stepwise = StepwiseCall<Expression<Self>>;
 }
 
 impl Kind for Multistage {
@@ -109,6 +111,7 @@ impl Kind for Multistage {
     type FullInteraction = Binary<Expression<Simple>>;
     type Nesting = Binary<Expression<Simple>>;
     type Grouped = Forbidden;
+    type Stepwise = StepwiseCall<Expression<Self>>;
 }
 
 impl Kind for VaryingSlope {
@@ -120,6 +123,7 @@ impl Kind for VaryingSlope {
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
     type Grouped = Grouped<Expression<FixedEffect>>;
+    type Stepwise = StepwiseCall<Expression<Self>>;
 }
 
 impl Kind for FixedEffect {
@@ -131,6 +135,7 @@ impl Kind for FixedEffect {
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
     type Grouped = Forbidden;
+    type Stepwise = StepwiseCall<Expression<Self>>;
 }
 
 pub(super) enum Expression<K: Kind> {
@@ -143,7 +148,7 @@ pub(super) enum Expression<K: Kind> {
     InteractFully(K::FullInteraction),
     Nesting(K::Nesting),
     Parenthesized(Box<Self>),
-    Stepwise(StepwiseCall<Self>),
+    Stepwise(K::Stepwise),
     Grouped(K::Grouped),
 }
 
@@ -187,6 +192,10 @@ impl<K: Construct> Expression<K> {
         rest: Vec<Arc<formula::Factor>>,
     ) -> Result<Self, ConstructionError> {
         K::grouped(self, intercept, first, rest)
+    }
+
+    pub(super) fn stepwise(call: StepwiseCall<Self>) -> Result<Self, ConstructionError> {
+        K::stepwise(call)
     }
 }
 
@@ -392,6 +401,7 @@ where
             FullInteraction = Binary<Expression<Simple>>,
             Nesting = Binary<Expression<Simple>>,
             Grouped = Forbidden,
+            Stepwise = StepwiseCall<Expression<K>>,
         >,
 {
     match expression {
@@ -441,6 +451,7 @@ where
             FullInteraction = Binary<Expression<Simple>>,
             Nesting = Binary<Expression<Simple>>,
             Grouped = Forbidden,
+            Stepwise = StepwiseCall<Expression<K>>,
         >,
 {
     match expression {
@@ -540,6 +551,10 @@ pub(super) trait Construct: Kind {
     ) -> Result<Expression<Self>, ConstructionError> {
         Err(ConstructionError::GroupedNotAllowed)
     }
+
+    fn stepwise(
+        call: StepwiseCall<Expression<Self>>,
+    ) -> Result<Expression<Self>, ConstructionError>;
 }
 
 impl Construct for Multistage {
@@ -602,6 +617,12 @@ impl Construct for Multistage {
             left.into_simple()?,
             right.into_simple()?,
         )))
+    }
+
+    fn stepwise(
+        call: StepwiseCall<Expression<Self>>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Stepwise(call))
     }
 }
 
@@ -684,6 +705,12 @@ impl Construct for VaryingSlope {
             rest,
         }))
     }
+
+    fn stepwise(
+        call: StepwiseCall<Expression<Self>>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Stepwise(call))
+    }
 }
 
 impl Construct for FixedEffect {
@@ -750,6 +777,12 @@ impl Construct for FixedEffect {
             operator: "/",
             context: "fixed-effect expressions",
         })
+    }
+
+    fn stepwise(
+        call: StepwiseCall<Expression<Self>>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Stepwise(call))
     }
 }
 

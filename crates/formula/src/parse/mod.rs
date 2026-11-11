@@ -418,11 +418,14 @@ fn parse_stepwise<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expr
 
     let (first, rest) = cut_err(parse_stepwise_arguments::<K>).parse_next(cursor)?;
 
-    Ok(ast::Expression::Stepwise(ast::StepwiseCall {
-        operator,
-        first: Box::new(first),
-        rest,
-    }))
+    construction_result(
+        cursor,
+        ast::Expression::<K>::stepwise(ast::StepwiseCall {
+            operator,
+            first: Box::new(first),
+            rest,
+        }),
+    )
 }
 
 fn parse_node_parenthesized<K: ast::Construct>(
