@@ -90,6 +90,26 @@ pub(super) trait Kind: Sized {
     type Stepwise;
 }
 
+/// Describes the expressions supported by arithmetic expansion.
+pub(super) trait Arithmetic:
+    Kind<
+        Addition = Binary<Expression<Self>>,
+        Subtraction = Binary<Expression<Self>, Expression<Self::Other>>,
+        Negation = Box<Expression<Self::Other>>,
+        Interaction = Binary<Expression<Self::Other>>,
+        FullInteraction = Binary<Expression<Self::Other>>,
+        Nesting = Binary<Expression<Self::Other>>,
+        Grouped = Forbidden,
+    >
+{
+    /// Kind used for the other arithmetic operand.
+    type Other: Arithmetic;
+
+    fn expand_operand(operand: &Self::Operand) -> Vec<formula::Expression>;
+
+    fn expand_stepwise(call: &Self::Stepwise) -> Vec<formula::Expression>;
+}
+
 impl Kind for Simple {
     type Operand = crate::formula::Term;
     type Addition = Binary<Expression<Self>>;
@@ -211,17 +231,64 @@ impl<K: Construct> Expression<K> {
     }
 }
 
-impl Expression<Simple> {
+impl Arithmetic for Simple {
+    type Other = Self;
+
     fn expand_operand(term: &formula::Term) -> Vec<formula::Expression> {
         vec![formula::Expression::from(term.clone())]
     }
 
+    fn expand_stepwise(call: &StepwiseCall<Expression<Self>>) -> Vec<formula::Expression> {
+        call.operator.expand(
+            std::iter::once(call.first.as_ref())
+                .chain(call.rest.iter())
+                .map(Expression::<Self>::expand),
+        )
+    }
+}
+
+impl Arithmetic for Multistage {
+    type Other = Simple;
+
+    fn expand_operand(operand: &MultistageOperand) -> Vec<formula::Expression> {
+        match operand {
+            MultistageOperand::Term(term) => vec![formula::Expression::from(term.clone())],
+            MultistageOperand::Formula(child) => child
+                .expand()
+                .into_iter()
+                .map(|child| formula::Expression::new([], vec![child]))
+                .collect(),
+        }
+    }
+
+    fn expand_stepwise(call: &StepwiseCall<Expression<Self>>) -> Vec<formula::Expression> {
+        call.operator.expand(
+            std::iter::once(call.first.as_ref())
+                .chain(call.rest.iter())
+                .map(Expression::<Self>::expand),
+        )
+    }
+}
+
+impl Arithmetic for TermQuery {
+    type Other = Self;
+
+    fn expand_operand(term: &formula::Term) -> Vec<formula::Expression> {
+        vec![formula::Expression::from(term.clone())]
+    }
+
+    fn expand_stepwise(call: &Forbidden) -> Vec<formula::Expression> {
+        match *call {}
+    }
+}
+
+impl<K: Arithmetic> Expression<K> {
     pub(super) fn expand(&self) -> Vec<formula::Expression> {
-        expand_arithmetic(self, Self::expand_operand)
+        expand_arithmetic(self)
     }
 
     pub(super) fn apply_to(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        apply_arithmetic(self, accumulated, Self::expand_operand)
+        apply_arithmetic(self, accumulated)
     }
 
     fn subtract_from(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
@@ -237,25 +304,6 @@ impl Expression<Simple> {
 }
 
 impl Expression<Multistage> {
-    fn expand_operand(operand: &MultistageOperand) -> Vec<formula::Expression> {
-        match operand {
-            MultistageOperand::Term(term) => vec![formula::Expression::from(term.clone())],
-            MultistageOperand::Formula(child) => child
-                .expand()
-                .into_iter()
-                .map(|child| formula::Expression::new([], vec![child]))
-                .collect(),
-        }
-    }
-
-    pub(super) fn expand(&self) -> Vec<formula::Expression> {
-        expand_arithmetic(self, Self::expand_operand)
-    }
-
-    pub(super) fn apply_to(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        apply_arithmetic(self, accumulated, Self::expand_operand)
-    }
-
     pub(super) fn into_simple(self) -> Result<Expression<Simple>, ConstructionError> {
         Ok(match self {
             Self::Empty => Expression::Empty,
@@ -400,30 +448,16 @@ impl Expression<FixedEffect> {
     }
 }
 
-fn expand_arithmetic<K>(
-    expression: &Expression<K>,
-    expand_operand: fn(&K::Operand) -> Vec<formula::Expression>,
-) -> Vec<formula::Expression>
+fn expand_arithmetic<K>(expression: &Expression<K>) -> Vec<formula::Expression>
 where
-    K: Kind<
-            Addition = Binary<Expression<K>>,
-            Subtraction = Binary<Expression<K>, Expression<Simple>>,
-            Negation = Box<Expression<Simple>>,
-            Interaction = Binary<Expression<Simple>>,
-            FullInteraction = Binary<Expression<Simple>>,
-            Nesting = Binary<Expression<Simple>>,
-            Grouped = Forbidden,
-            Stepwise = StepwiseCall<Expression<K>>,
-        >,
+    K: Arithmetic,
 {
     match expression {
         Expression::Empty => vec![formula::Expression::from_iter([])],
-        Expression::Operand(operand) => expand_operand(operand),
-        Expression::Add(_) | Expression::Subtract(_) | Expression::Negate(_) => apply_arithmetic(
-            expression,
-            formula::Expression::from_iter([]),
-            expand_operand,
-        ),
+        Expression::Operand(operand) => K::expand_operand(operand),
+        Expression::Add(_) | Expression::Subtract(_) | Expression::Negate(_) => {
+            apply_arithmetic(expression, formula::Expression::from_iter([]))
+        }
         Expression::Interact(node) => {
             super::combine_alternatives(&node.left.expand(), &node.right.expand(), |left, right| {
                 left.interact(&right)
@@ -439,12 +473,8 @@ where
                 left.nest(right)
             })
         }
-        Expression::Parenthesized(value) => expand_arithmetic(value, expand_operand),
-        Expression::Stepwise(call) => call.operator.expand(
-            std::iter::once(call.first.as_ref())
-                .chain(call.rest.iter())
-                .map(|argument| expand_arithmetic(argument, expand_operand)),
-        ),
+        Expression::Parenthesized(value) => expand_arithmetic(value),
+        Expression::Stepwise(call) => K::expand_stepwise(call),
         Expression::Grouped(impossible) => match *impossible {},
     }
 }
@@ -452,31 +482,21 @@ where
 fn apply_arithmetic<K>(
     expression: &Expression<K>,
     accumulated: formula::Expression,
-    expand_operand: fn(&K::Operand) -> Vec<formula::Expression>,
 ) -> Vec<formula::Expression>
 where
-    K: Kind<
-            Addition = Binary<Expression<K>>,
-            Subtraction = Binary<Expression<K>, Expression<Simple>>,
-            Negation = Box<Expression<Simple>>,
-            Interaction = Binary<Expression<Simple>>,
-            FullInteraction = Binary<Expression<Simple>>,
-            Nesting = Binary<Expression<Simple>>,
-            Grouped = Forbidden,
-            Stepwise = StepwiseCall<Expression<K>>,
-        >,
+    K: Arithmetic,
 {
     match expression {
-        Expression::Add(node) => apply_arithmetic(&node.left, accumulated, expand_operand)
+        Expression::Add(node) => apply_arithmetic(&node.left, accumulated)
             .into_iter()
-            .flat_map(|value| apply_arithmetic(&node.right, value, expand_operand))
+            .flat_map(|value| apply_arithmetic(&node.right, value))
             .collect(),
-        Expression::Subtract(node) => apply_arithmetic(&node.left, accumulated, expand_operand)
+        Expression::Subtract(node) => apply_arithmetic(&node.left, accumulated)
             .into_iter()
             .flat_map(|value| node.right.subtract_from(value))
             .collect(),
         Expression::Negate(value) => value.subtract_from(accumulated),
-        _ => expand_arithmetic(expression, expand_operand)
+        _ => expand_arithmetic(expression)
             .into_iter()
             .map(|value| accumulated.clone().add(value))
             .collect(),
@@ -917,6 +937,48 @@ mod tests {
 
         fn term() -> Expr {
             Expr::term(Term::from(Factor::from("x"))).unwrap()
+        }
+
+        #[test]
+        fn query_normalization_matches_simple_expressions() {
+            for source in [
+                "x",
+                "log(x)",
+                "C(group)",
+                "x + x + z",
+                "x - z",
+                "x - x",
+                "-x",
+                "--x",
+                "x - -z",
+                "x:z",
+                "x*z",
+                "x/z",
+                "(x + z)*w",
+                "x - (z + w)",
+                "x - (z - w)",
+                "0 + x",
+                "x - 1 - 0",
+                "(0 + x)",
+                "x + (-1 + z)",
+            ] {
+                let mut query_cursor = source;
+                let query = crate::parse::parse_node::<TermQuery>(&mut query_cursor).unwrap();
+                let mut formula_cursor = source;
+                let existing = crate::parse::parse_node::<Multistage>(&mut formula_cursor)
+                    .unwrap()
+                    .into_simple()
+                    .unwrap();
+
+                assert!(query_cursor.is_empty(), "{source}");
+                assert!(formula_cursor.is_empty(), "{source}");
+                assert_eq!(query.expand(), existing.expand(), "{source}");
+                assert_eq!(
+                    query.apply_to(formula::Expression::from(Term::intercept())),
+                    existing.apply_to(formula::Expression::from(Term::intercept())),
+                    "with intercept: {source}"
+                );
+            }
         }
 
         #[test]
