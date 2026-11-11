@@ -291,6 +291,348 @@ impl std::error::Error for SelectionError {}
 mod tests {
     use super::{Role, SelectionError};
 
+    mod varying_slopes {
+        use super::*;
+        use crate::{ComponentKey, FittedFormula, ModelError, ValidationError};
+        use polars::prelude::{Column, DataFrame, DataType, PlSmallStr, Scalar};
+
+        fn fit(source: &str, data: &DataFrame) -> FittedFormula {
+            crate::parse(source)
+                .unwrap()
+                .fit(data)
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .clone()
+        }
+
+        #[test]
+        fn prediction_reuses_group_encoding_and_updates_loadings() {
+            let training = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+                "firm" => ["a", "b", "a"], "time" => [10_i32, 20, 30],
+            )
+            .unwrap();
+            let model = fit("y ~ x | firm[time]", &training);
+            let fitted = model.expression(Role::FixedEffect).unwrap().frame();
+            assert_eq!(fitted.shape(), (3, 4));
+            for index in [0, 2] {
+                assert_eq!(
+                    fitted[index].u32().unwrap().iter().collect::<Vec<_>>(),
+                    [Some(0), Some(1), Some(0)],
+                );
+            }
+            assert_eq!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                ["x"],
+            );
+
+            let input = polars::df!(
+                "y" => [7.0, 8.0, 9.0], "x" => [10.0, 11.0, 12.0],
+                "firm" => ["b", "a", "unseen"], "time" => [40_i32, 50, 60],
+            )
+            .unwrap();
+            let predicted = model.transform(&input).unwrap();
+            let effects = predicted.expression(Role::FixedEffect).unwrap().frame();
+            assert_eq!(effects.shape(), (3, 4));
+            assert_eq!(effects.get_column_names(), fitted.get_column_names());
+            for index in [0, 2] {
+                assert_eq!(
+                    effects[index].u32().unwrap().iter().collect::<Vec<_>>(),
+                    [Some(1), Some(0), None],
+                );
+            }
+            assert_eq!(
+                effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(1.0); 3],
+            );
+            assert_eq!(
+                effects[3].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(40.0), Some(50.0), Some(60.0)],
+            );
+        }
+
+        #[test]
+        fn slope_only_joint_groups_preserve_nulls_and_empty_prediction_schema() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+                "firm" => ["a", "a", "b"], "year" => [2020_i32, 2021, 2020],
+                "time" => [Some(2_i32), None, Some(4)],
+                "exposure" => [Some(0.5), Some(1.0), None],
+            )
+            .unwrap();
+            let model = fit("y ~ x | firm:year[[time, exposure]]", &data);
+            assert_eq!(
+                model
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .get_column_names(),
+                ["Intercept", "x"],
+            );
+            let effects = model.expression(Role::FixedEffect).unwrap().frame();
+            assert_eq!(effects.shape(), (3, 4));
+            for index in [0, 2] {
+                assert_eq!(
+                    effects[index].u32().unwrap().iter().collect::<Vec<_>>(),
+                    [Some(0), Some(1), Some(2)],
+                );
+            }
+            assert_eq!(
+                effects[1].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(2.0), None, Some(4.0)],
+            );
+            assert_eq!(
+                effects[3].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(0.5), Some(1.0), None],
+            );
+
+            let predicted = model.transform(&data.head(Some(0))).unwrap();
+            let empty = predicted.expression(Role::FixedEffect).unwrap().frame();
+            assert_eq!(empty.shape(), (0, 4));
+            assert_eq!(empty.schema(), effects.schema());
+        }
+
+        #[test]
+        fn term_selection_preserves_fitted_order_and_prediction_dependencies() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+                "firm" => ["a", "b", "a"], "year" => [2020_i32, 2021, 2020],
+                "time" => [10_i32, 20, 30], "exposure" => [0.5, 1.0, 1.5],
+            )
+            .unwrap();
+            let model = fit("y ~ x | firm[time, exposure] + year", &data);
+            let selected = model
+                .select_terms("firm[[exposure, time, exposure]]", Role::FixedEffect)
+                .unwrap();
+            assert_eq!(
+                selected.frame().unwrap().get_column_names(),
+                [
+                    "G(firm, time)[group]",
+                    "G(firm, time)[loading]",
+                    "G(firm, exposure)[group]",
+                    "G(firm, exposure)[loading]",
+                ],
+            );
+            let repeated = selected
+                .select_terms("firm[[exposure]]", Role::FixedEffect)
+                .unwrap();
+            assert_eq!(repeated.frame().unwrap().shape(), (3, 2));
+            assert_eq!(
+                repeated.frame().unwrap()[1]
+                    .f64()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [Some(0.5), Some(1.0), Some(1.5)],
+            );
+            drop(model);
+
+            let input = polars::df!(
+                "firm" => ["b", "unseen"], "time" => [40_i32, 50],
+                "exposure" => [2.0, 2.5],
+            )
+            .unwrap();
+            let predicted = selected.transform(&input).unwrap();
+            let frame = predicted.frame().unwrap();
+            assert_eq!(frame.shape(), (2, 4));
+            for index in [0, 2] {
+                assert_eq!(
+                    frame[index].u32().unwrap().iter().collect::<Vec<_>>(),
+                    [Some(1), None],
+                );
+            }
+            assert_eq!(
+                frame[1].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(40.0), Some(50.0)],
+            );
+            assert_eq!(
+                frame[3].f64().unwrap().iter().collect::<Vec<_>>(),
+                [Some(2.0), Some(2.5)],
+            );
+        }
+
+        #[test]
+        fn term_selection_requires_each_requested_loading_and_group_intercept() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0], "firm" => ["a", "b"], "time" => [1_i32, 2],
+            )
+            .unwrap();
+            let model = fit("y ~ 1 | firm[[time]]", &data);
+            for query in ["firm", "firm[time]", "firm[[exposure]]"] {
+                assert!(
+                    matches!(
+                        model.select_terms(query, Role::FixedEffect),
+                        Err(SelectionError::MissingTerm(_)),
+                    ),
+                    "{query}"
+                );
+            }
+        }
+
+        #[test]
+        fn provenance_identifies_output_roles_group_inputs_and_nested_loadings() {
+            let training = polars::df!(
+                "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
+                "firm" => ["a", "a", "b"], "year" => [2020_i32, 2021, 2020],
+                "time" => [1_i32, 4, 9], "exposure" => [0.5, 1.0, 1.5],
+            )
+            .unwrap();
+            let model = fit("y ~ x | firm:year[log(time), exposure]", &training);
+            let input = polars::df!(
+                "y" => [7.0, 8.0], "x" => [9.0, 10.0],
+                "firm" => ["b", "unseen"], "year" => [2020_i32, 2021],
+                "time" => [16_i32, 25], "exposure" => [2.0, 2.5],
+            )
+            .unwrap();
+            let predicted = model.transform(&input).unwrap();
+
+            for model in [&model, &predicted] {
+                let columns = model
+                    .columns(Role::FixedEffect)
+                    .unwrap()
+                    .collect::<Vec<_>>();
+                assert_eq!(columns.len(), 6);
+                let (terms, _) = columns.as_chunks::<2>();
+                for (term_index, pair) in terms.iter().enumerate() {
+                    for (column, role, dtype) in [
+                        (&pair[0], "group", DataType::UInt32),
+                        (&pair[1], "loading", DataType::Float64),
+                    ] {
+                        let contributions = column.contributions().collect::<Vec<_>>();
+                        let [(factor, key)] = contributions.as_slice() else {
+                            panic!("expected one grouped-factor contribution");
+                        };
+                        assert_eq!(
+                            *key,
+                            &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(role))),
+                        );
+                        assert_eq!(column.data().dtype(), &dtype);
+                        assert_eq!(column.term().factors().collect::<Vec<_>>(), vec![*factor]);
+                        let call = factor.transform().unwrap();
+                        assert_eq!(call.name(), "G");
+                        assert!(call.parameters().is_empty());
+                        let inputs = call.inputs().collect::<Vec<_>>();
+                        let [group, loading] = inputs.as_slice() else {
+                            panic!("expected a group and a loading");
+                        };
+                        let encoding = group.transform().unwrap();
+                        assert_eq!(encoding.name(), "F");
+                        assert_eq!(
+                            encoding
+                                .inputs()
+                                .map(|factor| factor.name())
+                                .collect::<Vec<_>>(),
+                            [Some("firm"), Some("year")],
+                        );
+                        match term_index {
+                            0 => assert_eq!(loading.value(), Some(&Scalar::from(1_i64))),
+                            1 => {
+                                let transform = loading.transform().unwrap();
+                                assert_eq!(transform.name(), "log");
+                                assert_eq!(
+                                    transform
+                                        .inputs()
+                                        .map(|factor| factor.name())
+                                        .collect::<Vec<_>>(),
+                                    [Some("time")],
+                                );
+                            }
+                            2 => assert_eq!(loading.name(), Some("exposure")),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                predicted.expression(Role::FixedEffect).unwrap().frame()[3]
+                    .f64()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [Some(16_f64.ln()), Some(25_f64.ln())],
+            );
+        }
+
+        #[test]
+        fn numeric_literal_loadings_use_prediction_height() {
+            let data = polars::df!("y" => [1.0, 2.0], "firm" => ["a", "b"]).unwrap();
+            let model = fit("y ~ 1 | firm[[2]]", &data);
+            let selected = model.select_terms("firm[[2]]", Role::FixedEffect).unwrap();
+            let input = polars::df!("firm" => ["b", "a", "unseen"]).unwrap();
+            let predicted = selected.transform(&input).unwrap();
+            assert_eq!(
+                predicted.frame().unwrap()[1]
+                    .f64()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                [Some(2.0); 3],
+            );
+        }
+
+        #[test]
+        fn rejects_nonnumeric_loading_columns() {
+            for loading in [
+                Column::new("loading".into(), ["a", "b"]),
+                Column::new("loading".into(), [true, false]),
+                Column::full_null("loading".into(), 2, &DataType::Null),
+            ] {
+                let data = DataFrame::new(
+                    2,
+                    vec![
+                        Column::new("y".into(), [1.0, 2.0]),
+                        Column::new("firm".into(), ["a", "b"]),
+                        loading,
+                    ],
+                )
+                .unwrap();
+                let specification = crate::parse("y ~ 1 | firm[[loading]]").unwrap();
+                let Err(ModelError::TransformCall(message)) = specification.fit(&data) else {
+                    panic!("expected a nonnumeric loading error");
+                };
+                assert!(message.contains("G(F(firm), loading)"), "{message}");
+                assert!(
+                    message.contains("expected a primitive numeric dtype"),
+                    "{message}"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_expanding_loadings_even_when_their_output_has_one_column() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0], "firm" => ["a", "b"],
+                "category" => ["a", "b"], "time" => [1_i32, 2],
+            )
+            .unwrap();
+            for loading in [
+                "C(category)",
+                "C(category, reference='a')",
+                "poly(time, degree=2, raw=true)",
+                "poly(time, degree=1, raw=true)",
+                "log(C(category))",
+            ] {
+                let source = format!("y ~ 1 | firm[[{loading}]]");
+                let specification = crate::parse(&source).unwrap();
+                assert!(
+                    matches!(
+                        specification.fit(&data),
+                        Err(ModelError::Validation(
+                            ValidationError::InvalidTransformComposition
+                        )),
+                    ),
+                    "{source}"
+                );
+            }
+        }
+    }
+
     mod column_provenance {
         use super::*;
         use crate::{ComponentKey, FittedFormula};

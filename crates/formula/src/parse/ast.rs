@@ -1,19 +1,29 @@
 use crate::formula;
+use std::sync::Arc;
 
 pub(super) enum Forbidden {}
 
 pub(super) enum Simple {}
 pub(super) enum Multistage {}
+pub(super) enum VaryingSlope {}
+
 pub(super) enum FixedEffect {}
 
 pub(super) struct Formula {
     pub(super) left: Expression<Multistage>,
     pub(super) right: Expression<Multistage>,
-    pub(super) fixed_effects: Option<Expression<FixedEffect>>,
+    pub(super) fixed_effects: Option<Expression<VaryingSlope>>,
 }
 pub(super) enum MultistageOperand {
-    Term(crate::formula::Term),
+    Term(formula::Term),
     Formula(Box<Formula>),
+}
+
+pub(super) struct Grouped<E> {
+    pub(super) group: Box<E>,
+    pub(super) intercept: bool,
+    pub(super) first: Arc<formula::Factor>,
+    pub(super) rest: Vec<Arc<formula::Factor>>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +73,11 @@ pub(super) struct StepwiseCall<E> {
     pub(super) rest: Vec<E>,
 }
 
+/// Defines the node payloads that an [`Expression`] of this kind can store.
+///
+/// An associated type of [`Forbidden`] makes the corresponding variant
+/// unconstructible. Whether an operator is valid for particular operands is
+/// determined by [`Construct`].
 pub(super) trait Kind: Sized {
     type Operand;
     type Addition;
@@ -71,6 +86,7 @@ pub(super) trait Kind: Sized {
     type Interaction;
     type FullInteraction;
     type Nesting;
+    type Grouped;
 }
 
 impl Kind for Simple {
@@ -81,6 +97,7 @@ impl Kind for Simple {
     type Interaction = Binary<Expression<Self>>;
     type FullInteraction = Binary<Expression<Self>>;
     type Nesting = Binary<Expression<Self>>;
+    type Grouped = Forbidden;
 }
 
 impl Kind for Multistage {
@@ -91,6 +108,18 @@ impl Kind for Multistage {
     type Interaction = Binary<Expression<Simple>>;
     type FullInteraction = Binary<Expression<Simple>>;
     type Nesting = Binary<Expression<Simple>>;
+    type Grouped = Forbidden;
+}
+
+impl Kind for VaryingSlope {
+    type Operand = Expression<FixedEffect>;
+    type Addition = Binary<Expression<Self>>;
+    type Subtraction = Forbidden;
+    type Negation = Forbidden;
+    type Interaction = Forbidden;
+    type FullInteraction = Forbidden;
+    type Nesting = Forbidden;
+    type Grouped = Grouped<Expression<FixedEffect>>;
 }
 
 impl Kind for FixedEffect {
@@ -101,6 +130,7 @@ impl Kind for FixedEffect {
     type Interaction = Binary<Expression<Self>>;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
+    type Grouped = Forbidden;
 }
 
 pub(super) enum Expression<K: Kind> {
@@ -112,41 +142,51 @@ pub(super) enum Expression<K: Kind> {
     Interact(K::Interaction),
     InteractFully(K::FullInteraction),
     Nesting(K::Nesting),
-    Group(Box<Self>),
+    Parenthesized(Box<Self>),
     Stepwise(StepwiseCall<Self>),
+    Grouped(K::Grouped),
 }
 
 impl<K: Construct> Expression<K> {
-    pub(super) fn term(term: crate::formula::Term) -> Result<Self, ConstructionError> {
-        K::term(term).map(Self::Operand)
+    pub(super) fn term(term: formula::Term) -> Result<Self, ConstructionError> {
+        K::term(term)
     }
 
     pub(super) fn multistage(formula: Formula) -> Result<Self, ConstructionError> {
-        K::multistage(formula).map(Self::Operand)
+        K::multistage(formula)
     }
 
     pub(super) fn add(left: Self, right: Self) -> Result<Self, ConstructionError> {
-        K::add(left, right).map(Self::Add)
+        K::add(left, right)
     }
 
     pub(super) fn subtract(left: Self, right: Self) -> Result<Self, ConstructionError> {
-        K::subtract(left, right).map(Self::Subtract)
+        K::subtract(left, right)
     }
 
     pub(super) fn negate(self) -> Result<Self, ConstructionError> {
-        K::negate(self).map(Self::Negate)
+        K::negate(self)
     }
 
     pub(super) fn interact(left: Self, right: Self) -> Result<Self, ConstructionError> {
-        K::interact(left, right).map(Self::Interact)
+        K::interact(left, right)
     }
 
     pub(super) fn interact_fully(left: Self, right: Self) -> Result<Self, ConstructionError> {
-        K::interact_fully(left, right).map(Self::InteractFully)
+        K::interact_fully(left, right)
     }
 
     pub(super) fn nest(left: Self, right: Self) -> Result<Self, ConstructionError> {
-        K::nest(left, right).map(Self::Nesting)
+        K::nest(left, right)
+    }
+
+    pub(super) fn grouped(
+        self,
+        intercept: bool,
+        first: Arc<formula::Factor>,
+        rest: Vec<Arc<formula::Factor>>,
+    ) -> Result<Self, ConstructionError> {
+        K::grouped(self, intercept, first, rest)
     }
 }
 
@@ -210,7 +250,9 @@ impl Expression<Multistage> {
                 left: Box::new((*node.left).into_simple()?),
                 right: node.right,
             }),
-            Self::Group(value) => Expression::Group(Box::new((*value).into_simple()?)),
+            Self::Parenthesized(value) => {
+                Expression::Parenthesized(Box::new((*value).into_simple()?))
+            }
             Self::Stepwise(call) => Expression::Stepwise(StepwiseCall {
                 operator: call.operator,
                 first: Box::new((*call.first).into_simple()?),
@@ -224,7 +266,78 @@ impl Expression<Multistage> {
             Self::Interact(node) => Expression::Interact(node),
             Self::InteractFully(node) => Expression::InteractFully(node),
             Self::Nesting(node) => Expression::Nesting(node),
+            Self::Grouped(impossible) => match impossible {},
         })
+    }
+}
+
+impl Expression<VaryingSlope> {
+    pub(super) fn into_fixed_effect(self) -> Result<Expression<FixedEffect>, ConstructionError> {
+        Ok(match self {
+            Self::Empty => Expression::Empty,
+            Self::Operand(group) => group,
+            Self::Add(node) => Expression::Add(Binary::new(
+                (*node.left).into_fixed_effect()?,
+                (*node.right).into_fixed_effect()?,
+            )),
+            Self::Parenthesized(value) => {
+                Expression::Parenthesized(Box::new((*value).into_fixed_effect()?))
+            }
+            Self::Stepwise(call) => Expression::Stepwise(StepwiseCall {
+                operator: call.operator,
+                first: Box::new((*call.first).into_fixed_effect()?),
+                rest: call
+                    .rest
+                    .into_iter()
+                    .map(Self::into_fixed_effect)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            Self::Subtract(impossible) => match impossible {},
+            Self::Negate(impossible) => match impossible {},
+            Self::Interact(impossible) => match impossible {},
+            Self::InteractFully(impossible) => match impossible {},
+            Self::Nesting(impossible) => match impossible {},
+            Self::Grouped(_) => {
+                return Err(ConstructionError::ExpectedFixedEffectGroup);
+            }
+        })
+    }
+
+    pub(super) fn expand(&self) -> Vec<formula::Expression> {
+        match self {
+            Self::Empty => vec![formula::Expression::from_iter([])],
+            Self::Operand(group) => group
+                .expand()
+                .into_iter()
+                .map(|expression| formula::encode_fixed_effects(expression, true, []))
+                .collect(),
+            Self::Add(node) => super::combine_alternatives(
+                &node.left.expand(),
+                &node.right.expand(),
+                |left, right| left.add(right),
+            ),
+            Self::Parenthesized(value) => value.expand(),
+            Self::Stepwise(call) => call.operator.expand(
+                std::iter::once(call.first.as_ref())
+                    .chain(call.rest.iter())
+                    .map(Self::expand),
+            ),
+            Self::Grouped(node) => node
+                .group
+                .expand()
+                .into_iter()
+                .map(|expression| {
+                    let loadings = std::iter::once(&node.first).chain(&node.rest).cloned();
+                    formula::encode_fixed_effects(expression, node.intercept, loadings)
+                })
+                .collect(),
+
+            Self::Subtract(impossible) => match *impossible {},
+            Self::Negate(impossible) => match *impossible {},
+            Self::Interact(impossible) => match *impossible {},
+            Self::InteractFully(impossible) => match *impossible {},
+            Self::Nesting(impossible) => match *impossible {},
+        }
     }
 }
 
@@ -249,7 +362,7 @@ impl Expression<FixedEffect> {
                 |left, right| left.interact(&right),
             ),
 
-            Self::Group(value) => value.expand(),
+            Self::Parenthesized(value) => value.expand(),
 
             Self::Stepwise(call) => call.operator.expand(
                 std::iter::once(call.first.as_ref())
@@ -261,6 +374,7 @@ impl Expression<FixedEffect> {
             Self::Negate(impossible) => match *impossible {},
             Self::InteractFully(impossible) => match *impossible {},
             Self::Nesting(impossible) => match *impossible {},
+            Self::Grouped(impossible) => match *impossible {},
         }
     }
 }
@@ -277,6 +391,7 @@ where
             Interaction = Binary<Expression<Simple>>,
             FullInteraction = Binary<Expression<Simple>>,
             Nesting = Binary<Expression<Simple>>,
+            Grouped = Forbidden,
         >,
 {
     match expression {
@@ -302,12 +417,13 @@ where
                 left.nest(right)
             })
         }
-        Expression::Group(value) => expand_arithmetic(value, expand_operand),
+        Expression::Parenthesized(value) => expand_arithmetic(value, expand_operand),
         Expression::Stepwise(call) => call.operator.expand(
             std::iter::once(call.first.as_ref())
                 .chain(call.rest.iter())
                 .map(|argument| expand_arithmetic(argument, expand_operand)),
         ),
+        Expression::Grouped(impossible) => match *impossible {},
     }
 }
 
@@ -324,6 +440,7 @@ where
             Interaction = Binary<Expression<Simple>>,
             FullInteraction = Binary<Expression<Simple>>,
             Nesting = Binary<Expression<Simple>>,
+            Grouped = Forbidden,
         >,
 {
     match expression {
@@ -352,12 +469,11 @@ impl Formula {
         let fixed_effects = self
             .fixed_effects
             .as_ref()
-            .map(Expression::<FixedEffect>::expand)
+            .map(Expression::<VaryingSlope>::expand)
             .unwrap_or_else(|| vec![formula::Expression::from_iter([])]);
 
         let sides = super::combine_alternatives(&left, &right, |left, right| (left, right));
         super::combine_alternatives(&sides, &fixed_effects, |(left, right), fixed_effects| {
-            let fixed_effects = formula::encode_fixed_effects(fixed_effects);
             let right = if fixed_effects.has_fixed_effect_intercept() {
                 right.without_intercept()
             } else {
@@ -375,137 +491,265 @@ impl Formula {
     }
 }
 
+/// Validates parsed operands and constructs expressions with the requested meaning.
+///
+/// Each method must reject unsupported operands or return an expression allowed
+/// by [`Kind`]. The result need not use the variant named after the operator:
+/// construction can convert operands into a narrower kind and wrap the result.
+///
+/// For example, `VaryingSlope::interact` requires operands convertible to
+/// `Expression<FixedEffect>`. It constructs an inner grouping interaction and
+/// returns it as an `Operand`, while `VaryingSlope::Interaction` is `Forbidden`.
 pub(super) trait Construct: Kind {
-    fn term(term: crate::formula::Term) -> Result<Self::Operand, ConstructionError>;
+    fn term(term: formula::Term) -> Result<Expression<Self>, ConstructionError>;
 
-    fn multistage(formula: Formula) -> Result<Self::Operand, ConstructionError>;
+    fn multistage(formula: Formula) -> Result<Expression<Self>, ConstructionError>;
 
     fn add(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Addition, ConstructionError>;
+    ) -> Result<Expression<Self>, ConstructionError>;
 
     fn subtract(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Subtraction, ConstructionError>;
+    ) -> Result<Expression<Self>, ConstructionError>;
 
-    fn negate(value: Expression<Self>) -> Result<Self::Negation, ConstructionError>;
+    fn negate(value: Expression<Self>) -> Result<Expression<Self>, ConstructionError>;
 
     fn interact(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Interaction, ConstructionError>;
+    ) -> Result<Expression<Self>, ConstructionError>;
 
     fn interact_fully(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::FullInteraction, ConstructionError>;
+    ) -> Result<Expression<Self>, ConstructionError>;
 
     fn nest(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Nesting, ConstructionError>;
+    ) -> Result<Expression<Self>, ConstructionError>;
+
+    fn grouped(
+        _group: Expression<Self>,
+        _intercept: bool,
+        _first: Arc<formula::Factor>,
+        _rest: Vec<Arc<formula::Factor>>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::GroupedNotAllowed)
+    }
 }
 
 impl Construct for Multistage {
-    fn term(term: crate::formula::Term) -> Result<Self::Operand, ConstructionError> {
-        Ok(MultistageOperand::Term(term))
+    fn term(term: formula::Term) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Operand(MultistageOperand::Term(term)))
     }
 
-    fn multistage(formula: Formula) -> Result<Self::Operand, ConstructionError> {
-        Ok(MultistageOperand::Formula(Box::new(formula)))
+    fn multistage(formula: Formula) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Operand(MultistageOperand::Formula(Box::new(
+            formula,
+        ))))
     }
 
     fn add(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Addition, ConstructionError> {
-        Ok(Binary::new(left, right))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Add(Binary::new(left, right)))
     }
 
     fn subtract(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Subtraction, ConstructionError> {
-        Ok(Binary::new(left, right.into_simple()?))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Subtract(Binary::new(
+            left,
+            right.into_simple()?,
+        )))
     }
 
-    fn negate(value: Expression<Self>) -> Result<Self::Negation, ConstructionError> {
-        Ok(Box::new(value.into_simple()?))
+    fn negate(value: Expression<Self>) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Negate(Box::new(value.into_simple()?)))
     }
 
     fn interact(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Interaction, ConstructionError> {
-        Ok(Binary::new(left.into_simple()?, right.into_simple()?))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Interact(Binary::new(
+            left.into_simple()?,
+            right.into_simple()?,
+        )))
     }
 
     fn interact_fully(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::FullInteraction, ConstructionError> {
-        Ok(Binary::new(left.into_simple()?, right.into_simple()?))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::InteractFully(Binary::new(
+            left.into_simple()?,
+            right.into_simple()?,
+        )))
     }
 
     fn nest(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Nesting, ConstructionError> {
-        Ok(Binary::new(left.into_simple()?, right.into_simple()?))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Nesting(Binary::new(
+            left.into_simple()?,
+            right.into_simple()?,
+        )))
     }
 }
 
-impl Construct for FixedEffect {
-    fn term(term: crate::formula::Term) -> Result<Self::Operand, ConstructionError> {
-        if let Some(crate::formula::FactorKind::Variable(variable)) =
-            term.as_factor().map(|factor| &factor.kind)
-        {
-            Ok(variable.definition().name().to_owned())
-        } else {
-            Err(ConstructionError::ExpectedFixedEffectColumn)
-        }
+impl Construct for VaryingSlope {
+    fn term(term: formula::Term) -> Result<Expression<Self>, ConstructionError> {
+        Expression::<FixedEffect>::term(term).map(Expression::Operand)
     }
 
-    fn multistage(_: Formula) -> Result<Self::Operand, ConstructionError> {
+    fn multistage(_: Formula) -> Result<Expression<Self>, ConstructionError> {
         Err(ConstructionError::MultistageNotAllowed)
     }
 
     fn add(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Addition, ConstructionError> {
-        Ok(Binary::new(left, right))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Add(Binary::new(left, right)))
     }
 
     fn subtract(
         _: Expression<Self>,
         _: Expression<Self>,
-    ) -> Result<Self::Subtraction, ConstructionError> {
-        Err(ConstructionError::FixedEffectOperator("-"))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "-",
+            context: "varying-slope expressions",
+        })
     }
 
-    fn negate(_: Expression<Self>) -> Result<Self::Negation, ConstructionError> {
-        Err(ConstructionError::FixedEffectOperator("-"))
+    fn negate(_: Expression<Self>) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "-",
+            context: "varying-slope expressions",
+        })
     }
 
     fn interact(
         left: Expression<Self>,
         right: Expression<Self>,
-    ) -> Result<Self::Interaction, ConstructionError> {
-        Ok(Binary::new(left, right))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        let group = Expression::<FixedEffect>::interact(
+            left.into_fixed_effect()?,
+            right.into_fixed_effect()?,
+        )?;
+        Ok(Expression::Operand(group))
     }
 
     fn interact_fully(
         _: Expression<Self>,
         _: Expression<Self>,
-    ) -> Result<Self::FullInteraction, ConstructionError> {
-        Err(ConstructionError::FixedEffectOperator("*"))
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "*",
+            context: "varying-slope expressions",
+        })
     }
 
-    fn nest(_: Expression<Self>, _: Expression<Self>) -> Result<Self::Nesting, ConstructionError> {
-        Err(ConstructionError::FixedEffectOperator("/"))
+    fn nest(
+        _: Expression<Self>,
+        _: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "/",
+            context: "varying-slope expressions",
+        })
+    }
+
+    fn grouped(
+        group: Expression<Self>,
+        intercept: bool,
+        first: Arc<formula::Factor>,
+        rest: Vec<Arc<formula::Factor>>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        let group = group.into_fixed_effect()?;
+
+        Ok(Expression::Grouped(Grouped {
+            group: Box::new(group),
+            intercept,
+            first,
+            rest,
+        }))
+    }
+}
+
+impl Construct for FixedEffect {
+    fn term(term: formula::Term) -> Result<Expression<Self>, ConstructionError> {
+        if let Some(crate::formula::FactorKind::Variable(variable)) =
+            term.as_factor().map(|factor| &factor.kind)
+        {
+            Ok(Expression::Operand(variable.definition().name().to_owned()))
+        } else {
+            Err(ConstructionError::ExpectedFixedEffectColumn)
+        }
+    }
+
+    fn multistage(_: Formula) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::MultistageNotAllowed)
+    }
+
+    fn add(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Add(Binary::new(left, right)))
+    }
+
+    fn subtract(
+        _: Expression<Self>,
+        _: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "-",
+            context: "fixed-effect expressions",
+        })
+    }
+
+    fn negate(_: Expression<Self>) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "-",
+            context: "fixed-effect expressions",
+        })
+    }
+
+    fn interact(
+        left: Expression<Self>,
+        right: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Ok(Expression::Interact(Binary::new(left, right)))
+    }
+
+    fn interact_fully(
+        _: Expression<Self>,
+        _: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "*",
+            context: "fixed-effect expressions",
+        })
+    }
+
+    fn nest(
+        _: Expression<Self>,
+        _: Expression<Self>,
+    ) -> Result<Expression<Self>, ConstructionError> {
+        Err(ConstructionError::InvalidOperator {
+            operator: "/",
+            context: "fixed-effect expressions",
+        })
     }
 }
 
@@ -528,7 +772,12 @@ pub(super) enum ConstructionError {
     MultistageArithmetic,
     MultistageNotAllowed,
     ExpectedFixedEffectColumn,
-    FixedEffectOperator(&'static str),
+    InvalidOperator {
+        operator: &'static str,
+        context: &'static str,
+    },
+    ExpectedFixedEffectGroup,
+    GroupedNotAllowed,
 }
 
 impl std::fmt::Display for ConstructionError {
@@ -539,9 +788,13 @@ impl std::fmt::Display for ConstructionError {
             Self::ExpectedFixedEffectColumn => {
                 f.write_str("fixed effects require column references")
             }
-            Self::FixedEffectOperator(operator) => {
-                write!(f, "operator {operator} is not supported in fixed effects")
+            Self::InvalidOperator { operator, context } => {
+                write!(f, "operator {operator} is not supported in {context}")
             }
+            Self::ExpectedFixedEffectGroup => {
+                f.write_str("expected a grouping expression without loadings")
+            }
+            Self::GroupedNotAllowed => f.write_str("grouped loadings are not allowed here"),
         }
     }
 }
@@ -570,13 +823,13 @@ mod tests {
 
         #[test]
         fn conversion_preserves_grouped_subtraction() {
-            let expression = Expression::Group(Box::new(Expression::Subtract(Binary {
+            let expression = Expression::Parenthesized(Box::new(Expression::Subtract(Binary {
                 left: Box::new(term()),
                 right: Box::new(Expression::Operand(Term::intercept())),
             })));
 
             let converted = expression.into_simple().unwrap();
-            let Expression::Group(value) = converted else {
+            let Expression::Parenthesized(value) = converted else {
                 panic!("expected group");
             };
             let Expression::Subtract(node) = *value else {
@@ -590,7 +843,7 @@ mod tests {
         fn conversion_rejects_nested_formulas_inside_containers() {
             let expressions = [
                 nested(),
-                Expression::Group(Box::new(nested())),
+                Expression::Parenthesized(Box::new(nested())),
                 Expression::Add(Binary {
                     left: Box::new(term()),
                     right: Box::new(nested()),
@@ -661,14 +914,19 @@ mod tests {
             for (construct, operator) in forbidden {
                 assert!(matches!(
                     construct(column(), column()),
-                    Err(ConstructionError::FixedEffectOperator(actual))
-                        if actual == operator
+                    Err(ConstructionError::InvalidOperator {
+                        operator: actual,
+                        context: "fixed-effect expressions",
+                    }) if actual == operator
                 ));
             }
 
             assert!(matches!(
                 column().negate(),
-                Err(ConstructionError::FixedEffectOperator("-"))
+                Err(ConstructionError::InvalidOperator {
+                    operator: "-",
+                    context: "fixed-effect expressions",
+                })
             ));
         }
     }

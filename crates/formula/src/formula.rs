@@ -1157,18 +1157,31 @@ fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term) -> &'a FittedTerm
         .expect("every term must have an transformed entry")
 }
 
-pub(crate) fn encode_fixed_effects(expression: Expression) -> Expression {
+pub(crate) fn encode_fixed_effects(
+    expression: Expression,
+    intercept: bool,
+    loadings: impl IntoIterator<Item = Arc<Factor>>,
+) -> Expression {
+    let intercept_loading = intercept.then(|| {
+        Arc::new(Factor {
+            kind: FactorKind::Literal(Scalar::from(1_i64)),
+        })
+    });
+
+    let loadings = intercept_loading
+        .into_iter()
+        .chain(loadings)
+        .collect::<Vec<_>>();
+
     Expression::new(
         expression
             .terms
             .into_iter()
             .filter(|term| !term.is_intercept())
-            .map(|term| {
-                let loading = Arc::new(Factor {
-                    kind: FactorKind::Literal(Scalar::from(1_i64)),
-                });
-
-                Term::fixed_effect(term.factors, loading)
+            .flat_map(|term| {
+                loadings.iter().map(move |loading| {
+                    Term::fixed_effect(term.factors.clone(), Arc::clone(loading))
+                })
             }),
         expression.children,
     )
@@ -1548,7 +1561,7 @@ mod tests {
             vec![child.clone()],
         );
 
-        let encoded = encode_fixed_effects(expression);
+        let encoded = encode_fixed_effects(expression, true, []);
         let expected = crate::parse("y ~ x | firm")
             .unwrap()
             .iter()
