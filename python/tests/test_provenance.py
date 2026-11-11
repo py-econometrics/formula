@@ -212,3 +212,58 @@ def test_columns_reject_missing_or_invalid_roles(data):
         model.columns(formula.Role.FixedEffect)
     with pytest.raises(TypeError):
         model.columns("Independent")  # ty: ignore[invalid-argument-type]
+
+
+def test_varying_slope_provenance_survives_owner_deletion():
+    data = polars.DataFrame(
+        {
+            "y": [1.0, 2.0, 3.0],
+            "x": [4.0, 5.0, 6.0],
+            "firm": ["a", "b", "a"],
+            "year": [2020, 2020, 2021],
+            "time": polars.Series([1, 2, 3], dtype=polars.Int32),
+            "exposure": [0.5, 1.0, 1.5],
+        }
+    )
+    model = formula.parse("y ~ x | firm:year[log(time), exposure]").fit(data)[0]
+    selected = model.select_terms(
+        "firm:year[log(time), exposure]", formula.Role.FixedEffect
+    )
+    predicted = selected.transform(data.select("firm", "year", "time", "exposure"))
+    columns = predicted.columns(role=formula.Role.FixedEffect)
+    del model, selected, predicted
+
+    assert len(columns) == 6
+    for index, column in enumerate(columns):
+        (contribution,) = column.contributions
+        role = "group" if index % 2 == 0 else "loading"
+        assert contribution.key == role
+        assert type(contribution.key) is str
+        assert column.data.dtype == (
+            polars.UInt32 if role == "group" else polars.Float64
+        )
+        (term_factor,) = column.term
+        term_call = term_factor.transform
+        assert term_call is not None
+        assert term_call.name == "G"
+
+        call = contribution.factor.transform
+        assert call is not None
+        assert call.name == "G"
+        assert call.parameters == {}
+        group, loading = call.inputs
+        encoding = group.transform
+        assert encoding is not None
+        assert encoding.name == "F"
+        assert [factor.name for factor in encoding.inputs] == ["firm", "year"]
+
+        if index < 2:
+            assert type(loading.value) is int
+            assert loading.value == 1
+        elif index < 4:
+            transform = loading.transform
+            assert transform is not None
+            assert transform.name == "log"
+            assert [factor.name for factor in transform.inputs] == ["time"]
+        else:
+            assert loading.name == "exposure"
