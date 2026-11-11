@@ -215,16 +215,16 @@ For example, `y ~ z - 1 + [x ~ log(z)]` removes only the parent's intercept.
 Use `|` to specify fixed effects separately from ordinary predictors:
 
 ```text
-y ~ x | firm + year      # Separate firm and year fixed effects
-y ~ x | firm:year        # One fixed effect for observed firm-year combinations
-y ~ 1 + x | firm         # Fixed effects suppress even an explicitly requested intercept
+y ~ x | firm + year  # Separate firm and year fixed effects
+y ~ x | firm:year  # One fixed effect for observed firm-year combinations
+y ~ x | firm[time]  # Firm intercepts and firm-specific coefficients on time
+y ~ x | firm[[time]]  # Firm-specific coefficients on time, without firm intercepts
+y ~ x | firm[time, exposure]  # Firm intercepts and separate coefficients on both loadings
+y ~ x | firm:year[time]  # Intercepts and slopes for observed firm-year combinations
 ```
 
-Each grouping term produces one integer-coded column. Column names preserve the input column
-names and factor order: `firm:year` and `year:firm` retain their respective order.
-
-The fixed-effect pipe accepts column references, addition (`+`), interactions (`:`),
-parentheses, and stepwise calls (`sw`, `sw0`, `csw`, `csw0`).
+Prediction reuses the fitted group encoding and evaluates loadings on the new
+data. Nulls are preserved, and unseen groups receive null codes.
 
 ### Transformations
 
