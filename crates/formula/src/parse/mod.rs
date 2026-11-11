@@ -1044,6 +1044,17 @@ mod tests {
         }
 
         #[test]
+        fn fixed_effect_grouping_rejects_nested_formulas_and_loadings() {
+            for (source, expected) in [
+                ("[y ~ x]", typed::ConstructionError::MultistageNotAllowed),
+                ("firm[time]", typed::ConstructionError::GroupedNotAllowed),
+            ] {
+                let error = parse_fixed_effects.parse(source).unwrap_err();
+                assert_eq!(construction_error(error.inner()), &expected, "{source}");
+            }
+        }
+
+        #[test]
         fn parsing_preserves_subtraction() {
             let ast = parse_node::<Multistage>.parse("x - z").unwrap();
             let Ast::Subtract(node) = ast else {
