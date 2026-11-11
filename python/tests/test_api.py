@@ -358,7 +358,12 @@ def test_select_terms_returns_an_independent_fitted_formula(data, keyword_role):
         ("firm", formula.Role.FixedEffect, KeyError, "FixedEffect"),
         ("missing", formula.Role.Independent, KeyError, "missing"),
         ("x +", formula.Role.Independent, SyntaxError, None),
-        ("sw(x, z)", formula.Role.Independent, SyntaxError, "exactly one expression"),
+        (
+            "sw(x, z)",
+            formula.Role.Independent,
+            SyntaxError,
+            "stepwise calls are not allowed here",
+        ),
     ],
 )
 def test_select_terms_translates_rust_errors(data, query, role, exception, message):
