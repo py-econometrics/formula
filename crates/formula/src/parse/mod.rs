@@ -700,9 +700,7 @@ mod tests {
         for role in [Role::Dependent, Role::Independent] {
             let error = parse_term("sw(x)", role).unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("stepwise calls are not allowed here"),
+                error.to_string().contains("operator is not supported"),
                 "{role:?}: {error}"
             );
         }
@@ -882,7 +880,7 @@ mod tests {
                 let error = parse(source).unwrap_err();
                 assert_eq!(
                     construction_error(error.inner()),
-                    &typed::ConstructionError::GroupedNotAllowed,
+                    &typed::ConstructionError::Unsupported,
                     "{source}: {error}",
                 );
             }
@@ -1020,10 +1018,10 @@ mod tests {
 
     mod syntax {
         use super::*;
-        use typed::{Expression as Ast, Multistage, MultistageOperand, Simple};
+        use typed::{Construct, Expression as Ast, Multistage, Simple};
 
         fn assert_term(node: &Ast<Multistage>, name: &str) {
-            let Ast::Operand(MultistageOperand::Term(term)) = node else {
+            let Ast::Operand(term) = node else {
                 panic!("expected multistage-kind term {name}");
             };
             assert_eq!(term, &Term::from(Factor::from(name)));
@@ -1038,13 +1036,19 @@ mod tests {
 
         #[test]
         fn parsing_preserves_formula_sections() {
-            let ast = parse_formula_ast.parse("y ~ x | firm").unwrap();
-            assert_term(&ast.left, "y");
-            assert_term(&ast.right, "x");
-            let Some(Ast::Operand(group)) = ast.fixed_effects else {
-                panic!("expected fixed-effect group");
-            };
-            assert!(matches!(group, Ast::Operand(name) if name == "firm"));
+            let formulas = parse_formula_ast.parse("y ~ x | firm").unwrap();
+            assert_eq!(formulas.len(), 1);
+            assert_eq!(
+                formulas[0].expressions,
+                BTreeMap::from([
+                    (Role::Dependent, expression(&[&["y"]])),
+                    (Role::Independent, expression(&[&["x"]])),
+                    (
+                        Role::FixedEffect,
+                        crate::formula::encode_fixed_effects(expression(&[&["firm"]]), true, []),
+                    ),
+                ]),
+            );
         }
 
         #[test]
@@ -1060,7 +1064,7 @@ mod tests {
                     panic!("expected inner grouping interaction for {source}");
                 };
                 assert_eq!(
-                    node.into_fixed_effect().unwrap().expand(),
+                    Ast::<typed::FixedEffect>::construct(node).unwrap().expand(),
                     parse_fixed_effects.parse(source).unwrap(),
                     "{source}",
                 );
@@ -1070,8 +1074,8 @@ mod tests {
         #[test]
         fn fixed_effect_grouping_rejects_nested_formulas_and_loadings() {
             for (source, expected) in [
-                ("[y ~ x]", typed::ConstructionError::MultistageNotAllowed),
-                ("firm[time]", typed::ConstructionError::GroupedNotAllowed),
+                ("[y ~ x]", typed::ConstructionError::Unsupported),
+                ("firm[time]", typed::ConstructionError::Unsupported),
             ] {
                 let error = parse_fixed_effects.parse(source).unwrap_err();
                 assert_eq!(construction_error(error.inner()), &expected, "{source}");
@@ -1118,9 +1122,8 @@ mod tests {
 
         #[test]
         fn stepwise_expansion_preserves_formula_and_argument_scope() {
-            let ast = parse_formula_ast.parse("y ~ sw((x - 1), z)").unwrap();
-            assert_term(&ast.left, "y");
-            let Ast::Stepwise(call) = &ast.right else {
+            let ast = parse_node::<Multistage>.parse("sw((x - 1), z)").unwrap();
+            let Ast::Stepwise(call) = &ast else {
                 panic!("expected stepwise call");
             };
             assert!(matches!(call.operator, StepwiseOperator::Sw));
@@ -1129,7 +1132,14 @@ mod tests {
             assert_term(&call.rest[0], "z");
 
             let expected = parse_many(["y ~ x", "y ~ z"]).unwrap();
-            assert_eq!(ast.expand().into_iter().collect::<Formulas>(), expected);
+            assert_eq!(
+                parse_formula_ast
+                    .parse("y ~ sw((x - 1), z)")
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Formulas>(),
+                expected,
+            );
         }
 
         #[test]
@@ -1250,21 +1260,18 @@ mod tests {
 
     #[test]
     fn fixed_effect_expressions_report_unsupported_operators() {
-        for (source, operator) in [
-            ("firm - year", "-"),
-            ("-firm", "-"),
-            ("firm * year", "*"),
-            ("firm / year", "/"),
-            ("(firm - year)", "-"),
-            ("sw(firm, year * worker)", "*"),
+        for source in [
+            "firm - year",
+            "-firm",
+            "firm * year",
+            "firm / year",
+            "(firm - year)",
+            "sw(firm, year * worker)",
         ] {
             let error = parse_fixed_effects.parse(source).unwrap_err();
             assert_eq!(
                 construction_error(error.inner()),
-                &typed::ConstructionError::InvalidOperator {
-                    operator,
-                    context: "fixed-effect expressions",
-                },
+                &typed::ConstructionError::Unsupported,
                 "{source}: {error}",
             );
 
@@ -1272,10 +1279,7 @@ mod tests {
             let error = parse(&formula).unwrap_err();
             assert_eq!(
                 construction_error(error.inner()),
-                &typed::ConstructionError::InvalidOperator {
-                    operator,
-                    context: "varying-slope expressions",
-                },
+                &typed::ConstructionError::Unsupported,
                 "{formula}: {error}",
             );
             assert!(
@@ -2229,11 +2233,10 @@ mod tests {
                 "y ~ -sw([a ~ z], w)",
                 "y ~ x + [a ~ z * [b ~ w]]",
             ] {
-                // Test the syntax parser directly: evaluation is not involved.
+                // Construction must reject arithmetic on child formulas.
                 let error = parse_formula_ast
                     .parse(source)
-                    .err()
-                    .expect("expected construction failure");
+                    .expect_err("expected construction failure");
                 assert!(
                     construction_error(error.inner())
                         == &typed::ConstructionError::MultistageArithmetic,

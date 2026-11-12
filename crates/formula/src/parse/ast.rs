@@ -612,15 +612,8 @@ impl Construct<Expression<VaryingSlope>> for Expression<FixedEffect> {
 pub(super) enum ConstructionError {
     Unsupported,
     MultistageArithmetic,
-    MultistageNotAllowed,
     ExpectedFixedEffectColumn,
-    InvalidOperator {
-        operator: &'static str,
-        context: &'static str,
-    },
     ExpectedFixedEffectGroup,
-    GroupedNotAllowed,
-    StepwiseNotAllowed,
 }
 
 impl std::fmt::Display for ConstructionError {
@@ -628,18 +621,12 @@ impl std::fmt::Display for ConstructionError {
         match self {
             Self::Unsupported => f.write_str("operator is not supported"),
             Self::MultistageArithmetic => f.write_str("multistage formulas may only be added"),
-            Self::MultistageNotAllowed => f.write_str("multistage formulas are not allowed here"),
             Self::ExpectedFixedEffectColumn => {
                 f.write_str("fixed effects require column references")
-            }
-            Self::InvalidOperator { operator, context } => {
-                write!(f, "operator {operator} is not supported in {context}")
             }
             Self::ExpectedFixedEffectGroup => {
                 f.write_str("expected a grouping expression without loadings")
             }
-            Self::GroupedNotAllowed => f.write_str("grouped loadings are not allowed here"),
-            Self::StepwiseNotAllowed => f.write_str("stepwise calls are not allowed here"),
         }
     }
 }
@@ -654,6 +641,7 @@ mod tests {
     mod term_query {
         use super::*;
         use crate::formula::Factor;
+        use winnow::Parser;
         use winnow::error::ErrMode;
 
         type Expr = Expression<TermQuery>;
@@ -688,10 +676,10 @@ mod tests {
                 let mut query_cursor = source;
                 let query = crate::parse::parse_node::<TermQuery>(&mut query_cursor).unwrap();
                 let mut formula_cursor = source;
-                let existing = crate::parse::parse_node::<Multistage>(&mut formula_cursor)
-                    .unwrap()
-                    .into_simple()
-                    .unwrap();
+                let existing = Expression::<Simple>::construct(
+                    crate::parse::parse_node::<Multistage>(&mut formula_cursor).unwrap(),
+                )
+                .unwrap();
 
                 assert!(query_cursor.is_empty(), "{source}");
                 assert!(formula_cursor.is_empty(), "{source}");
@@ -726,14 +714,10 @@ mod tests {
 
         #[test]
         fn constructors_reject_child_formulas_and_all_stepwise_operators() {
-            let formula = Formula {
-                left: Expression::Operand(MultistageOperand::Term(Term::intercept())),
-                right: Expression::Operand(MultistageOperand::Term(Term::intercept())),
-                fixed_effects: None,
-            };
+            let formulas = crate::parse::parse_formula_ast.parse("y ~ x").unwrap();
             assert!(matches!(
-                Expr::multistage(formula),
-                Err(ConstructionError::MultistageNotAllowed)
+                Expr::multistage(formulas),
+                Err(ConstructionError::Unsupported)
             ));
 
             for operator in [
@@ -748,12 +732,12 @@ mod tests {
                         first: Box::new(term()),
                         rest: vec![],
                     }),
-                    Err(ConstructionError::StepwiseNotAllowed)
+                    Err(ConstructionError::Unsupported)
                 ));
             }
             assert_eq!(
-                ConstructionError::StepwiseNotAllowed.to_string(),
-                "stepwise calls are not allowed here"
+                ConstructionError::Unsupported.to_string(),
+                "operator is not supported"
             );
         }
 
@@ -788,9 +772,7 @@ mod tests {
                     let mut cursor = source.as_str();
                     match crate::parse::parse_node::<TermQuery>(&mut cursor) {
                         Err(ErrMode::Cut(error)) => assert!(
-                            error
-                                .to_string()
-                                .contains("stepwise calls are not allowed here"),
+                            error.to_string().contains("operator is not supported"),
                             "{source}: {error}"
                         ),
                         _ => panic!("expected committed stepwise construction error for {source}"),
@@ -805,9 +787,7 @@ mod tests {
                 let mut cursor = source;
                 match crate::parse::parse_node::<TermQuery>(&mut cursor) {
                     Err(ErrMode::Cut(error)) => assert!(
-                        error
-                            .to_string()
-                            .contains("multistage formulas are not allowed here"),
+                        error.to_string().contains("operator is not supported"),
                         "{source}: {error}"
                     ),
                     _ => panic!("expected committed child-formula construction error for {source}"),
@@ -818,27 +798,25 @@ mod tests {
 
     mod conversion {
         use super::*;
+        use winnow::Parser;
 
         fn term() -> Expression<Multistage> {
-            Expression::Operand(MultistageOperand::Term(Term::intercept()))
+            Expression::Operand(Term::intercept())
         }
 
         fn nested() -> Expression<Multistage> {
-            Expression::Operand(MultistageOperand::Formula(Box::new(Formula {
-                left: term(),
-                right: term(),
-                fixed_effects: None,
-            })))
+            Expression::Multistage(crate::parse::parse_formula_ast.parse("y ~ x").unwrap())
         }
 
         #[test]
         fn conversion_preserves_grouped_subtraction() {
-            let expression = Expression::Parenthesized(Box::new(Expression::Subtract(Binary {
-                left: Box::new(term()),
-                right: Box::new(Expression::Operand(Term::intercept())),
-            })));
+            let expression: Expression<Multistage> =
+                Expression::Parenthesized(Box::new(Expression::Subtract(Binary {
+                    left: Box::new(term()),
+                    right: Box::new(Expression::Operand(Term::intercept())),
+                })));
 
-            let converted = expression.into_simple().unwrap();
+            let converted = Expression::<Simple>::construct(expression).unwrap();
             let Expression::Parenthesized(value) = converted else {
                 panic!("expected group");
             };
@@ -867,7 +845,7 @@ mod tests {
 
             for expression in expressions {
                 assert!(matches!(
-                    expression.into_simple(),
+                    Expression::<Simple>::construct(expression),
                     Err(ConstructionError::MultistageArithmetic)
                 ));
             }
@@ -886,7 +864,7 @@ mod tests {
 
                 assert!(matches!(
                     expression,
-                    Expression::Operand(actual) if actual == name
+                    Expression::Operand(actual) if actual.name() == name
                 ));
             }
 
@@ -907,7 +885,7 @@ mod tests {
             type Expr = Expression<FixedEffect>;
             type BinaryConstructor = fn(Expr, Expr) -> Result<Expr, ConstructionError>;
 
-            let column = || Expr::Operand("firm".to_owned());
+            let column = || Expr::term(Term::from(Factor::from("firm"))).unwrap();
 
             assert!(matches!(Expr::add(column(), column()), Ok(Expr::Add(_))));
             assert!(matches!(
@@ -915,28 +893,19 @@ mod tests {
                 Ok(Expr::Interact(_))
             ));
 
-            let forbidden: [(BinaryConstructor, &str); 3] = [
-                (Expr::subtract, "-"),
-                (Expr::interact_fully, "*"),
-                (Expr::nest, "/"),
-            ];
+            let forbidden: [BinaryConstructor; 3] =
+                [Expr::subtract, Expr::interact_fully, Expr::nest];
 
-            for (construct, operator) in forbidden {
+            for construct in forbidden {
                 assert!(matches!(
                     construct(column(), column()),
-                    Err(ConstructionError::InvalidOperator {
-                        operator: actual,
-                        context: "fixed-effect expressions",
-                    }) if actual == operator
+                    Err(ConstructionError::Unsupported)
                 ));
             }
 
             assert!(matches!(
                 column().negate(),
-                Err(ConstructionError::InvalidOperator {
-                    operator: "-",
-                    context: "fixed-effect expressions",
-                })
+                Err(ConstructionError::Unsupported)
             ));
         }
     }
