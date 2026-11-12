@@ -4,7 +4,7 @@ use crate::Role;
 use crate::fit::Fit;
 use crate::formula::{Expression, FactorKind};
 use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
-use crate::parse::ast::Stepwise;
+use crate::parse::ast::StepwiseOperator;
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
 };
@@ -153,7 +153,7 @@ fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
     .parse_next(cursor)
 }
 
-fn parse_intercept<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_intercept<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
     let name = take_while(1.., is_identifier_character)
         .verify(|name: &str| matches!(name, "0" | "1"))
         .parse_next(cursor)?;
@@ -301,7 +301,7 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     })
 }
 
-fn combine_alternatives<L: Clone, R: Clone, O>(
+fn cartesian_product_with<L: Clone, R: Clone, O>(
     left: &[L],
     right: &[R],
     combine: impl Fn(L, R) -> O,
@@ -329,7 +329,7 @@ pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>
         .parse_next(cursor)
 }
 
-fn parse_node<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_node<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
     expression(parse_operand::<K>)
         .prefix(
             preceded(multispace0, '-')
@@ -381,7 +381,7 @@ fn parse_node<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expressi
         .parse_next(cursor)
 }
 
-fn parse_stepwise_arguments<K: ast::Construct>(
+fn parse_stepwise_arguments<K: ast::Kind>(
     cursor: &mut &str,
 ) -> ModalResult<(ast::Expression<K>, Vec<ast::Expression<K>>)> {
     multispace0.parse_next(cursor)?;
@@ -404,13 +404,13 @@ fn parse_stepwise_arguments<K: ast::Construct>(
     Ok((first, rest))
 }
 
-fn parse_stepwise<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_stepwise<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
     let operator = terminated(
         alt((
-            "sw0".value(Stepwise::Sw0),
-            "sw".value(Stepwise::Sw),
-            "csw0".value(Stepwise::Csw0),
-            "csw".value(Stepwise::Csw),
+            "sw0".value(StepwiseOperator::Sw0),
+            "sw".value(StepwiseOperator::Sw),
+            "csw0".value(StepwiseOperator::Csw0),
+            "csw".value(StepwiseOperator::Csw),
         )),
         '(',
     )
@@ -428,9 +428,7 @@ fn parse_stepwise<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expr
     )
 }
 
-fn parse_node_parenthesized<K: ast::Construct>(
-    cursor: &mut &str,
-) -> ModalResult<ast::Expression<K>> {
+fn parse_node_parenthesized<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
     '('.parse_next(cursor)?;
 
     let node = cut_err(parse_node::<K>).parse_next(cursor)?;
@@ -445,7 +443,7 @@ fn parse_node_parenthesized<K: ast::Construct>(
     Ok(ast::Expression::Parenthesized(Box::new(node)))
 }
 
-fn parse_operand<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_operand<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
     let factor = |cursor: &mut &str| {
         let factor = parse_factor.parse_next(cursor)?;
         construction_result(cursor, ast::Expression::<K>::term(Term::from(factor)))
@@ -465,7 +463,7 @@ fn parse_operand<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expre
     .parse_next(cursor)
 }
 
-fn parse_multistage<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_multistage<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
     let formula = preceded(
         '[',
         cut_err(terminated(
@@ -480,7 +478,7 @@ fn parse_multistage<K: ast::Construct>(cursor: &mut &str) -> ModalResult<ast::Ex
     construction_result(cursor, ast::Expression::<K>::multistage(formula))
 }
 
-fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::Formula> {
+fn parse_formula_ast(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
     let left = preceded(
         multispace0,
         parse_node::<ast::Multistage>.context(StrContext::Label("left-hand expression")),
@@ -506,11 +504,35 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::Formula> {
     ))
     .parse_next(cursor)?;
 
-    Ok(ast::Formula {
-        left,
-        right,
-        fixed_effects,
-    })
+    let left = left.expand();
+    let right = right.apply_to(Expression::from(Term::intercept()));
+    let fixed_effects = fixed_effects
+        .as_ref()
+        .map(ast::Expression::<ast::VaryingSlope>::expand)
+        .unwrap_or_else(|| vec![Expression::from_iter([])]);
+
+    let expanded_left_right = cartesian_product_with(&left, &right, |left, right| (left, right));
+    let expanded_fixed_effects = cartesian_product_with(
+        &expanded_left_right,
+        &fixed_effects,
+        |(left, right), fixed_effects| {
+            let right = if fixed_effects.has_fixed_effect_intercept() {
+                right.without_intercept()
+            } else {
+                right
+            };
+
+            Formula {
+                expressions: BTreeMap::from([
+                    (Role::Dependent, left),
+                    (Role::Independent, right),
+                    (Role::FixedEffect, fixed_effects),
+                ]),
+            }
+        },
+    );
+
+    Ok(expanded_fixed_effects)
 }
 
 pub(crate) type ParseResult<'i, T> = Result<T, ParseError<&'i str, ContextError>>;
@@ -529,7 +551,6 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
                 "a formula operator or end of input",
             ))),
         )
-        .map(|ast| ast.expand())
         .parse(source)?;
 
         for formula in expanded {
@@ -1102,7 +1123,7 @@ mod tests {
             let Ast::Stepwise(call) = &ast.right else {
                 panic!("expected stepwise call");
             };
-            assert!(matches!(call.operator, Stepwise::Sw));
+            assert!(matches!(call.operator, StepwiseOperator::Sw));
             assert!(matches!(call.first.as_ref(), Ast::Parenthesized(_)));
             assert_eq!(call.rest.len(), 1);
             assert_term(&call.rest[0], "z");
