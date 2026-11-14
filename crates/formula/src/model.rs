@@ -1155,7 +1155,7 @@ mod tests {
         }
 
         #[test]
-        fn queries_reject_unsupported_shapes_and_multiple_alternatives() {
+        fn queries_reject_unsupported_shapes_and_stepwise_calls() {
             let data = polars::df!(
                 "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"],
             )
@@ -1169,6 +1169,9 @@ mod tests {
                 ("x + (sw0(x))", Role::Independent),
                 ("g*g", Role::FixedEffect),
                 ("sw(g, g)", Role::FixedEffect),
+                ("sw(g)", Role::FixedEffect),
+                ("sw(g)[x]", Role::FixedEffect),
+                ("sw(g[x])", Role::FixedEffect),
             ] {
                 assert!(
                     matches!(
@@ -1178,17 +1181,6 @@ mod tests {
                     "{query}"
                 );
             }
-            // Fixed-effect queries retain the interim single-alternative behavior.
-            let selected = model.select_terms("sw(g)", Role::FixedEffect).unwrap();
-            assert!(
-                selected.frame().unwrap().equals_missing(
-                    &model
-                        .select_terms("g", Role::FixedEffect)
-                        .unwrap()
-                        .frame()
-                        .unwrap()
-                )
-            );
         }
     }
 
@@ -1266,6 +1258,30 @@ mod tests {
                 .shape(),
             (2, 0)
         );
+    }
+
+    #[test]
+    fn collecting_fitted_formulas_preserves_order_duplicates_and_frames() {
+        let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0]).unwrap();
+        let models = crate::parse_many(["y ~ x", "y ~ x - 1"])
+            .unwrap()
+            .fit(&data)
+            .unwrap();
+        let first = models.iter().next().unwrap();
+        let second = models.iter().nth(1).unwrap();
+        let entries = [second.clone(), first.clone(), second.clone()];
+        let collected = entries.iter().cloned().collect::<super::FittedFormulas>();
+
+        assert_eq!(collected.len(), entries.len());
+        for (actual, expected) in collected.iter().zip(&entries) {
+            assert_eq!(actual.formula(), expected.formula());
+            assert!(
+                actual
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&expected.frame().unwrap())
+            );
+        }
     }
 
     #[test]

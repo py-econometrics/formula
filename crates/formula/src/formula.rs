@@ -59,6 +59,17 @@ impl VariableDefinition {
     }
 }
 
+impl TryFrom<Term> for VariableDefinition {
+    type Error = ();
+
+    fn try_from(term: Term) -> Result<Self, Self::Error> {
+        match term.as_factor().map(|factor| &factor.kind) {
+            Some(FactorKind::Variable(variable)) => Ok(variable.definition().clone()),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct VariableState {
     dtype: DataType,
@@ -592,6 +603,8 @@ impl Expression {
     pub(crate) fn subtract(mut self, other: impl Into<Self>) -> Self {
         let other = other.into();
         self.terms.retain(|term| !other.terms.contains(term));
+        self.children
+            .retain(|child| !other.children.contains(child));
         self
     }
     pub(crate) fn interact(&self, other: &Self) -> Self {

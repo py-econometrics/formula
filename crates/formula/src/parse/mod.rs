@@ -1,4 +1,5 @@
 mod ast;
+mod expand;
 
 use crate::Role;
 use crate::fit::Fit;
@@ -153,12 +154,12 @@ fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
     .parse_next(cursor)
 }
 
-fn parse_intercept<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_intercept<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let name = take_while(1.., is_identifier_character)
         .verify(|name: &str| matches!(name, "0" | "1"))
         .parse_next(cursor)?;
 
-    let node = construction_result(cursor, ast::Expression::<K>::term(Term::intercept()))?;
+    let node = construction_result(cursor, ast::ParsedNode::<K>::from_term(Term::intercept()))?;
 
     if name == "0" {
         construction_result(cursor, node.negate())
@@ -301,20 +302,6 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     })
 }
 
-fn cartesian_product_with<L: Clone, R: Clone, O>(
-    left: &[L],
-    right: &[R],
-    combine: impl Fn(L, R) -> O,
-) -> Vec<O> {
-    let mut alternatives = Vec::new();
-    for left in left {
-        for right in right {
-            alternatives.push(combine(left.clone(), right.clone()));
-        }
-    }
-    alternatives
-}
-
 fn construction_result<T>(
     cursor: &mut &str,
     result: Result<T, ast::ConstructionError>,
@@ -324,18 +311,18 @@ fn construction_result<T>(
 
 #[cfg(test)]
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_node::<ast::Multistage>
+    parse_node::<ast::SimpleFormulaExpression>
         .map(|node| node.expand())
         .parse_next(cursor)
 }
 
-fn parse_node<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_node<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     expression(parse_operand::<K>)
         .prefix(
             preceded(multispace0, '-')
                 .value(Prefix(
                     PREFIX_PRECEDENCE,
-                    |cursor, node: ast::Expression<K>| construction_result(cursor, node.negate()),
+                    |cursor, node: ast::ParsedNode<K>| construction_result(cursor, node.negate()),
                 ))
                 .context(StrContext::Expected(StrContextValue::Description(
                     "an expression",
@@ -343,37 +330,50 @@ fn parse_node<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>
         )
         .infix(alt((
             '+'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
-                construction_result(cursor, ast::Expression::<K>::add(left, right))
+                construction_result(
+                    cursor,
+                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Add, left, right),
+                )
             })),
             '-'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
-                construction_result(cursor, ast::Expression::<K>::subtract(left, right))
+                construction_result(
+                    cursor,
+                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Subtract, left, right),
+                )
             })),
             '*'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
-                construction_result(cursor, ast::Expression::<K>::interact_fully(left, right))
+                construction_result(
+                    cursor,
+                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::InteractFully, left, right),
+                )
             })),
             '/'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
-                construction_result(cursor, ast::Expression::<K>::nest(left, right))
+                construction_result(
+                    cursor,
+                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Nest, left, right),
+                )
             })),
             ':'.value(Right(INTERACTION_PRECEDENCE, |cursor, left, right| {
-                construction_result(cursor, ast::Expression::<K>::interact(left, right))
+                construction_result(
+                    cursor,
+                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Interact, left, right),
+                )
             })),
         )))
         .postfix(alt((
             "[[".value(Postfix(
                 GROUPED_PRECEDENCE,
-                |cursor, group: ast::Expression<K>| {
+                |cursor, group: ast::ParsedNode<K>| {
                     let (first, rest) = cut_err(terminated(parse_loadings, ("]]", multispace0)))
                         .parse_next(cursor)?;
-
                     construction_result(cursor, group.grouped(false, first, rest))
                 },
             )),
             '['.value(Postfix(
                 GROUPED_PRECEDENCE,
-                |cursor, group: ast::Expression<K>| {
+                |cursor, group: ast::ParsedNode<K>| {
                     let (first, rest) = cut_err(terminated(parse_loadings, (']', multispace0)))
                         .parse_next(cursor)?;
-
                     construction_result(cursor, group.grouped(true, first, rest))
                 },
             )),
@@ -381,9 +381,9 @@ fn parse_node<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>
         .parse_next(cursor)
 }
 
-fn parse_stepwise_arguments<K: ast::Kind>(
+fn parse_stepwise_arguments<K: ast::ParseGrammar>(
     cursor: &mut &str,
-) -> ModalResult<(ast::Expression<K>, Vec<ast::Expression<K>>)> {
+) -> ModalResult<(ast::ParsedNode<K>, Vec<ast::ParsedNode<K>>)> {
     multispace0.parse_next(cursor)?;
 
     let first = cut_err(parse_node::<K>).parse_next(cursor)?;
@@ -404,7 +404,7 @@ fn parse_stepwise_arguments<K: ast::Kind>(
     Ok((first, rest))
 }
 
-fn parse_stepwise<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_stepwise<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let operator = terminated(
         alt((
             "sw0".value(StepwiseOperator::Sw0),
@@ -420,15 +420,17 @@ fn parse_stepwise<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expressio
 
     construction_result(
         cursor,
-        ast::Expression::<K>::stepwise(ast::StepwiseCall {
+        ast::ParsedNode::<K>::stepwise(ast::Stepwise {
             operator,
-            first: Box::new(first),
+            first,
             rest,
         }),
     )
 }
 
-fn parse_node_parenthesized<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_node_parenthesized<K: ast::ParseGrammar>(
+    cursor: &mut &str,
+) -> ModalResult<ast::ParsedNode<K>> {
     '('.parse_next(cursor)?;
 
     let node = cut_err(parse_node::<K>).parse_next(cursor)?;
@@ -440,13 +442,13 @@ fn parse_node_parenthesized<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast:
     )
     .parse_next(cursor)?;
 
-    Ok(ast::Expression::Parenthesized(Box::new(node)))
+    Ok(node.parenthesized())
 }
 
-fn parse_operand<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_operand<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let factor = |cursor: &mut &str| {
         let factor = parse_factor.parse_next(cursor)?;
-        construction_result(cursor, ast::Expression::<K>::term(Term::from(factor)))
+        construction_result(cursor, ast::ParsedNode::<K>::from_term(Term::from(factor)))
     };
 
     delimited(
@@ -463,7 +465,7 @@ fn parse_operand<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression
     .parse_next(cursor)
 }
 
-fn parse_multistage<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Expression<K>> {
+fn parse_multistage<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let formula = preceded(
         '[',
         cut_err(terminated(
@@ -475,64 +477,47 @@ fn parse_multistage<K: ast::Kind>(cursor: &mut &str) -> ModalResult<ast::Express
     )
     .parse_next(cursor)?;
 
-    construction_result(cursor, ast::Expression::<K>::multistage(formula))
+    construction_result(cursor, ast::ParsedNode::<K>::child(formula))
 }
 
-fn parse_formula_ast(cursor: &mut &str) -> ModalResult<Vec<Formula>> {
+fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
     let left = preceded(
         multispace0,
-        parse_node::<ast::Multistage>.context(StrContext::Label("left-hand expression")),
+        parse_node::<ast::SimpleFormulaExpression>
+            .context(StrContext::Label("left-hand expression")),
     )
     .parse_next(cursor)?;
 
-    '~'.context(StrContext::Expected(StrContextValue::CharLiteral(
-        FORMULA_SEPARATOR,
-    )))
-    .parse_next(cursor)?;
+    FORMULA_SEPARATOR
+        .context(StrContext::Expected(StrContextValue::CharLiteral(
+            FORMULA_SEPARATOR,
+        )))
+        .parse_next(cursor)?;
 
     let right = preceded(
         multispace0,
-        cut_err(parse_node::<ast::Multistage>.context(StrContext::Label("right-hand expression"))),
+        cut_err(
+            parse_node::<ast::SimpleFormulaExpression>
+                .context(StrContext::Label("right-hand expression")),
+        ),
     )
     .parse_next(cursor)?;
 
     let fixed_effects = opt(preceded(
         PIPE_SEPARATOR,
         cut_err(
-            parse_node::<ast::VaryingSlope>.context(StrContext::Label("fixed-effect expression")),
+            parse_node::<ast::GroupingExpression>
+                .try_map(|node| node.into_embedded())
+                .context(StrContext::Label("fixed-effect expression")),
         ),
     ))
     .parse_next(cursor)?;
 
-    let left = left.expand();
-    let right = right.apply_to(Expression::from(Term::intercept()));
-    let fixed_effects = fixed_effects
-        .as_ref()
-        .map(ast::Expression::<ast::VaryingSlope>::expand)
-        .unwrap_or_else(|| vec![Expression::from_iter([])]);
-
-    let expanded_left_right = cartesian_product_with(&left, &right, |left, right| (left, right));
-    let expanded_fixed_effects = cartesian_product_with(
-        &expanded_left_right,
-        &fixed_effects,
-        |(left, right), fixed_effects| {
-            let right = if fixed_effects.has_fixed_effect_intercept() {
-                right.without_intercept()
-            } else {
-                right
-            };
-
-            Formula {
-                expressions: BTreeMap::from([
-                    (Role::Dependent, left),
-                    (Role::Independent, right),
-                    (Role::FixedEffect, fixed_effects),
-                ]),
-            }
-        },
-    );
-
-    Ok(expanded_fixed_effects)
+    Ok(ast::FormulaAst {
+        left,
+        right,
+        fixed_effects,
+    })
 }
 
 pub(crate) type ParseResult<'i, T> = Result<T, ParseError<&'i str, ContextError>>;
@@ -551,6 +536,7 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
                 "a formula operator or end of input",
             ))),
         )
+        .map(|node| node.expand())
         .parse(source)?;
 
         for formula in expanded {
@@ -564,20 +550,13 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
 pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression> {
     let parser = |cursor: &mut &str| -> ModalResult<Expression> {
         let mut alternatives = match role {
-            Role::Dependent | Role::Independent => parse_node::<ast::TermQuery>(cursor)?.expand(),
+            Role::Dependent | Role::Independent => {
+                parse_node::<ast::SingleFormulaExpression>(cursor)?.expand()
+            }
             Role::FixedEffect => {
-                let alternatives = parse_node::<ast::VaryingSlope>(cursor)?.expand();
-
-                if alternatives.len() != 1 {
-                    return cut_err(fail.context(StrContext::Expected(
-                        StrContextValue::Description(
-                            "a fixed-effect query that expands to exactly one expression",
-                        ),
-                    )))
-                    .parse_next(cursor);
-                }
-
-                alternatives
+                let node = parse_node::<ast::SingleGroupingExpression>(cursor)?;
+                let expression = construction_result(cursor, node.into_embedded())?;
+                expression.expand()
             }
         };
 
@@ -699,8 +678,9 @@ mod tests {
     fn ordinary_term_queries_reject_single_argument_stepwise_calls() {
         for role in [Role::Dependent, Role::Independent] {
             let error = parse_term("sw(x)", role).unwrap_err();
-            assert!(
-                error.to_string().contains("operator is not supported"),
+            assert_eq!(
+                construction_error(error.inner()),
+                &typed::ConstructionError::Unsupported,
                 "{role:?}: {error}"
             );
         }
@@ -756,11 +736,16 @@ mod tests {
                 ("firm[[2.0]]", Scalar::from(2_f64), false),
                 ("firm[[-2.5]]", Scalar::from(-2.5_f64), false),
             ] {
-                let node = parse_node::<typed::VaryingSlope>.parse(source).unwrap();
-                let typed::Expression::Grouped(group) = node else {
+                let node = parse_node::<typed::GroupingExpression>
+                    .parse(source)
+                    .unwrap();
+                let typed::ParsedNode::Embedded(typed::ExpressionAst::Operand(group)) = node else {
                     panic!("expected grouped loadings for {source}");
                 };
-                let actual = group.first.value().expect("expected a numeric literal");
+                assert_eq!(group.loadings.len(), 1);
+                let actual = group.loadings[0]
+                    .value()
+                    .expect("expected a numeric literal");
                 assert_eq!(actual.dtype(), value.dtype(), "{source}");
                 assert_eq!(actual, &value, "{source}");
                 assert_eq!(group.intercept, intercept, "{source}");
@@ -863,7 +848,7 @@ mod tests {
                 let error = parse(&source).unwrap_err();
                 assert_eq!(
                     construction_error(error.inner()),
-                    &typed::ConstructionError::ExpectedFixedEffectGroup,
+                    &typed::ConstructionError::Unsupported,
                     "{source}: {error}",
                 );
             }
@@ -967,6 +952,29 @@ mod tests {
         }
 
         #[test]
+        fn subtraction_removes_whole_matching_children_without_entering_them() {
+            for (source, expected) in [
+                ("y ~ x + [a ~ z] - [a ~ z]", "y ~ x"),
+                ("y ~ x + [a ~ z] + [b ~ w] - (x + [a ~ z])", "y ~ [b ~ w]"),
+                (
+                    "y ~ x + [a ~ z + [b ~ w]] - [b ~ w]",
+                    "y ~ x + [a ~ z + [b ~ w]]",
+                ),
+                ("y ~ x + [a ~ z + [b ~ w]] - [a ~ z + [b ~ w]]", "y ~ x"),
+            ] {
+                assert_eq!(formula(source), formula(expected), "{source}");
+            }
+        }
+
+        #[test]
+        fn subtraction_expands_child_alternatives_before_matching() {
+            assert_eq!(
+                parse("y ~ [a ~ sw(x, z)] - [a ~ x]").unwrap(),
+                parse_many(["y ~ 1", "y ~ [a ~ z]"]).unwrap(),
+            );
+        }
+
+        #[test]
         fn stepwise_expansion_preserves_parent_child_order() {
             let actual = parse("y ~ sw(x, w) + [sw(a, b) ~ sw(z, v)] + [c ~ q]").unwrap();
             let mut expected = Vec::new();
@@ -1003,12 +1011,6 @@ mod tests {
         }
     }
 
-    fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-        parse_node::<typed::FixedEffect>
-            .map(|node| node.expand())
-            .parse_next(cursor)
-    }
-
     fn construction_error(error: &ContextError) -> &typed::ConstructionError {
         error
             .cause()
@@ -1018,200 +1020,150 @@ mod tests {
 
     mod syntax {
         use super::*;
-        use typed::{Construct, Expression as Ast, Multistage, Simple};
+        use typed::{ExpressionAst as Ast, ParsedNode, SimpleFormulaExpression};
 
-        fn assert_term(node: &Ast<Multistage>, name: &str) {
-            let Ast::Operand(term) = node else {
-                panic!("expected multistage-kind term {name}");
+        fn simple(source: &str) -> Ast<SimpleFormulaExpression> {
+            let ParsedNode::Flat(expression) =
+                parse_node::<SimpleFormulaExpression>.parse(source).unwrap()
+            else {
+                panic!("expected a flat expression for {source}");
             };
-            assert_eq!(term, &Term::from(Factor::from(name)));
+            expression
         }
 
-        fn assert_simple_term(node: &Ast<Simple>, name: &str) {
+        fn assert_term(node: &Ast<SimpleFormulaExpression>, name: &str) {
             let Ast::Operand(term) = node else {
-                panic!("expected simple term {name}");
+                panic!("expected term {name}");
             };
             assert_eq!(term, &Term::from(Factor::from(name)));
         }
 
         #[test]
-        fn parsing_preserves_formula_sections() {
-            let formulas = parse_formula_ast.parse("y ~ x | firm").unwrap();
-            assert_eq!(formulas.len(), 1);
-            assert_eq!(
-                formulas[0].expressions,
-                BTreeMap::from([
-                    (Role::Dependent, expression(&[&["y"]])),
-                    (Role::Independent, expression(&[&["x"]])),
-                    (
-                        Role::FixedEffect,
-                        crate::formula::encode_fixed_effects(expression(&[&["firm"]]), true, []),
-                    ),
-                ]),
-            );
+        fn parsing_preserves_formula_sections_and_default_group_settings() {
+            let formula = parse_formula_ast.parse("y ~ x | firm").unwrap();
+            let ParsedNode::Flat(left) = formula.left else {
+                panic!("expected flat LHS")
+            };
+            let ParsedNode::Flat(right) = formula.right else {
+                panic!("expected flat RHS")
+            };
+            assert_term(&left, "y");
+            assert_term(&right, "x");
+            let Some(Ast::Operand(group)) = formula.fixed_effects else {
+                panic!("expected a complete fixed-effect operand");
+            };
+            assert!(group.intercept);
+            assert!(group.loadings.is_empty());
+            let Ast::Operand(column) = group.group else {
+                panic!("expected a grouping column")
+            };
+            assert_eq!(column.name(), "firm");
         }
 
         #[test]
-        fn varying_slope_interactions_construct_inner_groupings() {
-            for source in [
-                "firm:year",
-                "(firm + year):sector",
-                "sw0(firm):year",
-                "csw(firm, year):sector",
+        fn child_formulas_remain_unexpanded() {
+            let ParsedNode::Embedded(Ast::Child(_, child)) = parse_node::<SimpleFormulaExpression>
+                .parse("[a ~ sw(x, z)]")
+                .unwrap()
+            else {
+                panic!("expected a child formula");
+            };
+            let ParsedNode::Flat(Ast::Stepwise(_, call)) = child.right else {
+                panic!("expected an unexpanded stepwise call");
+            };
+            assert_term(&call.first, "x");
+            assert_eq!(call.rest.len(), 1);
+            assert_term(&call.rest[0], "z");
+        }
+
+        #[test]
+        fn grouping_column_names_are_preserved() {
+            for (source, name) in [
+                ("firm", "firm"),
+                ("`log(x)`", "log(x)"),
+                ("`0`", "0"),
+                ("`1`", "1"),
+                ("0x", "0x"),
+                ("1x", "1x"),
             ] {
-                let node = parse_node::<typed::VaryingSlope>.parse(source).unwrap();
-                let Ast::Operand(Ast::Interact(_)) = &node else {
-                    panic!("expected inner grouping interaction for {source}");
+                let ParsedNode::Flat(Ast::Operand(column)) =
+                    parse_node::<typed::GroupingExpression>
+                        .parse(source)
+                        .unwrap()
+                else {
+                    panic!("expected a grouping column for {source}");
                 };
-                assert_eq!(
-                    Ast::<typed::FixedEffect>::construct(node).unwrap().expand(),
-                    parse_fixed_effects.parse(source).unwrap(),
-                    "{source}",
-                );
+                assert_eq!(column.name(), name, "{source}");
             }
         }
 
         #[test]
-        fn fixed_effect_grouping_rejects_nested_formulas_and_loadings() {
-            for (source, expected) in [
-                ("[y ~ x]", typed::ConstructionError::Unsupported),
-                ("firm[time]", typed::ConstructionError::Unsupported),
-            ] {
-                let error = parse_fixed_effects.parse(source).unwrap_err();
-                assert_eq!(construction_error(error.inner()), &expected, "{source}");
-            }
+        fn loading_postfix_wraps_the_entire_grouping_interaction() {
+            let ParsedNode::Embedded(Ast::Operand(group)) = parse_node::<typed::GroupingExpression>
+                .parse("firm:year[time]")
+                .unwrap()
+            else {
+                panic!("expected a loaded fixed-effect operand");
+            };
+            let Ast::Interact(_, operands) = group.group else {
+                panic!("expected an interaction inside the group");
+            };
+            let (Ast::Operand(left), Ast::Operand(right)) = (*operands.left, *operands.right)
+            else {
+                panic!("expected grouping columns");
+            };
+            assert_eq!((left.name(), right.name()), ("firm", "year"));
+            assert_eq!(
+                group.loadings.as_slice(),
+                &[std::sync::Arc::new(Factor::from("time"))]
+            );
+            assert!(group.intercept);
         }
 
         #[test]
         fn parsing_preserves_subtraction() {
-            let ast = parse_node::<Multistage>.parse("x - z").unwrap();
-            let Ast::Subtract(node) = ast else {
+            let Ast::Subtract(_, operands) = simple("x - z") else {
                 panic!("expected subtraction");
             };
-            assert_term(&node.left, "x");
-            assert_simple_term(&node.right, "z");
+            assert_term(&operands.left, "x");
+            assert_term(&operands.right, "z");
         }
 
         #[test]
         fn parsing_does_not_cancel_double_negation() {
-            let ast = parse_node::<Multistage>.parse("--x").unwrap();
-            let Ast::Negate(outer) = ast else {
+            let Ast::Negate(_, outer) = simple("--x") else {
                 panic!("expected outer negation");
             };
-            let Ast::Negate(inner) = outer.as_ref() else {
+            let Ast::Negate(_, inner) = *outer else {
                 panic!("expected inner negation");
             };
-            assert_simple_term(inner, "x");
+            assert_term(&inner, "x");
         }
 
         #[test]
         fn parsing_preserves_grouped_negation_in_subtraction() {
-            let ast = parse_node::<Multistage>.parse("x - (-z)").unwrap();
-            let Ast::Subtract(node) = ast else {
+            let Ast::Subtract(_, operands) = simple("x - (-z)") else {
                 panic!("expected subtraction");
             };
-            assert_term(&node.left, "x");
-            let Ast::Parenthesized(group) = node.right.as_ref() else {
-                panic!("expected group");
+            assert_term(&operands.left, "x");
+            let Ast::Parenthesized(group) = *operands.right else {
+                panic!("expected parentheses");
             };
-            let Ast::Negate(value) = group.as_ref() else {
+            let Ast::Negate(_, value) = *group else {
                 panic!("expected grouped negation");
             };
-            assert_simple_term(value, "z");
+            assert_term(&value, "z");
         }
 
         #[test]
-        fn stepwise_expansion_preserves_formula_and_argument_scope() {
-            let ast = parse_node::<Multistage>.parse("sw((x - 1), z)").unwrap();
-            let Ast::Stepwise(call) = &ast else {
+        fn parsing_preserves_stepwise_argument_scope() {
+            let Ast::Stepwise(_, call) = simple("sw((x - 1), z)") else {
                 panic!("expected stepwise call");
             };
             assert!(matches!(call.operator, StepwiseOperator::Sw));
-            assert!(matches!(call.first.as_ref(), Ast::Parenthesized(_)));
+            assert!(matches!(call.first, Ast::Parenthesized(_)));
             assert_eq!(call.rest.len(), 1);
             assert_term(&call.rest[0], "z");
-
-            let expected = parse_many(["y ~ x", "y ~ z"]).unwrap();
-            assert_eq!(
-                parse_formula_ast
-                    .parse("y ~ sw((x - 1), z)")
-                    .unwrap()
-                    .into_iter()
-                    .collect::<Formulas>(),
-                expected,
-            );
-        }
-
-        #[test]
-        fn zero_step_expansion_produces_an_empty_alternative() {
-            for source in ["sw0(x)", "csw0(x)"] {
-                let ast = parse_node::<Multistage>.parse(source).unwrap();
-                assert_eq!(ast.expand(), [expression(&[]), expression(&[&["x"]])]);
-            }
-        }
-
-        #[test]
-        fn cumulative_expansion_preserves_prefix_order_and_local_scope() {
-            let ast = parse_node::<Multistage>
-                .parse("csw(sw(a, b), sw(c, d))")
-                .unwrap();
-            let expected: &[&[&str]] = &[
-                &["a"],
-                &["b"],
-                &["a", "c"],
-                &["a", "d"],
-                &["b", "c"],
-                &["b", "d"],
-            ];
-            let expected = expected
-                .iter()
-                .map(|names| {
-                    names
-                        .iter()
-                        .map(|name| Term::from(Factor::from(*name)))
-                        .collect::<Expression>()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(ast.expand(), expected);
-
-            // The first argument removes its own intercept, not the RHS seed.
-            assert_eq!(
-                parse("y ~ csw(sw(a - 1, b - 1), sw(c, d))").unwrap(),
-                parse_many([
-                    "y ~ a",
-                    "y ~ b",
-                    "y ~ a + c",
-                    "y ~ a + d",
-                    "y ~ b + c",
-                    "y ~ b + d",
-                ])
-                .unwrap(),
-            );
-        }
-    }
-
-    #[test]
-    fn fixed_effect_expressions_preserve_grouping_and_stepwise_expansion() {
-        for (source, expected) in [
-            ("f1 + f1:f2", vec![expression(&[&["f1"], &["f1", "f2"]])]),
-            (
-                "(f1 + f2):f3",
-                vec![expression(&[&["f1", "f3"], &["f2", "f3"]])],
-            ),
-            (
-                "sw0(f1):f2",
-                vec![expression(&[]), expression(&[&["f1", "f2"]])],
-            ),
-            ("`log(x)`", vec![expression(&[&["log(x)"]])]),
-            ("`0`", vec![expression(&[&["0"]])]),
-            ("`1`", vec![expression(&[&["1"]])]),
-            ("0x + 1x", vec![expression(&[&["0x"], &["1x"]])]),
-        ] {
-            assert_eq!(
-                parse_fixed_effects.parse(source).unwrap(),
-                expected,
-                "{source}"
-            );
         }
     }
 
@@ -1234,18 +1186,13 @@ mod tests {
             "csw0(f, 1)",
             "f + 1 - 1",
         ] {
-            let error = parse_fixed_effects.parse(source).unwrap_err();
-            assert!(
-                construction_error(error.inner())
-                    == &typed::ConstructionError::ExpectedFixedEffectColumn,
-                "{source}: {error}"
-            );
-
             let formula = format!("y ~ x | {source}");
-            let error = parse(&formula).unwrap_err();
+            let error = parse_formula_ast
+                .parse(&formula)
+                .err()
+                .expect("expected fixed-effect construction failure");
             assert!(
-                construction_error(error.inner())
-                    == &typed::ConstructionError::ExpectedFixedEffectColumn,
+                construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
                 "{formula}: {error}"
             );
             assert!(
@@ -1268,15 +1215,11 @@ mod tests {
             "(firm - year)",
             "sw(firm, year * worker)",
         ] {
-            let error = parse_fixed_effects.parse(source).unwrap_err();
-            assert_eq!(
-                construction_error(error.inner()),
-                &typed::ConstructionError::Unsupported,
-                "{source}: {error}",
-            );
-
             let formula = format!("y ~ x | {source}");
-            let error = parse(&formula).unwrap_err();
+            let error = parse_formula_ast
+                .parse(&formula)
+                .err()
+                .expect("expected fixed-effect construction failure");
             assert_eq!(
                 construction_error(error.inner()),
                 &typed::ConstructionError::Unsupported,
@@ -1299,15 +1242,15 @@ mod tests {
             "sw(f, log(x))",
             "f + log(x) - log(x)",
         ] {
-            assert!(parse_fixed_effects.parse(source).is_err(), "{source}");
             let formula = format!("y ~ x | {source}");
-            assert!(parse(&formula).is_err(), "{formula}");
+            assert!(parse_formula_ast.parse(&formula).is_err(), "{formula}");
         }
     }
 
     #[test]
-    fn fixed_effect_pipe_expands_stepwise_alternatives_across_roles() {
+    fn fixed_effect_pipe_expands_groupings_and_stepwise_alternatives() {
         let cases: &[(&str, &[&str])] = &[
+            ("y ~ x | (f1 + f2):f3", &["y ~ x | f1:f3 + f2:f3"]),
             ("y ~ x | sw0(f)", &["y ~ x", "y ~ x | f"]),
             (
                 "y ~ x | csw0(f1, f2)",
@@ -1400,6 +1343,15 @@ mod tests {
                 "{source}: {error}"
             );
         }
+    }
+
+    fn single_expression(source: &str) -> Expression {
+        let [expression]: [_; 1] = parse_expression
+            .parse(source)
+            .unwrap()
+            .try_into()
+            .expect("expected one expression");
+        expression
     }
 
     fn expression(terms: &[&[&str]]) -> Expression {
@@ -1636,14 +1588,8 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| {
-                    let [expected]: [_; 1] = parse_expression
-                        .parse(source)
-                        .unwrap()
-                        .try_into()
-                        .expect("expected one expression");
-                    expected
-                })
+                .copied()
+                .map(single_expression)
                 .collect::<Vec<_>>();
             assert_eq!(
                 parse_expression.parse(source).unwrap(),
@@ -1674,14 +1620,8 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| {
-                    let [expected]: [_; 1] = parse_expression
-                        .parse(source)
-                        .unwrap()
-                        .try_into()
-                        .expect("expected one expression");
-                    expected
-                })
+                .copied()
+                .map(single_expression)
                 .collect::<Vec<_>>();
             assert_eq!(
                 parse_expression.parse(source).unwrap(),
@@ -1710,13 +1650,9 @@ mod tests {
         ];
 
         for &(source, expected) in cases {
-            let expected = expected
-                .iter()
-                .map(|source| parse(source).unwrap().iter().next().unwrap().clone())
-                .collect::<Vec<_>>();
             assert_eq!(
-                super::parse(source).unwrap(),
-                Formulas::new(expected),
+                parse(source).unwrap(),
+                parse_many(expected.iter().copied()).unwrap(),
                 "{source}"
             );
         }
@@ -1754,13 +1690,9 @@ mod tests {
         ];
 
         for &(source, expected) in cases {
-            let expected = expected
-                .iter()
-                .map(|source| parse(source).unwrap().iter().next().unwrap().clone())
-                .collect::<Vec<_>>();
             assert_eq!(
-                super::parse(source).unwrap(),
-                Formulas::new(expected),
+                parse(source).unwrap(),
+                parse_many(expected.iter().copied()).unwrap(),
                 "{source}"
             );
         }
@@ -2140,73 +2072,6 @@ mod tests {
         }
     }
 
-    mod expansion {
-        use super::*;
-
-        #[test]
-        fn local_expansion_and_application_preserve_sign_and_group_scope() {
-            for (source, local, applied) in [
-                ("--x", expression(&[&["x"]]), expression(&[&[], &["x"]])),
-                ("-(-x)", expression(&[]), expression(&[&[]])),
-                (
-                    "x - -z",
-                    expression(&[&["x"], &["z"]]),
-                    expression(&[&[], &["x"], &["z"]]),
-                ),
-                (
-                    "x - (-z)",
-                    expression(&[&["x"]]),
-                    expression(&[&[], &["x"]]),
-                ),
-                (
-                    "x - 1 - -1",
-                    expression(&[&["x"], &[]]),
-                    expression(&[&["x"], &[]]),
-                ),
-                ("x - 1 - (-1)", expression(&[&["x"]]), expression(&[&["x"]])),
-            ] {
-                let node = parse_node::<typed::Multistage>.parse(source).unwrap();
-                assert_eq!(node.expand(), [local], "{source}");
-                assert_eq!(
-                    node.apply_to(Expression::from(Term::intercept())),
-                    [applied],
-                    "{source}",
-                );
-            }
-        }
-
-        #[test]
-        fn stepwise_expands_directly_without_an_intermediate_ast() {
-            let stepwise = parse_node::<typed::Multistage>.parse("sw(x, z)").unwrap();
-            assert_eq!(
-                stepwise.expand(),
-                [expression(&[&["x"]]), expression(&[&["z"]])]
-            );
-        }
-
-        #[test]
-        fn expansion_preserves_signs_and_grouping() {
-            type Ast = typed::Expression<typed::Multistage>;
-            let x = || Ast::term(Term::from(Factor::from("x"))).unwrap();
-            let intercept = || Ast::term(Term::intercept()).unwrap();
-            let removed = || Ast::subtract(x(), intercept()).unwrap();
-            let seed = Expression::from(Term::intercept());
-
-            assert_eq!(removed().apply_to(seed.clone()), [expression(&[&["x"]])]);
-
-            let grouped = Ast::Parenthesized(Box::new(removed()));
-            assert_eq!(grouped.apply_to(seed.clone()), [expression(&[&[], &["x"]])]);
-
-            let restored = Ast::add(removed(), intercept()).unwrap();
-            assert_eq!(restored.apply_to(seed), [expression(&[&["x"], &[]])]);
-
-            assert_eq!(
-                intercept().negate().unwrap().negate().unwrap().expand(),
-                [expression(&[&[]])],
-            );
-        }
-    }
-
     mod errors {
         use super::*;
 
@@ -2219,27 +2084,24 @@ mod tests {
                 "y ~ [a ~ z] : x",
                 "y ~ x / [a ~ z]",
                 "y ~ [a ~ z] / x",
-                "y ~ x - [a ~ z]",
                 "y ~ -[a ~ z]",
                 "y ~ --[a ~ z]",
                 "y ~ x - -[a ~ z]",
                 "y ~ x * ([a ~ z] + w)",
                 "y ~ ([a ~ z] + w) : x",
-                "y ~ x - (w + [a ~ z])",
                 "y ~ -([a ~ z] + w)",
                 "y ~ x * sw(w, [a ~ z])",
                 "y ~ x / sw0([a ~ z])",
-                "y ~ x - csw(w, [a ~ z])",
                 "y ~ -sw([a ~ z], w)",
                 "y ~ x + [a ~ z * [b ~ w]]",
             ] {
-                // Construction must reject arithmetic on child formulas.
+                // Construction rejects operations forbidden for multistage expressions.
                 let error = parse_formula_ast
                     .parse(source)
-                    .expect_err("expected construction failure");
+                    .err()
+                    .expect("expected construction failure");
                 assert!(
-                    construction_error(error.inner())
-                        == &typed::ConstructionError::MultistageArithmetic,
+                    construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
                     "{source}: {error}"
                 );
             }
@@ -2440,37 +2302,32 @@ mod tests {
             for source in ["`", "`income", "`a``", "```", "log(`income)", "x + `income"] {
                 assert!(parse_expression.parse(source).is_err(), "{source}");
             }
-            assert!(parse("y ~ `income").is_err());
         }
 
         #[test]
         fn stepwise_calls_reject_malformed_arguments_and_name_spacing() {
-            for name in ["sw", "sw0", "csw", "csw0"] {
-                for arguments in [
-                    "()", "( )", "(,x)", "(x,)", "(x,,y)", "(x", "(x))", "(x +)", "(x y)", " (x)",
-                ] {
-                    let source = format!("y ~ {name}{arguments}");
-                    assert!(super::parse(&source).is_err(), "{source}");
-                }
-            }
             for source in [
+                "y ~ sw( )",
+                "y ~ sw(,x)",
+                "y ~ sw(x,,y)",
+                "y ~ sw(x))",
+                "y ~ sw(x +)",
                 "y ~ sw(x, sw())",
                 "y ~ log(sw(x, z))",
                 "y ~ sw(x, reference=1)",
             ] {
-                assert!(super::parse(source).is_err(), "{source}");
+                assert!(parse(source).is_err(), "{source}");
+            }
+            for name in ["sw", "sw0", "csw", "csw0"] {
+                let source = format!("y ~ {name} (x)");
+                assert!(parse(&source).is_err(), "{source}");
             }
         }
 
         #[test]
         fn invalid_transform_calls_are_rejected() {
             for source in [
-                "unknown(x)",
                 "C (x)",
-                "log(x, reference=1)",
-                "C(reference=1, x)",
-                "C(x, reference=1, reference=2)",
-                "C(x, unknown=1)",
                 "C(x, reference=1 2)",
                 "C(x, reference=tr ue)",
                 "F(x)",
