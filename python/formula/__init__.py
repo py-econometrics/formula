@@ -12,6 +12,7 @@ from ._formula import (
     Formulas,
     Role,
     TransformCall,
+    TransformState,
 )
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "Formulas",
     "Role",
     "TransformCall",
+    "TransformState",
     "parse",
 ]
 
