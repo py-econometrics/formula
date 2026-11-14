@@ -154,7 +154,7 @@ fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
     .parse_next(cursor)
 }
 
-fn parse_intercept<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_intercept<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let name = take_while(1.., is_identifier_character)
         .verify(|name: &str| matches!(name, "0" | "1"))
         .parse_next(cursor)?;
@@ -316,7 +316,7 @@ pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>
         .parse_next(cursor)
 }
 
-fn parse_node<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_node<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     expression(parse_operand::<K>)
         .prefix(
             preceded(multispace0, '-')
@@ -381,7 +381,7 @@ fn parse_node<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::ParsedNo
         .parse_next(cursor)
 }
 
-fn parse_stepwise_arguments<K: ast::ParseKind>(
+fn parse_stepwise_arguments<K: ast::ParseGrammar>(
     cursor: &mut &str,
 ) -> ModalResult<(ast::ParsedNode<K>, Vec<ast::ParsedNode<K>>)> {
     multispace0.parse_next(cursor)?;
@@ -404,7 +404,7 @@ fn parse_stepwise_arguments<K: ast::ParseKind>(
     Ok((first, rest))
 }
 
-fn parse_stepwise<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_stepwise<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let operator = terminated(
         alt((
             "sw0".value(StepwiseOperator::Sw0),
@@ -428,7 +428,7 @@ fn parse_stepwise<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::Pars
     )
 }
 
-fn parse_node_parenthesized<K: ast::ParseKind>(
+fn parse_node_parenthesized<K: ast::ParseGrammar>(
     cursor: &mut &str,
 ) -> ModalResult<ast::ParsedNode<K>> {
     '('.parse_next(cursor)?;
@@ -445,7 +445,7 @@ fn parse_node_parenthesized<K: ast::ParseKind>(
     Ok(node.parenthesized())
 }
 
-fn parse_operand<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_operand<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let factor = |cursor: &mut &str| {
         let factor = parse_factor.parse_next(cursor)?;
         construction_result(cursor, ast::ParsedNode::<K>::from_term(Term::from(factor)))
@@ -465,7 +465,7 @@ fn parse_operand<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::Parse
     .parse_next(cursor)
 }
 
-fn parse_multistage<K: ast::ParseKind>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_multistage<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let formula = preceded(
         '[',
         cut_err(terminated(

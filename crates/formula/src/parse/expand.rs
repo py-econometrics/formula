@@ -1,6 +1,6 @@
 use crate::parse::ast::{
-    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParseKind, ParsedNode,
-    StepwiseOperator,
+    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParseGrammar,
+    ParsedNode, StepwiseOperator,
 };
 use crate::{Factor, formula};
 
@@ -251,7 +251,7 @@ where
     }
 }
 
-impl<K: ParseKind> ParsedNode<K>
+impl<K: ParseGrammar> ParsedNode<K>
 where
     K::Operand: OperandExpansion,
     <K::Embedded as ExpressionKind>::Operand: OperandExpansion,

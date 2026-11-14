@@ -279,60 +279,46 @@ impl ExpressionKind for SingleFixedEffectExpression {
 }
 
 /// Defines an [`ExpressionKind`] with its embedded counterpart
-pub(super) trait ParseKind: ExpressionKind<Operand: TryFrom<crate::Term>> {
+pub(super) trait ParseGrammar: ExpressionKind<Operand: TryFrom<crate::Term>> {
     type Embedded: ExpressionKind<Operand: TryFrom<ExpressionAst<Self>>>;
 
     fn grouped(
-        _group: ExpressionAst<Self>,
-        _intercept: bool,
-        _loadings: Vec<Arc<Factor>>,
+        _group: FixedEffectGroup<Self>,
     ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
         Err(ConstructionError::Unsupported)
     }
 }
 
-impl ParseKind for SingleFormulaExpression {
+impl ParseGrammar for SingleFormulaExpression {
     type Embedded = Forbidden;
 }
 
-impl ParseKind for SimpleFormulaExpression {
+impl ParseGrammar for SimpleFormulaExpression {
     type Embedded = MultistageFormulaExpression;
 }
 
-impl ParseKind for GroupingExpression {
+impl ParseGrammar for GroupingExpression {
     type Embedded = FixedEffectExpression;
 
     fn grouped(
-        group: ExpressionAst<Self>,
-        intercept: bool,
-        loadings: Vec<Arc<Factor>>,
+        group: FixedEffectGroup<Self>,
     ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Ok(ExpressionAst::Operand(FixedEffectGroup {
-            group,
-            intercept,
-            loadings,
-        }))
+        Ok(ExpressionAst::Operand(group))
     }
 }
 
-impl ParseKind for SingleGroupingExpression {
+impl ParseGrammar for SingleGroupingExpression {
     type Embedded = SingleFixedEffectExpression;
 
     fn grouped(
-        group: ExpressionAst<Self>,
-        intercept: bool,
-        loadings: Vec<Arc<Factor>>,
+        group: FixedEffectGroup<Self>,
     ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Ok(ExpressionAst::Operand(FixedEffectGroup {
-            group,
-            intercept,
-            loadings,
-        }))
+        Ok(ExpressionAst::Operand(group))
     }
 }
 
 /// Homogeneous result returned by the Pratt parser.
-pub(super) enum ParsedNode<K: ParseKind> {
+pub(super) enum ParsedNode<K: ParseGrammar> {
     Flat(ExpressionAst<K>),
     Embedded(ExpressionAst<K::Embedded>),
 }
@@ -346,7 +332,7 @@ pub(super) struct FormulaAst {
     pub(super) fixed_effects: Option<ExpressionAst<FixedEffectExpression>>,
 }
 
-impl<K: ParseKind> ParsedNode<K> {
+impl<K: ParseGrammar> ParsedNode<K> {
     fn into_flat(self) -> Result<ExpressionAst<K>, ConstructionError> {
         match self {
             Self::Flat(expression) => Ok(expression),
@@ -420,10 +406,13 @@ impl<K: ParseKind> ParsedNode<K> {
         first: Arc<Factor>,
         rest: Vec<Arc<Factor>>,
     ) -> Result<Self, ConstructionError> {
-        let group = self.into_flat()?;
-        let loadings = std::iter::once(first).chain(rest).collect();
+        let group = FixedEffectGroup {
+            group: self.into_flat()?,
+            intercept,
+            loadings: std::iter::once(first).chain(rest).collect(),
+        };
 
-        K::grouped(group, intercept, loadings).map(Self::Embedded)
+        K::grouped(group).map(Self::Embedded)
     }
 
     pub(super) fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError> {
