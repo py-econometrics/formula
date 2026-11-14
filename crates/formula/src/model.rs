@@ -540,6 +540,16 @@ mod tests {
                     };
                     let encoding = group.transform().unwrap();
                     assert_eq!(encoding.name(), "F");
+                    let state = encoding.state().expect("fitted encoder exposes its state");
+                    let Some(crate::StateValue::DataFrame(codes)) = state.get("codes") else {
+                        panic!("expected the fitted code table");
+                    };
+                    let Some(crate::StateValue::DataFrame(levels)) = state.get("levels") else {
+                        panic!("expected the fitted level table");
+                    };
+                    let expected_codes = polars::df!("code" => [0_u32, 1, 2]).unwrap();
+                    assert!(codes.equals_missing(&expected_codes));
+                    assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
                     assert_eq!(
                         encoding
                             .inputs()
