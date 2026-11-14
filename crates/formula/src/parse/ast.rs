@@ -461,3 +461,63 @@ impl<K: ParseKind> ParsedNode<K> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Node = ParsedNode<GroupingExpression>;
+
+    fn column(name: &str) -> Node {
+        Node::from_term(crate::Term::from(Factor::from(name))).unwrap()
+    }
+
+    fn loaded() -> Node {
+        column("year")
+            .grouped(false, Arc::new(Factor::from("time")), Vec::new())
+            .unwrap()
+    }
+
+    #[test]
+    fn mixed_binary_wraps_the_flat_subtree_with_default_group_settings() {
+        let flat =
+            Node::binary(BinaryOperator::Interact, column("firm"), column("sector")).unwrap();
+        let Node::Embedded(ExpressionAst::Add(_, operands)) =
+            Node::binary(BinaryOperator::Add, flat, loaded()).unwrap()
+        else {
+            panic!("expected embedded addition");
+        };
+        let (ExpressionAst::Operand(left), ExpressionAst::Operand(right)) =
+            (*operands.left, *operands.right)
+        else {
+            panic!("expected complete group operands");
+        };
+        assert!(matches!(left.group, ExpressionAst::Interact(_, _)));
+        assert!(left.intercept);
+        assert!(left.loadings.is_empty());
+        assert!(!right.intercept);
+        assert_eq!(right.loadings, vec![Arc::new(Factor::from("time"))]);
+    }
+
+    #[test]
+    fn mixed_stepwise_wraps_flat_arguments_and_preserves_loaded_arguments() {
+        let Node::Embedded(ExpressionAst::Stepwise(_, call)) = Node::stepwise(Stepwise {
+            operator: StepwiseOperator::Sw,
+            first: column("firm"),
+            rest: vec![loaded()],
+        })
+        .unwrap() else {
+            panic!("expected embedded stepwise call");
+        };
+        let ExpressionAst::Operand(first) = &call.first else {
+            panic!("expected a complete first group");
+        };
+        let [ExpressionAst::Operand(second)] = call.rest.as_slice() else {
+            panic!("expected one loaded alternative");
+        };
+        assert!(first.intercept);
+        assert!(first.loadings.is_empty());
+        assert!(!second.intercept);
+        assert_eq!(second.loadings, vec![Arc::new(Factor::from("time"))]);
+    }
+}

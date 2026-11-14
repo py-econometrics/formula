@@ -273,3 +273,91 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::ast::{
+        Binary, MultistageFormulaExpression, Permitted, SimpleFormulaExpression,
+    };
+
+    type Ast = ExpressionAst<SimpleFormulaExpression>;
+
+    fn term(name: &str) -> formula::Term {
+        formula::Term::from(Factor::from(name))
+    }
+
+    fn operand(name: &str) -> Ast {
+        Ast::Operand(term(name))
+    }
+
+    fn negate(value: Ast) -> Ast {
+        Ast::Negate(Permitted, Box::new(value))
+    }
+
+    fn subtract(left: Ast, right: Ast) -> Ast {
+        Ast::Subtract(Permitted, Binary::new(left, right))
+    }
+
+    fn parenthesized(value: Ast) -> Ast {
+        Ast::Parenthesized(Box::new(value))
+    }
+
+    fn value(terms: impl IntoIterator<Item = formula::Term>) -> formula::Expression {
+        terms.into_iter().collect()
+    }
+
+    #[test]
+    fn negation_and_parentheses_preserve_subtraction_scope() {
+        for (node, local, applied) in [
+            (
+                negate(negate(operand("x"))),
+                value([term("x")]),
+                value([formula::Term::intercept(), term("x")]),
+            ),
+            (
+                negate(parenthesized(negate(operand("x")))),
+                value([]),
+                value([formula::Term::intercept()]),
+            ),
+            (
+                subtract(operand("x"), negate(operand("z"))),
+                value([term("x"), term("z")]),
+                value([formula::Term::intercept(), term("x"), term("z")]),
+            ),
+            (
+                subtract(operand("x"), parenthesized(negate(operand("z")))),
+                value([term("x")]),
+                value([formula::Term::intercept(), term("x")]),
+            ),
+        ] {
+            assert_eq!(node.expand(), [local]);
+            assert_eq!(
+                node.apply_to(value([formula::Term::intercept()])),
+                [applied]
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_simple_expressions_are_transparent_until_parenthesized() {
+        type Embedded = ExpressionAst<MultistageFormulaExpression>;
+        let removed = || subtract(operand("x"), Ast::Operand(formula::Term::intercept()));
+        let seed = value([formula::Term::intercept()]);
+        let node = Embedded::Operand(removed());
+        assert_eq!(node.apply_to(seed.clone()), [value([term("x")])]);
+
+        let grouped = Embedded::Parenthesized(Box::new(node));
+        assert_eq!(
+            grouped.apply_to(seed.clone()),
+            [value([formula::Term::intercept(), term("x")])]
+        );
+
+        // Subtracting an embedded negation adds its operand to the accumulator.
+        let negated = Embedded::Operand(negate(operand("x")));
+        assert_eq!(
+            negated.subtract_from(seed),
+            [value([formula::Term::intercept(), term("x")])]
+        );
+    }
+}

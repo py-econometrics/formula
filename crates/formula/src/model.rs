@@ -1155,7 +1155,7 @@ mod tests {
         }
 
         #[test]
-        fn queries_reject_unsupported_shapes_and_multiple_alternatives() {
+        fn queries_reject_unsupported_shapes_and_stepwise_calls() {
             let data = polars::df!(
                 "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"],
             )
@@ -1169,6 +1169,9 @@ mod tests {
                 ("x + (sw0(x))", Role::Independent),
                 ("g*g", Role::FixedEffect),
                 ("sw(g, g)", Role::FixedEffect),
+                ("sw(g)", Role::FixedEffect),
+                ("sw(g)[x]", Role::FixedEffect),
+                ("sw(g[x])", Role::FixedEffect),
             ] {
                 assert!(
                     matches!(
@@ -1178,17 +1181,6 @@ mod tests {
                     "{query}"
                 );
             }
-            // Fixed-effect queries retain the interim single-alternative behavior.
-            let selected = model.select_terms("sw(g)", Role::FixedEffect).unwrap();
-            assert!(
-                selected.frame().unwrap().equals_missing(
-                    &model
-                        .select_terms("g", Role::FixedEffect)
-                        .unwrap()
-                        .frame()
-                        .unwrap()
-                )
-            );
         }
     }
 

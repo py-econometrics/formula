@@ -678,8 +678,9 @@ mod tests {
     fn ordinary_term_queries_reject_single_argument_stepwise_calls() {
         for role in [Role::Dependent, Role::Independent] {
             let error = parse_term("sw(x)", role).unwrap_err();
-            assert!(
-                error.to_string().contains("operator is not supported"),
+            assert_eq!(
+                construction_error(error.inner()),
+                &typed::ConstructionError::Unsupported,
                 "{role:?}: {error}"
             );
         }
@@ -735,13 +736,16 @@ mod tests {
                 ("firm[[2.0]]", Scalar::from(2_f64), false),
                 ("firm[[-2.5]]", Scalar::from(-2.5_f64), false),
             ] {
-                let node = parse_node::<typed::FixedEffectExpression>
+                let node = parse_node::<typed::GroupingExpression>
                     .parse(source)
                     .unwrap();
-                let typed::ExpressionAst::Grouped(group) = node else {
+                let typed::ParsedNode::Embedded(typed::ExpressionAst::Operand(group)) = node else {
                     panic!("expected grouped loadings for {source}");
                 };
-                let actual = group.first.value().expect("expected a numeric literal");
+                assert_eq!(group.loadings.len(), 1);
+                let actual = group.loadings[0]
+                    .value()
+                    .expect("expected a numeric literal");
                 assert_eq!(actual.dtype(), value.dtype(), "{source}");
                 assert_eq!(actual, &value, "{source}");
                 assert_eq!(group.intercept, intercept, "{source}");
@@ -844,7 +848,7 @@ mod tests {
                 let error = parse(&source).unwrap_err();
                 assert_eq!(
                     construction_error(error.inner()),
-                    &typed::ConstructionError::ExpectedFixedEffectGroup,
+                    &typed::ConstructionError::Unsupported,
                     "{source}: {error}",
                 );
             }
@@ -948,6 +952,29 @@ mod tests {
         }
 
         #[test]
+        fn subtraction_removes_whole_matching_children_without_entering_them() {
+            for (source, expected) in [
+                ("y ~ x + [a ~ z] - [a ~ z]", "y ~ x"),
+                ("y ~ x + [a ~ z] + [b ~ w] - (x + [a ~ z])", "y ~ [b ~ w]"),
+                (
+                    "y ~ x + [a ~ z + [b ~ w]] - [b ~ w]",
+                    "y ~ x + [a ~ z + [b ~ w]]",
+                ),
+                ("y ~ x + [a ~ z + [b ~ w]] - [a ~ z + [b ~ w]]", "y ~ x"),
+            ] {
+                assert_eq!(formula(source), formula(expected), "{source}");
+            }
+        }
+
+        #[test]
+        fn subtraction_expands_child_alternatives_before_matching() {
+            assert_eq!(
+                parse("y ~ [a ~ sw(x, z)] - [a ~ x]").unwrap(),
+                parse_many(["y ~ 1", "y ~ [a ~ z]"]).unwrap(),
+            );
+        }
+
+        #[test]
         fn stepwise_expansion_preserves_parent_child_order() {
             let actual = parse("y ~ sw(x, w) + [sw(a, b) ~ sw(z, v)] + [c ~ q]").unwrap();
             let mut expected = Vec::new();
@@ -999,191 +1026,129 @@ mod tests {
 
     mod syntax {
         use super::*;
-        use typed::{
-            Construct, ExpressionAst as Ast, MultistageFormulaExpression, SimpleFormulaExpression,
-        };
+        use typed::{ExpressionAst as Ast, ParsedNode, SimpleFormulaExpression};
 
-        fn assert_term(node: &Ast<MultistageFormulaExpression>, name: &str) {
-            let Ast::Operand(term) = node else {
-                panic!("expected multistage-kind term {name}");
+        fn simple(source: &str) -> Ast<SimpleFormulaExpression> {
+            let ParsedNode::Flat(expression) =
+                parse_node::<SimpleFormulaExpression>.parse(source).unwrap()
+            else {
+                panic!("expected a flat expression for {source}");
             };
-            assert_eq!(term, &Term::from(Factor::from(name)));
+            expression
         }
 
-        fn assert_simple_term(node: &Ast<SimpleFormulaExpression>, name: &str) {
+        fn assert_term(node: &Ast<SimpleFormulaExpression>, name: &str) {
             let Ast::Operand(term) = node else {
-                panic!("expected simple term {name}");
+                panic!("expected term {name}");
             };
             assert_eq!(term, &Term::from(Factor::from(name)));
         }
 
         #[test]
-        fn parsing_preserves_formula_sections() {
-            let formulas = parse_formula_ast.parse("y ~ x | firm").unwrap();
-            assert_eq!(formulas.len(), 1);
+        fn parsing_preserves_formula_sections_and_default_group_settings() {
+            let formula = parse_formula_ast.parse("y ~ x | firm").unwrap();
+            let ParsedNode::Flat(left) = formula.left else {
+                panic!("expected flat LHS")
+            };
+            let ParsedNode::Flat(right) = formula.right else {
+                panic!("expected flat RHS")
+            };
+            assert_term(&left, "y");
+            assert_term(&right, "x");
+            let Some(Ast::Operand(group)) = formula.fixed_effects else {
+                panic!("expected a complete fixed-effect operand");
+            };
+            assert!(group.intercept);
+            assert!(group.loadings.is_empty());
+            let Ast::Operand(column) = group.group else {
+                panic!("expected a grouping column")
+            };
+            assert_eq!(column.name(), "firm");
+        }
+
+        #[test]
+        fn child_formulas_remain_unexpanded() {
+            let ParsedNode::Embedded(Ast::Child(_, child)) = parse_node::<SimpleFormulaExpression>
+                .parse("[a ~ sw(x, z)]")
+                .unwrap()
+            else {
+                panic!("expected a child formula");
+            };
+            let ParsedNode::Flat(Ast::Stepwise(_, call)) = child.right else {
+                panic!("expected an unexpanded stepwise call");
+            };
+            assert_term(&call.first, "x");
+            assert_eq!(call.rest.len(), 1);
+            assert_term(&call.rest[0], "z");
+        }
+
+        #[test]
+        fn loading_postfix_wraps_the_entire_grouping_interaction() {
+            let ParsedNode::Embedded(Ast::Operand(group)) = parse_node::<typed::GroupingExpression>
+                .parse("firm:year[time]")
+                .unwrap()
+            else {
+                panic!("expected a loaded fixed-effect operand");
+            };
+            let Ast::Interact(_, operands) = group.group else {
+                panic!("expected an interaction inside the group");
+            };
+            let (Ast::Operand(left), Ast::Operand(right)) = (*operands.left, *operands.right)
+            else {
+                panic!("expected grouping columns");
+            };
+            assert_eq!((left.name(), right.name()), ("firm", "year"));
             assert_eq!(
-                formulas[0].expressions,
-                BTreeMap::from([
-                    (Role::Dependent, expression(&[&["y"]])),
-                    (Role::Independent, expression(&[&["x"]])),
-                    (
-                        Role::FixedEffect,
-                        crate::formula::encode_fixed_effects(expression(&[&["firm"]]), true, []),
-                    ),
-                ]),
+                group.loadings.as_slice(),
+                &[std::sync::Arc::new(Factor::from("time"))]
             );
-        }
-
-        #[test]
-        fn varying_slope_interactions_construct_inner_groupings() {
-            for source in [
-                "firm:year",
-                "(firm + year):sector",
-                "sw0(firm):year",
-                "csw(firm, year):sector",
-            ] {
-                let node = parse_node::<typed::FixedEffectExpression>
-                    .parse(source)
-                    .unwrap();
-                let Ast::Operand(Ast::Interact(_)) = &node else {
-                    panic!("expected inner grouping interaction for {source}");
-                };
-                assert_eq!(
-                    Ast::<typed::GroupingExpression>::construct(node)
-                        .unwrap()
-                        .expand(),
-                    parse_fixed_effects.parse(source).unwrap(),
-                    "{source}",
-                );
-            }
-        }
-
-        #[test]
-        fn fixed_effect_grouping_rejects_nested_formulas_and_loadings() {
-            for (source, expected) in [
-                ("[y ~ x]", typed::ConstructionError::Unsupported),
-                ("firm[time]", typed::ConstructionError::Unsupported),
-            ] {
-                let error = parse_fixed_effects.parse(source).unwrap_err();
-                assert_eq!(construction_error(error.inner()), &expected, "{source}");
-            }
+            assert!(group.intercept);
         }
 
         #[test]
         fn parsing_preserves_subtraction() {
-            let ast = parse_node::<MultistageFormulaExpression>
-                .parse("x - z")
-                .unwrap();
-            let Ast::Subtract(node) = ast else {
+            let Ast::Subtract(_, operands) = simple("x - z") else {
                 panic!("expected subtraction");
             };
-            assert_term(&node.left, "x");
-            assert_simple_term(&node.right, "z");
+            assert_term(&operands.left, "x");
+            assert_term(&operands.right, "z");
         }
 
         #[test]
         fn parsing_does_not_cancel_double_negation() {
-            let ast = parse_node::<MultistageFormulaExpression>
-                .parse("--x")
-                .unwrap();
-            let Ast::Negate(outer) = ast else {
+            let Ast::Negate(_, outer) = simple("--x") else {
                 panic!("expected outer negation");
             };
-            let Ast::Negate(inner) = outer.as_ref() else {
+            let Ast::Negate(_, inner) = *outer else {
                 panic!("expected inner negation");
             };
-            assert_simple_term(inner, "x");
+            assert_term(&inner, "x");
         }
 
         #[test]
         fn parsing_preserves_grouped_negation_in_subtraction() {
-            let ast = parse_node::<MultistageFormulaExpression>
-                .parse("x - (-z)")
-                .unwrap();
-            let Ast::Subtract(node) = ast else {
+            let Ast::Subtract(_, operands) = simple("x - (-z)") else {
                 panic!("expected subtraction");
             };
-            assert_term(&node.left, "x");
-            let Ast::Parenthesized(group) = node.right.as_ref() else {
-                panic!("expected group");
+            assert_term(&operands.left, "x");
+            let Ast::Parenthesized(group) = *operands.right else {
+                panic!("expected parentheses");
             };
-            let Ast::Negate(value) = group.as_ref() else {
+            let Ast::Negate(_, value) = *group else {
                 panic!("expected grouped negation");
             };
-            assert_simple_term(value, "z");
+            assert_term(&value, "z");
         }
 
         #[test]
-        fn stepwise_expansion_preserves_formula_and_argument_scope() {
-            let ast = parse_node::<MultistageFormulaExpression>
-                .parse("sw((x - 1), z)")
-                .unwrap();
-            let Ast::Stepwise(call) = &ast else {
+        fn parsing_preserves_stepwise_argument_scope() {
+            let Ast::Stepwise(_, call) = simple("sw((x - 1), z)") else {
                 panic!("expected stepwise call");
             };
             assert!(matches!(call.operator, StepwiseOperator::Sw));
-            assert!(matches!(call.first.as_ref(), Ast::Parenthesized(_)));
+            assert!(matches!(call.first, Ast::Parenthesized(_)));
             assert_eq!(call.rest.len(), 1);
             assert_term(&call.rest[0], "z");
-
-            let expected = parse_many(["y ~ x", "y ~ z"]).unwrap();
-            assert_eq!(
-                parse_formula_ast
-                    .parse("y ~ sw((x - 1), z)")
-                    .unwrap()
-                    .into_iter()
-                    .collect::<Formulas>(),
-                expected,
-            );
-        }
-
-        #[test]
-        fn zero_step_expansion_produces_an_empty_alternative() {
-            for source in ["sw0(x)", "csw0(x)"] {
-                let ast = parse_node::<MultistageFormulaExpression>
-                    .parse(source)
-                    .unwrap();
-                assert_eq!(ast.expand(), [expression(&[]), expression(&[&["x"]])]);
-            }
-        }
-
-        #[test]
-        fn cumulative_expansion_preserves_prefix_order_and_local_scope() {
-            let ast = parse_node::<MultistageFormulaExpression>
-                .parse("csw(sw(a, b), sw(c, d))")
-                .unwrap();
-            let expected: &[&[&str]] = &[
-                &["a"],
-                &["b"],
-                &["a", "c"],
-                &["a", "d"],
-                &["b", "c"],
-                &["b", "d"],
-            ];
-            let expected = expected
-                .iter()
-                .map(|names| {
-                    names
-                        .iter()
-                        .map(|name| Term::from(Factor::from(*name)))
-                        .collect::<Expression>()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(ast.expand(), expected);
-
-            // The first argument removes its own intercept, not the RHS seed.
-            assert_eq!(
-                parse("y ~ csw(sw(a - 1, b - 1), sw(c, d))").unwrap(),
-                parse_many([
-                    "y ~ a",
-                    "y ~ b",
-                    "y ~ a + c",
-                    "y ~ a + d",
-                    "y ~ b + c",
-                    "y ~ b + d",
-                ])
-                .unwrap(),
-            );
         }
     }
 
@@ -1233,16 +1198,14 @@ mod tests {
         ] {
             let error = parse_fixed_effects.parse(source).unwrap_err();
             assert!(
-                construction_error(error.inner())
-                    == &typed::ConstructionError::ExpectedFixedEffectColumn,
+                construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
                 "{source}: {error}"
             );
 
             let formula = format!("y ~ x | {source}");
             let error = parse(&formula).unwrap_err();
             assert!(
-                construction_error(error.inner())
-                    == &typed::ConstructionError::ExpectedFixedEffectColumn,
+                construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
                 "{formula}: {error}"
             );
             assert!(
@@ -2137,77 +2100,6 @@ mod tests {
         }
     }
 
-    mod expansion {
-        use super::*;
-
-        #[test]
-        fn local_expansion_and_application_preserve_sign_and_group_scope() {
-            for (source, local, applied) in [
-                ("--x", expression(&[&["x"]]), expression(&[&[], &["x"]])),
-                ("-(-x)", expression(&[]), expression(&[&[]])),
-                (
-                    "x - -z",
-                    expression(&[&["x"], &["z"]]),
-                    expression(&[&[], &["x"], &["z"]]),
-                ),
-                (
-                    "x - (-z)",
-                    expression(&[&["x"]]),
-                    expression(&[&[], &["x"]]),
-                ),
-                (
-                    "x - 1 - -1",
-                    expression(&[&["x"], &[]]),
-                    expression(&[&["x"], &[]]),
-                ),
-                ("x - 1 - (-1)", expression(&[&["x"]]), expression(&[&["x"]])),
-            ] {
-                let node = parse_node::<typed::MultistageFormulaExpression>
-                    .parse(source)
-                    .unwrap();
-                assert_eq!(node.expand(), [local], "{source}");
-                assert_eq!(
-                    node.apply_to(Expression::from(Term::intercept())),
-                    [applied],
-                    "{source}",
-                );
-            }
-        }
-
-        #[test]
-        fn stepwise_expands_directly_without_an_intermediate_ast() {
-            let stepwise = parse_node::<typed::MultistageFormulaExpression>
-                .parse("sw(x, z)")
-                .unwrap();
-            assert_eq!(
-                stepwise.expand(),
-                [expression(&[&["x"]]), expression(&[&["z"]])]
-            );
-        }
-
-        #[test]
-        fn expansion_preserves_signs_and_grouping() {
-            type Ast = typed::ExpressionAst<typed::MultistageFormulaExpression>;
-            let x = || Ast::term(Term::from(Factor::from("x"))).unwrap();
-            let intercept = || Ast::term(Term::intercept()).unwrap();
-            let removed = || Ast::subtract(x(), intercept()).unwrap();
-            let seed = Expression::from(Term::intercept());
-
-            assert_eq!(removed().apply_to(seed.clone()), [expression(&[&["x"]])]);
-
-            let grouped = Ast::Parenthesized(Box::new(removed()));
-            assert_eq!(grouped.apply_to(seed.clone()), [expression(&[&[], &["x"]])]);
-
-            let restored = Ast::add(removed(), intercept()).unwrap();
-            assert_eq!(restored.apply_to(seed), [expression(&[&["x"], &[]])]);
-
-            assert_eq!(
-                intercept().negate().unwrap().negate().unwrap().expand(),
-                [expression(&[&[]])],
-            );
-        }
-    }
-
     mod errors {
         use super::*;
 
@@ -2220,27 +2112,24 @@ mod tests {
                 "y ~ [a ~ z] : x",
                 "y ~ x / [a ~ z]",
                 "y ~ [a ~ z] / x",
-                "y ~ x - [a ~ z]",
                 "y ~ -[a ~ z]",
                 "y ~ --[a ~ z]",
                 "y ~ x - -[a ~ z]",
                 "y ~ x * ([a ~ z] + w)",
                 "y ~ ([a ~ z] + w) : x",
-                "y ~ x - (w + [a ~ z])",
                 "y ~ -([a ~ z] + w)",
                 "y ~ x * sw(w, [a ~ z])",
                 "y ~ x / sw0([a ~ z])",
-                "y ~ x - csw(w, [a ~ z])",
                 "y ~ -sw([a ~ z], w)",
                 "y ~ x + [a ~ z * [b ~ w]]",
             ] {
-                // Construction must reject arithmetic on child formulas.
+                // Construction rejects operations forbidden for multistage expressions.
                 let error = parse_formula_ast
                     .parse(source)
-                    .expect_err("expected construction failure");
+                    .err()
+                    .expect("expected construction failure");
                 assert!(
-                    construction_error(error.inner())
-                        == &typed::ConstructionError::MultistageArithmetic,
+                    construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
                     "{source}: {error}"
                 );
             }

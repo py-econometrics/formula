@@ -362,7 +362,7 @@ def test_select_terms_returns_an_independent_fitted_formula(data, keyword_role):
             "sw(x, z)",
             formula.Role.Independent,
             SyntaxError,
-            "stepwise calls are not allowed here",
+            "operation is not supported",
         ),
     ],
 )
