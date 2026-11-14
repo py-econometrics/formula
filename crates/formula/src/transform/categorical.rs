@@ -1,4 +1,4 @@
-use super::input::{input_frame, validate_single_input};
+use super::input::PreparedInput;
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
@@ -149,16 +149,20 @@ impl TransformDefinition for CategoricalDefinition {
 }
 
 impl Definition<CategoricalState> for CategoricalDefinition {
-    type Input = [Column];
+    type Input = PreparedInput;
     type Output = MaterializedColumns<ComponentKey>;
     type Error = TransformError;
 
-    fn validate(&self, state: &CategoricalState, inputs: &[Column]) -> Result<(), TransformError> {
-        let input = validate_single_input(inputs)?;
+    fn validate(
+        &self,
+        state: &CategoricalState,
+        inputs: &PreparedInput,
+    ) -> Result<(), TransformError> {
+        let (field, input) = inputs.single()?;
 
         if input.dtype() != state.levels.dtype() {
             return Err(TransformError::InputTypeMismatch {
-                name: input.name().clone(),
+                name: field.name().clone(),
                 expected: state.levels.dtype().to_string(),
                 actual: input.dtype().to_string(),
             });
@@ -167,10 +171,9 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         Ok(())
     }
 
-    fn fit(&self, inputs: &[Column]) -> Result<CategoricalState, TransformError> {
-        let levels = validate_single_input(inputs)?
-            .drop_nulls()
-            .unique_stable()?;
+    fn fit(&self, inputs: &PreparedInput) -> Result<CategoricalState, TransformError> {
+        let (_, input) = inputs.single()?;
+        let levels = input.drop_nulls().unique_stable()?;
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
             levels.filter(&levels.is_finite()?)?
@@ -204,11 +207,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
     fn transform(
         &self,
         state: &CategoricalState,
-        inputs: &[Column],
+        inputs: &PreparedInput,
     ) -> Result<Self::Output, TransformError> {
-        let input = &inputs[0]; // Already validated in Self::validate
+        let (field, input) = inputs.single()?;
         let levels = &state.levels;
-        let frame = input_frame(inputs)?;
+        let frame = &inputs.frame;
 
         let argument = col(frame.columns()[0].name().clone());
         let fitted_levels = (0..levels.len())
@@ -239,7 +242,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             .enumerate()
             .filter(|(index, _)| Some(*index) != state.reference_index)
             .map(|(_, level)| {
-                let column_name = self.output_name(input.name(), &level);
+                let column_name = self.output_name(field.name(), &level);
 
                 let expression = when(argument.clone().is_null())
                     .then(lit(NULL))
@@ -255,7 +258,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let result = if expressions.is_empty() {
             DataFrame::empty_with_height(input.len())
         } else {
-            frame.lazy().select(expressions).collect()?
+            frame.clone().lazy().select(expressions).collect()?
         };
 
         Ok(MaterializedColumns::new(result, metadata))
@@ -293,12 +296,17 @@ mod tests {
         ]
     }
 
+    fn prepare(inputs: &[Column]) -> PreparedInput {
+        PreparedInput::new(inputs, false).unwrap()
+    }
+
     #[test]
     fn native_levels_preserve_observed_order_and_label_names() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
             let training = [Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?];
-            let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
-            let output = fitted.transform(&training)?;
+            let prepared_training = prepare(&training);
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared_training)?;
+            let output = fitted.transform(&prepared_training)?;
 
             assert_eq!(output.frame().get_column_names(), ["C(x)[d]", "C(x)[b]"]);
             assert_output(
@@ -318,18 +326,19 @@ mod tests {
     #[test]
     fn native_unknown_levels_and_nulls_produce_null_indicators() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
             let input = [Column::new(
                 "x".into(),
                 [Some("b"), Some("a"), None, Some("d"), Some("c")],
             )
             .cast(&dtype)?];
+            let prepared_input = prepare(&input);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                fitted.transform(&input)?.frame(),
+                fitted.transform(&prepared_input)?.frame(),
                 &[
                     &[Some(false), None, None, Some(true), None],
                     &[Some(true), None, None, Some(false), None],
@@ -343,13 +352,14 @@ mod tests {
     fn native_reference_is_omitted_without_treating_unknown_levels_as_reference()
     -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
             let reference = Scalar::from(PlSmallStr::from_static("b"));
             let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
             let input = [
                 Column::new("x".into(), [Some("b"), Some("a"), None, Some("d")]).cast(&dtype)?,
             ];
-            let output = fitted.transform(&input)?;
+            let prepared_input = prepare(&input);
+            let output = fitted.transform(&prepared_input)?;
             assert_eq!(
                 output.frame().get_column_names(),
                 ["C(x, reference='b')[T.d]"]
@@ -368,7 +378,7 @@ mod tests {
     #[test]
     fn native_reference_must_be_observed_not_just_declared() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
             let reference = Scalar::from(PlSmallStr::from_static("a"));
             let error =
                 Fitted::fit(CategoricalDefinition::new(Some(reference)), &training).unwrap_err();
@@ -384,7 +394,7 @@ mod tests {
     #[test]
     fn native_missing_reference_does_not_extend_dictionary() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
             let mapping = dtype.cat_mapping().unwrap();
             assert!(mapping.get_cat("missing").is_none());
             let reference = Scalar::from(PlSmallStr::from_static("missing"));
@@ -400,13 +410,14 @@ mod tests {
     #[test]
     fn categorical_dictionary_growth_preserves_fitted_schema() -> Result<(), TransformError> {
         let dtype = native_dtypes().remove(0);
-        let training = [Column::new("x".into(), ["d", "b"]).cast(&dtype)?];
+        let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
         let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
         let original = fitted.transform(&training)?;
         let input = [Column::new("x".into(), ["new", "b", "a"]).cast(&dtype)?];
+        let prepared_input = prepare(&input);
 
         for _ in 0..2 {
-            let output = fitted.transform(&input)?;
+            let output = fitted.transform(&prepared_input)?;
             assert_eq!(
                 output.frame().get_column_names(),
                 original.frame().get_column_names()
@@ -437,9 +448,9 @@ mod tests {
             )),
             DataType::from_frozen_categories(FrozenCategories::new(["b", "a", "c", "d"])?),
         ]) {
-            let training = [Column::new("x".into(), ["a", "b"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["a", "b"]).cast(&dtype)?]);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
-            let input = [Column::new("x".into(), ["a", "b"]).cast(&incompatible)?];
+            let input = prepare(&[Column::new("x".into(), ["a", "b"]).cast(&incompatible)?]);
             assert!(matches!(
                 fitted.transform(&input),
                 Err(TransformError::InputTypeMismatch { .. })
@@ -453,9 +464,10 @@ mod tests {
     {
         for dtype in native_dtypes() {
             for values in [vec![], vec![None::<&str>, None]] {
-                let training = [Column::new("x".into(), values).cast(&dtype)?];
+                let training = prepare(&[Column::new("x".into(), values).cast(&dtype)?]);
                 let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
-                let input = [Column::new("x".into(), [Some("a"), None, Some("b")]).cast(&dtype)?];
+                let input =
+                    prepare(&[Column::new("x".into(), [Some("a"), None, Some("b")]).cast(&dtype)?]);
                 assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
             }
         }
@@ -466,12 +478,12 @@ mod tests {
     fn native_empty_and_all_null_predictions_preserve_fitted_schema() -> Result<(), TransformError>
     {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["b", "d"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["b", "d"]).cast(&dtype)?]);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
             let original = fitted.transform(&training)?;
             for values in [vec![], vec![None::<&str>, None]] {
                 let height = values.len();
-                let input = [Column::new("x".into(), values).cast(&dtype)?];
+                let input = prepare(&[Column::new("x".into(), values).cast(&dtype)?]);
                 let output = fitted.transform(&input)?;
                 assert_eq!(output.frame().shape(), (height, 2));
                 assert_eq!(
@@ -490,10 +502,11 @@ mod tests {
     #[test]
     fn native_reference_only_encoding_preserves_prediction_height() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["b", "b"]).cast(&dtype)?];
+            let training = prepare(&[Column::new("x".into(), ["b", "b"]).cast(&dtype)?]);
             let reference = Scalar::from(PlSmallStr::from_static("b"));
             let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
-            let input = [Column::new("x".into(), [Some("b"), Some("a"), None]).cast(&dtype)?];
+            let input =
+                prepare(&[Column::new("x".into(), [Some("b"), Some("a"), None]).cast(&dtype)?]);
             assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
         }
         Ok(())
@@ -501,7 +514,7 @@ mod tests {
 
     #[test]
     fn reference_only_encoding_preserves_input_height() -> Result<(), TransformError> {
-        let inputs = [Column::new("group".into(), [1_i32, 1, 1])];
+        let inputs = prepare(&[Column::new("group".into(), [1_i32, 1, 1])]);
         let definition = CategoricalDefinition::new(Some(Scalar::from(1_i64)));
         let transform = definition.fit(&inputs)?;
         assert_eq!(
@@ -520,9 +533,9 @@ mod tests {
             Column::new("group".into(), [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]),
             Column::new("group".into(), [f64::NAN, f64::INFINITY, f64::NEG_INFINITY]),
         ] {
-            let inputs = [inputs[0].cast(training.dtype())?];
+            let inputs = prepare(&[inputs[0].cast(training.dtype())?]);
             let definition = CategoricalDefinition::new(None);
-            let transform = definition.fit(&[training])?;
+            let transform = definition.fit(&prepare(&[training]))?;
             assert_eq!(
                 definition.transform(&transform, &inputs)?.frame().shape(),
                 (2, 0)
@@ -547,8 +560,9 @@ mod tests {
         );
         for dtype in [DataType::Float32, DataType::Float64] {
             let inputs = [input.cast(&dtype)?];
+            let prepared_inputs = prepare(&inputs);
             let definition = CategoricalDefinition::new(None);
-            let state = definition.fit(&inputs)?;
+            let state = definition.fit(&prepared_inputs)?;
             let levels = state.levels.cast(&DataType::Float64)?;
             assert_eq!(
                 levels.f64()?.iter().collect::<Vec<_>>(),
@@ -559,7 +573,7 @@ mod tests {
                 &definition,
                 &state,
                 &inputs,
-                definition.transform(&state, &inputs)?.frame(),
+                definition.transform(&state, &prepared_inputs)?.frame(),
                 &[
                     &[Some(true), None, None, Some(false), None, Some(true), None],
                     &[Some(false), None, None, Some(true), None, Some(false), None],
@@ -640,7 +654,7 @@ mod tests {
     fn categorical_requires_fit() {
         let reference = Scalar::from(PlSmallStr::from_static("missing"));
         let transform = Fit::Unfitted(CategoricalDefinition::new(Some(reference)));
-        let input = [Column::new("group".into(), ["a", "b"])];
+        let input = prepare(&[Column::new("group".into(), ["a", "b"])]);
 
         assert!(matches!(
             transform.transform(&input),
@@ -660,9 +674,10 @@ mod tests {
     fn categorical_definition_produces_independent_fits() -> Result<(), TransformError> {
         let definition =
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
-        let first_input = [Column::new("group".into(), ["a", "b"])];
-        let second_input = [Column::new("group".into(), ["a", "c"])];
+        let first_input = prepare(&[Column::new("group".into(), ["a", "b"])]);
+        let second_input = prepare(&[Column::new("group".into(), ["a", "c"])]);
         let input = [Column::new("group".into(), ["a", "b", "c"])];
+        let prepared_input = prepare(&input);
         let first = definition.fit(&first_input)?;
         let second = definition.fit(&second_input)?;
 
@@ -670,14 +685,14 @@ mod tests {
             &definition,
             &first,
             &input,
-            definition.transform(&first, &input)?.frame(),
+            definition.transform(&first, &prepared_input)?.frame(),
             &[&[Some(false), Some(true), None]],
         );
         assert_output(
             &definition,
             &second,
             &input,
-            definition.transform(&second, &input)?.frame(),
+            definition.transform(&second, &prepared_input)?.frame(),
             &[&[Some(false), None, Some(true)]],
         );
 
@@ -688,8 +703,8 @@ mod tests {
     fn categorical_failed_refit_preserves_fitted_levels() -> Result<(), TransformError> {
         let definition =
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
-        let training = [Column::new("group".into(), ["a", "b"])];
-        let invalid = [Column::new("group".into(), ["b", "c"])];
+        let training = prepare(&[Column::new("group".into(), ["a", "b"])]);
+        let invalid = prepare(&[Column::new("group".into(), ["b", "c"])]);
         let transform = Fit::Fitted(Fitted::fit(definition.clone(), &training)?);
         let original = transform.transform(&training).unwrap();
 
@@ -715,15 +730,16 @@ mod tests {
         for count in [3, 8, 9] {
             let mut values = vec![Some("b"), Some("a"), Some("b"), None];
             values.extend(levels[2..count].iter().copied().map(Some));
-            let training = [Column::new("group".into(), values)];
+            let training = prepare(&[Column::new("group".into(), values)]);
             // Prediction omits fitted levels, but their columns must remain.
             let input = [Column::new(
                 "group".into(),
                 [Some("a"), Some("b"), Some("unseen"), None],
             )];
+            let prepared_input = prepare(&input);
             let definition = CategoricalDefinition::new(None);
             let fitted = Fitted::fit(definition, &training)?;
-            let output = fitted.transform(&input)?;
+            let output = fitted.transform(&prepared_input)?;
             let mut expected = vec![
                 [Some(false), Some(true), None, None],
                 [Some(true), Some(false), None, None],
@@ -768,14 +784,15 @@ mod tests {
                 .map(Some)
                 .collect::<Vec<_>>();
             values.push(None);
-            let training = [Column::new("group".into(), values)];
+            let training = prepare(&[Column::new("group".into(), values)]);
             let input = [Column::new(
                 "group".into(),
                 [Some("a"), Some("b"), Some("c"), Some("unseen"), None],
             )];
+            let prepared_input = prepare(&input);
             let reference = Scalar::from(PlSmallStr::from_static("a"));
             let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
-            let output = fitted.transform(&input)?;
+            let output = fitted.transform(&prepared_input)?;
             let mut expected = vec![
                 [Some(false), Some(true), Some(false), None, None],
                 [Some(false), Some(false), Some(true), None, None],
@@ -819,13 +836,14 @@ mod tests {
             [Column::new("group".into(), [1_u64, 2, 1])],
         ];
         for input in inputs {
+            let prepared_input = prepare(&input);
             let definition = CategoricalDefinition::new(Some(Scalar::from(1_i64)));
-            let transform = definition.fit(&input)?;
+            let transform = definition.fit(&prepared_input)?;
             assert_output(
                 &definition,
                 &transform,
                 &input,
-                definition.transform(&transform, &input)?.frame(),
+                definition.transform(&transform, &prepared_input)?.frame(),
                 &[&[Some(false), Some(true), Some(false)]],
             );
         }
@@ -835,14 +853,15 @@ mod tests {
     #[test]
     fn categorical_resolves_float_reference_to_column_precision() -> Result<(), TransformError> {
         let input = [Column::new("group".into(), [0.1_f32, 0.2, 0.1])];
+        let prepared_input = prepare(&input);
         let definition = CategoricalDefinition::new(Some(Scalar::from(0.1_f64)));
-        let transform = definition.fit(&input)?;
+        let transform = definition.fit(&prepared_input)?;
 
         assert_output(
             &definition,
             &transform,
             &input,
-            definition.transform(&transform, &input)?.frame(),
+            definition.transform(&transform, &prepared_input)?.frame(),
             &[&[Some(false), Some(true), Some(false)]],
         );
         Ok(())
@@ -851,14 +870,15 @@ mod tests {
     #[test]
     fn categorical_supports_boolean_reference() -> Result<(), TransformError> {
         let input = [Column::new("group".into(), [Some(true), Some(false), None])];
+        let prepared_input = prepare(&input);
         let definition = CategoricalDefinition::new(Some(Scalar::from(false)));
-        let transform = definition.fit(&input)?;
+        let transform = definition.fit(&prepared_input)?;
 
         assert_output(
             &definition,
             &transform,
             &input,
-            definition.transform(&transform, &input)?.frame(),
+            definition.transform(&transform, &prepared_input)?.frame(),
             &[&[Some(true), Some(false), None]],
         );
         Ok(())
@@ -866,7 +886,7 @@ mod tests {
 
     #[test]
     fn categorical_rejects_missing_reference() {
-        let input = [Column::new("group".into(), ["a", "b"])];
+        let input = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let reference = Scalar::from(PlSmallStr::from_static("missing"));
         let definition = CategoricalDefinition::new(Some(reference));
 
@@ -896,9 +916,10 @@ mod tests {
         ];
 
         for (reference, input) in cases {
+            let prepared_input = prepare(&input);
             let definition = CategoricalDefinition::new(Some(reference));
             assert!(matches!(
-                definition.fit(&input),
+                definition.fit(&prepared_input),
                 Err(TransformError::InvalidParameter(_))
             ));
         }
@@ -918,9 +939,10 @@ mod tests {
         ];
 
         for (reference, input) in cases {
+            let prepared_input = prepare(&input);
             let definition = CategoricalDefinition::new(Some(reference));
             assert!(matches!(
-                definition.fit(&input),
+                definition.fit(&prepared_input),
                 Err(TransformError::Polars(_))
             ));
         }
@@ -928,7 +950,7 @@ mod tests {
 
     #[test]
     fn categorical_rejects_nonfinite_float_reference() {
-        let input = [Column::new("group".into(), [0.1_f32, 0.2])];
+        let input = prepare(&[Column::new("group".into(), [0.1_f32, 0.2])]);
 
         for reference in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
             let definition = CategoricalDefinition::new(Some(Scalar::from(reference)));
@@ -941,8 +963,8 @@ mod tests {
 
     #[test]
     fn categorical_rejects_changed_input_dtype() -> Result<(), TransformError> {
-        let training = [Column::new("group".into(), [1_i32, 2])];
-        let input = [Column::new("group".into(), [1_i64, 2])];
+        let training = prepare(&[Column::new("group".into(), [1_i32, 2])]);
+        let input = prepare(&[Column::new("group".into(), [1_i64, 2])]);
 
         for reference in [None, Some(Scalar::from(1_i64))] {
             let definition = CategoricalDefinition::new(reference);
@@ -966,16 +988,17 @@ mod tests {
 
     #[test]
     fn categorical_refit_replaces_fitted_levels() -> Result<(), TransformError> {
-        let first = [Column::new("group".into(), ["a", "b"])];
-        let second = [Column::new("group".into(), ["b", "c"])];
+        let first = prepare(&[Column::new("group".into(), ["a", "b"])]);
+        let second = prepare(&[Column::new("group".into(), ["b", "c"])]);
         let input = [Column::new("group".into(), ["a", "b", "c"])];
+        let prepared_input = prepare(&input);
         let definition = CategoricalDefinition::new(None);
         let original = Fit::Fitted(Fitted::fit(definition, &first)?);
-        let original_output = original.transform(&input).unwrap();
+        let original_output = original.transform(&prepared_input).unwrap();
         let transform = original.fit(&second)?;
         assert!(
             original
-                .transform(&input)
+                .transform(&prepared_input)
                 .unwrap()
                 .frame()
                 .equals_missing(original_output.frame())
@@ -989,7 +1012,7 @@ mod tests {
             &transform.definition,
             &transform.state,
             &input,
-            transform.transform(&input)?.frame(),
+            transform.transform(&prepared_input)?.frame(),
             &[
                 &[None, Some(true), Some(false)],
                 &[None, Some(false), Some(true)],

@@ -9,7 +9,8 @@ pub(crate) use categorical::CategoricalDefinition;
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
-pub(crate) use input::validate_numeric_input;
+use input::PreparedInput;
+pub(crate) use input::validate_numeric_field;
 pub(crate) use integer::IntegerEncodingDefinition;
 pub(crate) use polynomial::PolynomialDefinition;
 use std::collections::BTreeMap;
@@ -47,6 +48,10 @@ pub(crate) trait TransformDefinition {
 
     fn argument_count(&self) -> ArgumentCount;
 
+    fn deduplicate_inputs(&self) -> bool {
+        false
+    }
+
     fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
         BTreeMap::new()
     }
@@ -83,16 +88,29 @@ impl Transform {
         self.definition().call_name(arguments)
     }
 
+    fn input(&self, inputs: &[Column]) -> Result<PreparedInput, TransformError> {
+        PreparedInput::new(inputs, self.definition().deduplicate_inputs())
+    }
+
     pub(crate) fn fit(&self, inputs: &[Column]) -> Result<Self, TransformError> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits + 1, transforms));
-
         match self {
-            Self::Expression(expression) => Ok(Self::Expression(expression.fit())),
-            Self::C(categorical) => Ok(Self::C(categorical.fit(inputs)?)),
-            Self::Poly(polynomial) => Ok(Self::Poly(polynomial.fit(inputs)?)),
-            Self::F(integer) => Ok(Self::F(integer.fit(inputs)?)),
-            Self::G(grouped) => Ok(Self::G(*grouped)),
+            Self::C(categorical) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::C(categorical.fit(&inputs)?))
+            }
+            Self::Poly(polynomial) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::Poly(polynomial.fit(&inputs)?))
+            }
+            Self::F(integer) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::F(integer.fit(&inputs)?))
+            }
+
+            Self::Expression(expression) => Ok(Self::Expression(expression.clone())),
+            Self::G(grouped) => Ok(Self::G(grouped.clone())),
         }
     }
 
@@ -103,14 +121,15 @@ impl Transform {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 
+        let inputs = self.input(inputs).map_err(FitError::Transform)?;
         match self {
             Self::Expression(expression) => {
-                expression.transform(inputs).map_err(FitError::Transform)
+                expression.transform(&inputs).map_err(FitError::Transform)
             }
-            Self::C(categorical) => categorical.transform(inputs),
-            Self::Poly(polynomial) => polynomial.transform(inputs),
-            Self::F(integer) => integer.transform(inputs),
-            Self::G(grouped) => grouped.transform(inputs).map_err(FitError::Transform),
+            Self::C(categorical) => categorical.transform(&inputs),
+            Self::Poly(polynomial) => polynomial.transform(&inputs),
+            Self::F(integer) => integer.transform(&inputs),
+            Self::G(grouped) => grouped.transform(&inputs).map_err(FitError::Transform),
         }
     }
 }
@@ -190,12 +209,16 @@ mod tests {
     use crate::fit::Fitted;
     use polars::prelude::{PlSmallStr, Scalar};
 
+    fn prepare(inputs: &[Column]) -> PreparedInput {
+        PreparedInput::new(inputs, false).unwrap()
+    }
+
     #[test]
     fn fit_identity_depends_on_definition_not_fitted_state() -> Result<(), TransformError> {
         let definition =
             CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
-        let first_input = [Column::new("group".into(), ["a", "b"])];
-        let second_input = [Column::new("group".into(), ["a", "c"])];
+        let first_input = prepare(&[Column::new("group".into(), ["a", "b"])]);
+        let second_input = prepare(&[Column::new("group".into(), ["a", "c"])]);
         let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
         let second = Fit::Fitted(Fitted::fit(definition.clone(), &second_input)?);
 

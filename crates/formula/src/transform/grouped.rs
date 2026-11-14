@@ -1,11 +1,12 @@
-use super::{ArgumentCount, TransformDefinition, call_name, validate_numeric_input};
+use super::input::{PreparedInput, validate_numeric_field};
+use super::{ArgumentCount, TransformDefinition, call_name};
 use crate::formula::MaterializedColumns;
 use crate::{ComponentKey, TransformError};
 use polars::prelude::{Column, DataFrame, DataType, PlSmallStr, Scalar};
 use std::collections::BTreeMap;
 
 /// One normalized fixed-effect term with an optional loading and group intercept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GroupedTransform {
     intercept: bool,
 }
@@ -55,28 +56,28 @@ impl GroupedTransform {
 
     fn validate_inputs<'a>(
         &self,
-        inputs: &'a [Column],
+        inputs: &'a PreparedInput,
     ) -> Result<(&'a Column, &'a [Column]), TransformError> {
-        let Some((group, loadings)) = inputs.split_first() else {
+        let Some((group, loadings)) = inputs.frame.columns().split_first() else {
             return Err(TransformError::InputCountMismatch {
                 expected: self.argument_count(),
-                actual: inputs.len(),
+                actual: inputs.fields.len(),
             });
         };
-
-        for loading in loadings {
-            validate_numeric_input(loading)?;
+        let (_, loading_fields) = inputs.fields.split_at(1);
+        for field in loading_fields {
+            validate_numeric_field(field)?;
         }
-
         Ok((group, loadings))
     }
 
     pub(crate) fn transform(
         &self,
-        inputs: &[Column],
+        inputs: &PreparedInput,
     ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
         let (group, loadings) = self.validate_inputs(inputs)?;
         let arguments = inputs
+            .fields
             .iter()
             .map(|input| input.name().as_str())
             .collect::<Vec<_>>();
@@ -118,6 +119,10 @@ mod tests {
     use crate::transform::Transform;
     use polars::error::PolarsError;
 
+    fn prepare(inputs: &[Column]) -> PreparedInput {
+        PreparedInput::new(inputs, false).unwrap()
+    }
+
     #[test]
     fn intercept_materializes_only_group_codes() -> Result<(), TransformError> {
         for group in [
@@ -127,7 +132,7 @@ mod tests {
             let expected = group
                 .clone()
                 .with_name("G(firm, intercept=true)[group]".into());
-            let output = GroupedTransform::new(true).transform(&[group])?;
+            let output = GroupedTransform::new(true).transform(&prepare(&[group]))?;
             assert!(output.frame().equals_missing(&expected.into_frame()));
         }
         Ok(())
@@ -140,7 +145,8 @@ mod tests {
             Column::new("time".into(), [Some(10_i32), Some(20), None]),
             Column::new("exposure".into(), [Some(0.5_f32), None, Some(1.5)]),
         ];
-        let output = GroupedTransform::new(false).transform(&inputs)?;
+        let prepared_inputs = prepare(&inputs);
+        let output = GroupedTransform::new(false).transform(&prepared_inputs)?;
         let frame = output.frame();
 
         assert_eq!(
@@ -179,7 +185,7 @@ mod tests {
             Column::new("x".into(), [2_f32, 3.0]),
             Column::new("x".into(), [2_f64, 3.0]),
         ] {
-            let inputs = [Column::new("x".into(), [0_u32, 1]), loading];
+            let inputs = prepare(&[Column::new("x".into(), [0_u32, 1]), loading]);
             let output = GroupedTransform::new(false).transform(&inputs)?;
             assert_eq!(
                 output.frame()[1].f64()?.iter().collect::<Vec<_>>(),
@@ -202,7 +208,8 @@ mod tests {
                 Column::new("time".into(), [None::<i32>, None]),
             ],
         ] {
-            let output = GroupedTransform::new(false).transform(&inputs)?;
+            let prepared_inputs = prepare(&inputs);
+            let output = GroupedTransform::new(false).transform(&prepared_inputs)?;
             assert_eq!(output.frame().shape(), (inputs[0].len(), 2));
             assert_eq!(output.frame()[0].dtype(), &DataType::UInt32);
             assert_eq!(output.frame()[1].dtype(), &DataType::Float64);
@@ -221,7 +228,7 @@ mod tests {
                 .into_iter()
                 .filter(|count| !expected.accepts(*count))
             {
-                let inputs = vec![Column::new("x".into(), [0_u32]); count];
+                let inputs = prepare(&vec![Column::new("x".into(), [0_u32]); count]);
                 assert!(matches!(
                     transform.transform(&inputs),
                     Err(TransformError::InputCountMismatch {
@@ -239,11 +246,11 @@ mod tests {
             Column::new("time".into(), ["1", "2"]),
             Column::new("time".into(), [true, false]),
         ] {
-            let inputs = [
+            let inputs = prepare(&[
                 Column::new("firm".into(), [0_u32, 1]),
                 Column::new("valid".into(), [1.0, 2.0]),
                 loading,
-            ];
+            ]);
             assert!(matches!(
                 GroupedTransform::new(false).transform(&inputs),
                 Err(TransformError::NonNumericInput { name, .. }) if name == "time"
@@ -258,8 +265,10 @@ mod tests {
             Column::new("time".into(), [1.0]),
         ];
         assert!(matches!(
-            GroupedTransform::new(false).transform(&inputs),
-            Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
+            Transform::G(GroupedTransform::new(false)).transform(&inputs),
+            Err(FitError::Transform(TransformError::Polars(
+                PolarsError::ShapeMismatch(_)
+            )))
         ));
     }
 

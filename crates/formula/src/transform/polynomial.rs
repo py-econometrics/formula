@@ -1,7 +1,7 @@
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
-use crate::transform::input::{argument_column_name, input_frame, validate_single_input};
-use crate::transform::{TransformDefinition, call_name, validate_numeric_input};
+use crate::transform::input::{PreparedInput, argument_column_name, validate_numeric_field};
+use crate::transform::{TransformDefinition, call_name};
 use crate::{ArgumentCount, TransformError};
 use polars::prelude::{
     AnyValue, Column, DataFrame, DataType, Expr, Field, Float64Chunked, IntoColumn, IntoLazy, NULL,
@@ -189,11 +189,13 @@ impl OrthogonalBasis {
             .collect())
     }
 
-    fn training_frame(input: &Column, degree: usize) -> Result<DataFrame, TransformError> {
+    fn training_frame(input: &PreparedInput, degree: usize) -> Result<DataFrame, TransformError> {
         const PREFIX_SIZE: usize = 1_000;
 
         let name = argument_column_name(0);
-        let frame = input_frame(std::slice::from_ref(input))?
+        let frame = input
+            .frame
+            .clone()
             .lazy()
             .select([finite_values(col(name.clone()))])
             .drop_nulls(None)
@@ -219,7 +221,7 @@ impl OrthogonalBasis {
         Ok(frame)
     }
 
-    fn fit(input: &Column, degree: usize) -> Result<Self, TransformError> {
+    fn fit(input: &PreparedInput, degree: usize) -> Result<Self, TransformError> {
         let frame = Self::training_frame(input, degree)?;
         let values = frame
             .column(argument_column_name(0).as_str())?
@@ -282,43 +284,48 @@ pub(crate) struct PolynomialState {
 }
 
 impl Definition<PolynomialState> for PolynomialDefinition {
-    type Input = [Column];
+    type Input = PreparedInput;
     type Output = MaterializedColumns<ComponentKey>;
     type Error = TransformError;
 
-    fn validate(&self, state: &PolynomialState, inputs: &[Column]) -> Result<(), TransformError> {
-        let input = validate_single_input(inputs)?;
+    fn validate(
+        &self,
+        state: &PolynomialState,
+        inputs: &PreparedInput,
+    ) -> Result<(), TransformError> {
+        let (field, _) = inputs.single()?;
 
-        if input.name() != state.field.name() {
+        if field.name() != state.field.name() {
             return Err(TransformError::InputNamesMismatch {
                 expected: vec![state.field.name().clone()],
-                actual: vec![input.name().clone()],
+                actual: vec![field.name().clone()],
             });
         }
 
-        if input.dtype() != state.field.dtype() {
+        if field.dtype() != state.field.dtype() {
             return Err(TransformError::InputTypeMismatch {
-                name: input.name().clone(),
+                name: field.name().clone(),
                 expected: state.field.dtype().to_string(),
-                actual: input.dtype().to_string(),
+                actual: field.dtype().to_string(),
             });
         }
 
         Ok(())
     }
 
-    fn fit(&self, inputs: &[Column]) -> Result<PolynomialState, TransformError> {
-        let input = validate_single_input(inputs)?;
-        validate_numeric_input(input)?;
+    fn fit(&self, inputs: &PreparedInput) -> Result<PolynomialState, TransformError> {
+        let (field, _) = inputs.single()?;
+
+        validate_numeric_field(field)?;
 
         let basis = if self.raw {
             PolynomialBasis::Raw
         } else {
-            PolynomialBasis::Orthogonal(OrthogonalBasis::fit(input, self.degree)?)
+            PolynomialBasis::Orthogonal(OrthogonalBasis::fit(inputs, self.degree)?)
         };
 
         Ok(PolynomialState {
-            field: input.field().into_owned(),
+            field: field.clone(),
             basis,
         })
     }
@@ -326,9 +333,9 @@ impl Definition<PolynomialState> for PolynomialDefinition {
     fn transform(
         &self,
         state: &PolynomialState,
-        inputs: &[Column],
+        inputs: &PreparedInput,
     ) -> Result<Self::Output, TransformError> {
-        let frame = input_frame(inputs)?;
+        let frame = inputs.frame.clone();
         let height = frame.height();
         let (columns, metadata): (Vec<Column>, Vec<ComponentKey>) = state
             .basis
@@ -376,6 +383,10 @@ fn sum_in_lanes(mut values: impl Iterator<Item = f64>) -> f64 {
 mod tests {
     use super::*;
     use crate::fit::Fitted;
+
+    fn prepare(inputs: &[Column]) -> PreparedInput {
+        PreparedInput::new(inputs, false).unwrap()
+    }
 
     #[test]
     fn constructor_parameters_default_independently() -> Result<(), TransformError> {
@@ -453,7 +464,7 @@ mod tests {
 
     #[test]
     fn orthogonal_basis_matches_hand_calculated_fixture() -> Result<(), TransformError> {
-        let training = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
+        let training = prepare(&[Column::new("x".into(), [-1.0, 0.0, 1.0])]);
         let fitted = Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(false)))?,
             &training,
@@ -487,11 +498,12 @@ mod tests {
             (10, (0..20).map(|i| i as f64 * 1e-20).collect()),
         ] {
             let training = [Column::new("x".into(), values)];
+            let prepared_training = prepare(&training);
             let fitted = Fitted::fit(
                 PolynomialDefinition::new(Some(Scalar::from(degree as i64)), None)?,
-                &training,
+                &prepared_training,
             )?;
-            let output = fitted.transform(&training)?;
+            let output = fitted.transform(&prepared_training)?;
             assert_polynomial_schema(output.frame(), training[0].len(), degree, false);
             let columns = output
                 .frame()
@@ -520,12 +532,12 @@ mod tests {
 
     #[test]
     fn orthogonal_prediction_reuses_training_basis() -> Result<(), TransformError> {
-        let training = [Column::new("x".into(), [9.0, 10.0, 11.0])];
+        let training = prepare(&[Column::new("x".into(), [9.0, 10.0, 11.0])]);
         let fitted = Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(false)))?,
             &training,
         )?;
-        let prediction = [Column::new("x".into(), [12.0])];
+        let prediction = prepare(&[Column::new("x".into(), [12.0])]);
         for _ in 0..2 {
             let output = fitted.transform(&prediction)?;
             assert_polynomial_schema(output.frame(), 1, 2, false);
@@ -546,10 +558,10 @@ mod tests {
     -> Result<(), TransformError> {
         let fitted = Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(3_i64)), None)?,
-            &[Column::new("x".into(), [-2.0, -1.0, 0.0, 1.0, 2.0])],
+            &prepare(&[Column::new("x".into(), [-2.0, -1.0, 0.0, 1.0, 2.0])]),
         )?;
         let values = [Some(-1.0), None, Some(0.0), Some(1.0)];
-        let expected = fitted.transform(&[Column::new("x".into(), values)])?;
+        let expected = fitted.transform(&prepare(&[Column::new("x".into(), values)]))?;
         let subset = Column::new(
             "x".into(),
             [
@@ -569,7 +581,7 @@ mod tests {
         for (case, input) in [("subset", subset), ("concatenated batches", batches)] {
             assert!(
                 fitted
-                    .transform(&[input])?
+                    .transform(&prepare(&[input]))?
                     .frame()
                     .equals_missing(expected.frame()),
                 "{case}"
@@ -581,8 +593,8 @@ mod tests {
     #[test]
     fn orthogonal_fit_ignores_missing_values_and_prediction_preserves_rows()
     -> Result<(), TransformError> {
-        let clean = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
-        let missing = [Column::new(
+        let clean = prepare(&[Column::new("x".into(), [-1.0, 0.0, 1.0])]);
+        let missing = prepare(&[Column::new(
             "x".into(),
             [
                 Some(-1.0),
@@ -593,7 +605,7 @@ mod tests {
                 Some(1.0),
                 Some(f64::NEG_INFINITY),
             ],
-        )];
+        )]);
         let definition =
             PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(false)))?;
         let clean_fit = Fitted::fit(definition.clone(), &clean)?;
@@ -655,7 +667,7 @@ mod tests {
                         Some(Scalar::from(i64::from(degree))),
                         Some(Scalar::from(false))
                     )?,
-                    &[Column::new("x".into(), values)]
+                    &prepare(&[Column::new("x".into(), values)])
                 ),
                 Err(TransformError::NumericalError(message))
                     if message == format!(
@@ -669,13 +681,13 @@ mod tests {
 
     #[test]
     fn orthogonal_fit_counts_distinct_values_beyond_prefix() -> Result<(), TransformError> {
-        let training = [Column::new(
+        let training = prepare(&[Column::new(
             "x".into(),
             vec![0.0; 2_000]
                 .into_iter()
                 .chain([-1.0, 1.0])
                 .collect::<Vec<_>>(),
-        )];
+        )]);
         Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(2_i64)), None)?,
             &training,
@@ -692,7 +704,7 @@ mod tests {
 
     #[test]
     fn polynomial_empty_and_all_missing_predictions_retain_schema() -> Result<(), TransformError> {
-        let training = [Column::new("x".into(), [-1.0, 0.0, 1.0])];
+        let training = prepare(&[Column::new("x".into(), [-1.0, 0.0, 1.0])]);
         for raw in [false, true] {
             let fitted = Fitted::fit(
                 PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(raw)))?,
@@ -704,7 +716,7 @@ mod tests {
                 vec![Some(f64::NAN), Some(f64::INFINITY), Some(f64::NEG_INFINITY)],
             ] {
                 let height = values.len();
-                let output = fitted.transform(&[Column::new("x".into(), values)])?;
+                let output = fitted.transform(&prepare(&[Column::new("x".into(), values)]))?;
                 assert_polynomial_schema(output.frame(), height, 2, raw);
                 for column in output.frame().columns() {
                     assert_eq!(column.null_count(), height, "raw={raw}");
@@ -728,7 +740,7 @@ mod tests {
                         Some(Scalar::from(1_i64)),
                         Some(Scalar::from(false))
                     )?,
-                    &[Column::new("x".into(), values)]
+                    &prepare(&[Column::new("x".into(), values)])
                 ),
                 Err(TransformError::NumericalError(_))
             ));
@@ -738,12 +750,12 @@ mod tests {
 
     #[test]
     fn raw_powers_preserve_values_order_and_schema_on_prediction() -> Result<(), TransformError> {
-        let training = [Column::new("x".into(), [1_i64, 2])];
+        let training = prepare(&[Column::new("x".into(), [1_i64, 2])]);
         let fitted = Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(3_i64)), Some(Scalar::from(true)))?,
             &training,
         )?;
-        let prediction = [Column::new("x".into(), [2_i64, -3, 0])];
+        let prediction = prepare(&[Column::new("x".into(), [2_i64, -3, 0])]);
 
         for _ in 0..2 {
             let output = fitted.transform(&prediction)?;
@@ -761,7 +773,7 @@ mod tests {
 
     #[test]
     fn raw_powers_mask_nonfinite_and_null_inputs() -> Result<(), TransformError> {
-        let inputs = [Column::new(
+        let inputs = prepare(&[Column::new(
             "x".into(),
             [
                 Some(2.0),
@@ -771,7 +783,7 @@ mod tests {
                 Some(f64::NEG_INFINITY),
                 Some(-0.5),
             ],
-        )];
+        )]);
         let fitted = Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(true)))?,
             &inputs,
@@ -796,9 +808,9 @@ mod tests {
         ] {
             let fitted = Fitted::fit(
                 PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(true)))?,
-                &[Column::new("x".into(), values)],
+                &prepare(&[Column::new("x".into(), values)]),
             )?;
-            let output = fitted.transform(&[Column::new("x".into(), [3.0])])?;
+            let output = fitted.transform(&prepare(&[Column::new("x".into(), [3.0])]))?;
             assert_polynomial_schema(output.frame(), 1, 2, true);
             assert_eq!(output.frame()[0].f64()?.get(0), Some(3.0));
             assert_eq!(output.frame()[1].f64()?.get(0), Some(9.0));
@@ -808,7 +820,7 @@ mod tests {
 
     #[test]
     fn raw_overflow_propagates_as_infinity() -> Result<(), TransformError> {
-        let inputs = [Column::new("x".into(), [f64::MAX, -f64::MAX])];
+        let inputs = prepare(&[Column::new("x".into(), [f64::MAX, -f64::MAX])]);
         let fitted = Fitted::fit(
             PolynomialDefinition::new(Some(Scalar::from(3_i64)), Some(Scalar::from(true)))?,
             &inputs,
@@ -831,11 +843,12 @@ mod tests {
         for raw in [false, true] {
             let definition =
                 PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(raw)))?;
-            let fitted = Fitted::fit(definition.clone(), &inputs[..1])?;
+            let fitted = Fitted::fit(definition.clone(), &prepare(&inputs[..1]))?;
             for invalid in [&inputs[..0], &inputs[..]] {
+                let prepared_invalid = prepare(invalid);
                 for result in [
-                    definition.fit(invalid).map(|_| ()),
-                    fitted.transform(invalid).map(|_| ()),
+                    definition.fit(&prepared_invalid).map(|_| ()),
+                    fitted.transform(&prepared_invalid).map(|_| ()),
                 ] {
                     assert!(
                         matches!(
@@ -862,7 +875,7 @@ mod tests {
             ] {
                 assert!(
                     matches!(
-                        definition.fit(&[input]),
+                        definition.fit(&prepare(&[input])),
                         Err(TransformError::NonNumericInput { .. })
                     ),
                     "raw={raw}"
@@ -874,7 +887,7 @@ mod tests {
 
     #[test]
     fn polynomial_prediction_rejects_changed_names_and_dtypes() -> Result<(), TransformError> {
-        let training = [Column::new("x".into(), [1.0, 2.0, 3.0])];
+        let training = prepare(&[Column::new("x".into(), [1.0, 2.0, 3.0])]);
         for raw in [false, true] {
             let fitted = Fitted::fit(
                 PolynomialDefinition::new(Some(Scalar::from(2_i64)), Some(Scalar::from(raw)))?,
@@ -882,7 +895,7 @@ mod tests {
             )?;
             assert!(
                 matches!(
-                    fitted.transform(&[Column::new("z".into(), [1.0])]),
+                    fitted.transform(&prepare(&[Column::new("z".into(), [1.0])])),
                     Err(TransformError::InputNamesMismatch { expected, actual })
                         if expected == vec![PlSmallStr::from_static("x")]
                             && actual == vec![PlSmallStr::from_static("z")]
@@ -891,7 +904,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    fitted.transform(&[Column::new("x".into(), [1_i64])]),
+                    fitted.transform(&prepare(&[Column::new("x".into(), [1_i64])])),
                     Err(TransformError::InputTypeMismatch { name, expected, actual })
                         if name.as_str() == "x" && expected == DataType::Float64.to_string()
                             && actual == DataType::Int64.to_string()
