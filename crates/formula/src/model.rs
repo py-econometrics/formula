@@ -1164,6 +1164,7 @@ mod tests {
             for (query, role) in [
                 ("x +", Role::Independent),
                 ("[y ~ x]", Role::Independent),
+                ("sw(x)", Role::Independent),
                 ("sw(x, x)", Role::Independent),
                 ("x + (sw0(x))", Role::Independent),
                 ("g*g", Role::FixedEffect),
@@ -1177,13 +1178,16 @@ mod tests {
                     "{query}"
                 );
             }
-            // Until #92, single-alternative stepwise calls are accepted.
-            let selected = model.select_terms("sw(x)", Role::Independent).unwrap();
+            // Fixed-effect queries retain the interim single-alternative behavior.
+            let selected = model.select_terms("sw(g)", Role::FixedEffect).unwrap();
             assert!(
-                selected
-                    .frame()
-                    .unwrap()
-                    .equals_missing(&data.select(["x"]).unwrap())
+                selected.frame().unwrap().equals_missing(
+                    &model
+                        .select_terms("g", Role::FixedEffect)
+                        .unwrap()
+                        .frame()
+                        .unwrap()
+                )
             );
         }
     }

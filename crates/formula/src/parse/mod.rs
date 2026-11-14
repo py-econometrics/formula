@@ -543,25 +543,22 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
 pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression> {
     let parser = |cursor: &mut &str| -> ModalResult<Expression> {
         let mut alternatives = match role {
-            Role::Dependent | Role::Independent => {
-                let node = parse_node::<ast::Multistage>(cursor)?;
-                let node = construction_result(cursor, node.into_simple())?;
-                node.expand()
-            }
+            Role::Dependent | Role::Independent => parse_node::<ast::TermQuery>(cursor)?.expand(),
             Role::FixedEffect => {
-                let node = parse_node::<ast::VaryingSlope>(cursor)?;
-                node.expand().into_iter().collect()
+                let alternatives = parse_node::<ast::VaryingSlope>(cursor)?.expand();
+
+                if alternatives.len() != 1 {
+                    return cut_err(fail.context(StrContext::Expected(
+                        StrContextValue::Description(
+                            "a fixed-effect query that expands to exactly one expression",
+                        ),
+                    )))
+                    .parse_next(cursor);
+                }
+
+                alternatives
             }
         };
-
-        if alternatives.len() != 1 {
-            return cut_err(
-                fail.context(StrContext::Expected(StrContextValue::Description(
-                    "a term query that expands to exactly one expression",
-                ))),
-            )
-            .parse_next(cursor);
-        }
 
         Ok(alternatives.remove(0))
     };
@@ -676,6 +673,19 @@ mod tests {
     use super::*;
     use crate::formula::Role;
     use crate::parse::ast as typed;
+
+    #[test]
+    fn ordinary_term_queries_reject_single_argument_stepwise_calls() {
+        for role in [Role::Dependent, Role::Independent] {
+            let error = parse_term("sw(x)", role).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stepwise calls are not allowed here"),
+                "{role:?}: {error}"
+            );
+        }
+    }
 
     mod varying_slopes {
         use super::*;
