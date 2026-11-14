@@ -1261,6 +1261,30 @@ mod tests {
     }
 
     #[test]
+    fn collecting_fitted_formulas_preserves_order_duplicates_and_frames() {
+        let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0]).unwrap();
+        let models = crate::parse_many(["y ~ x", "y ~ x - 1"])
+            .unwrap()
+            .fit(&data)
+            .unwrap();
+        let first = models.iter().next().unwrap();
+        let second = models.iter().nth(1).unwrap();
+        let entries = [second.clone(), first.clone(), second.clone()];
+        let collected = entries.iter().cloned().collect::<super::FittedFormulas>();
+
+        assert_eq!(collected.len(), entries.len());
+        for (actual, expected) in collected.iter().zip(&entries) {
+            assert_eq!(actual.formula(), expected.formula());
+            assert!(
+                actual
+                    .frame()
+                    .unwrap()
+                    .equals_missing(&expected.frame().unwrap())
+            );
+        }
+    }
+
+    #[test]
     fn models_select_preserves_formula_keys_order_and_fitted_state() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],

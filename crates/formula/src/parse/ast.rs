@@ -479,6 +479,16 @@ mod tests {
     }
 
     #[test]
+    fn non_nesting_kind_rejects_embedding() {
+        let node =
+            ParsedNode::<SingleFormulaExpression>::from_term(crate::Term::intercept()).unwrap();
+        assert!(matches!(
+            node.into_embedded(),
+            Err(ConstructionError::Unsupported)
+        ));
+    }
+
+    #[test]
     fn mixed_binary_wraps_the_flat_subtree_with_default_group_settings() {
         let flat =
             Node::binary(BinaryOperator::Interact, column("firm"), column("sector")).unwrap();
