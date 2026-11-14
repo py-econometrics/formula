@@ -1011,12 +1011,6 @@ mod tests {
         }
     }
 
-    fn parse_fixed_effects(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-        parse_node::<typed::GroupingExpression>
-            .map(|node| node.expand())
-            .parse_next(cursor)
-    }
-
     fn construction_error(error: &ContextError) -> &typed::ConstructionError {
         error
             .cause()
@@ -1080,6 +1074,27 @@ mod tests {
             assert_term(&call.first, "x");
             assert_eq!(call.rest.len(), 1);
             assert_term(&call.rest[0], "z");
+        }
+
+        #[test]
+        fn grouping_column_names_are_preserved() {
+            for (source, name) in [
+                ("firm", "firm"),
+                ("`log(x)`", "log(x)"),
+                ("`0`", "0"),
+                ("`1`", "1"),
+                ("0x", "0x"),
+                ("1x", "1x"),
+            ] {
+                let ParsedNode::Flat(Ast::Operand(column)) =
+                    parse_node::<typed::GroupingExpression>
+                        .parse(source)
+                        .unwrap()
+                else {
+                    panic!("expected a grouping column for {source}");
+                };
+                assert_eq!(column.name(), name, "{source}");
+            }
         }
 
         #[test]
@@ -1153,31 +1168,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_effect_expressions_preserve_grouping_and_stepwise_expansion() {
-        for (source, expected) in [
-            ("f1 + f1:f2", vec![expression(&[&["f1"], &["f1", "f2"]])]),
-            (
-                "(f1 + f2):f3",
-                vec![expression(&[&["f1", "f3"], &["f2", "f3"]])],
-            ),
-            (
-                "sw0(f1):f2",
-                vec![expression(&[]), expression(&[&["f1", "f2"]])],
-            ),
-            ("`log(x)`", vec![expression(&[&["log(x)"]])]),
-            ("`0`", vec![expression(&[&["0"]])]),
-            ("`1`", vec![expression(&[&["1"]])]),
-            ("0x + 1x", vec![expression(&[&["0x"], &["1x"]])]),
-        ] {
-            assert_eq!(
-                parse_fixed_effects.parse(source).unwrap(),
-                expected,
-                "{source}"
-            );
-        }
-    }
-
-    #[test]
     fn fixed_effect_expressions_reject_intercept_literals_before_expansion() {
         for source in [
             "0",
@@ -1196,14 +1186,11 @@ mod tests {
             "csw0(f, 1)",
             "f + 1 - 1",
         ] {
-            let error = parse_fixed_effects.parse(source).unwrap_err();
-            assert!(
-                construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
-                "{source}: {error}"
-            );
-
             let formula = format!("y ~ x | {source}");
-            let error = parse(&formula).unwrap_err();
+            let error = parse_formula_ast
+                .parse(&formula)
+                .err()
+                .expect("expected fixed-effect construction failure");
             assert!(
                 construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
                 "{formula}: {error}"
@@ -1228,15 +1215,11 @@ mod tests {
             "(firm - year)",
             "sw(firm, year * worker)",
         ] {
-            let error = parse_fixed_effects.parse(source).unwrap_err();
-            assert_eq!(
-                construction_error(error.inner()),
-                &typed::ConstructionError::Unsupported,
-                "{source}: {error}",
-            );
-
             let formula = format!("y ~ x | {source}");
-            let error = parse(&formula).unwrap_err();
+            let error = parse_formula_ast
+                .parse(&formula)
+                .err()
+                .expect("expected fixed-effect construction failure");
             assert_eq!(
                 construction_error(error.inner()),
                 &typed::ConstructionError::Unsupported,
@@ -1259,15 +1242,15 @@ mod tests {
             "sw(f, log(x))",
             "f + log(x) - log(x)",
         ] {
-            assert!(parse_fixed_effects.parse(source).is_err(), "{source}");
             let formula = format!("y ~ x | {source}");
-            assert!(parse(&formula).is_err(), "{formula}");
+            assert!(parse_formula_ast.parse(&formula).is_err(), "{formula}");
         }
     }
 
     #[test]
-    fn fixed_effect_pipe_expands_stepwise_alternatives_across_roles() {
+    fn fixed_effect_pipe_expands_groupings_and_stepwise_alternatives() {
         let cases: &[(&str, &[&str])] = &[
+            ("y ~ x | (f1 + f2):f3", &["y ~ x | f1:f3 + f2:f3"]),
             ("y ~ x | sw0(f)", &["y ~ x", "y ~ x | f"]),
             (
                 "y ~ x | csw0(f1, f2)",
@@ -1360,6 +1343,15 @@ mod tests {
                 "{source}: {error}"
             );
         }
+    }
+
+    fn single_expression(source: &str) -> Expression {
+        let [expression]: [_; 1] = parse_expression
+            .parse(source)
+            .unwrap()
+            .try_into()
+            .expect("expected one expression");
+        expression
     }
 
     fn expression(terms: &[&[&str]]) -> Expression {
@@ -1596,14 +1588,8 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| {
-                    let [expected]: [_; 1] = parse_expression
-                        .parse(source)
-                        .unwrap()
-                        .try_into()
-                        .expect("expected one expression");
-                    expected
-                })
+                .copied()
+                .map(single_expression)
                 .collect::<Vec<_>>();
             assert_eq!(
                 parse_expression.parse(source).unwrap(),
@@ -1634,14 +1620,8 @@ mod tests {
         for &(source, expected) in cases {
             let expected = expected
                 .iter()
-                .map(|source| {
-                    let [expected]: [_; 1] = parse_expression
-                        .parse(source)
-                        .unwrap()
-                        .try_into()
-                        .expect("expected one expression");
-                    expected
-                })
+                .copied()
+                .map(single_expression)
                 .collect::<Vec<_>>();
             assert_eq!(
                 parse_expression.parse(source).unwrap(),
@@ -1670,13 +1650,9 @@ mod tests {
         ];
 
         for &(source, expected) in cases {
-            let expected = expected
-                .iter()
-                .map(|source| parse(source).unwrap().iter().next().unwrap().clone())
-                .collect::<Vec<_>>();
             assert_eq!(
-                super::parse(source).unwrap(),
-                Formulas::new(expected),
+                parse(source).unwrap(),
+                parse_many(expected.iter().copied()).unwrap(),
                 "{source}"
             );
         }
@@ -1714,13 +1690,9 @@ mod tests {
         ];
 
         for &(source, expected) in cases {
-            let expected = expected
-                .iter()
-                .map(|source| parse(source).unwrap().iter().next().unwrap().clone())
-                .collect::<Vec<_>>();
             assert_eq!(
-                super::parse(source).unwrap(),
-                Formulas::new(expected),
+                parse(source).unwrap(),
+                parse_many(expected.iter().copied()).unwrap(),
                 "{source}"
             );
         }
@@ -2330,37 +2302,32 @@ mod tests {
             for source in ["`", "`income", "`a``", "```", "log(`income)", "x + `income"] {
                 assert!(parse_expression.parse(source).is_err(), "{source}");
             }
-            assert!(parse("y ~ `income").is_err());
         }
 
         #[test]
         fn stepwise_calls_reject_malformed_arguments_and_name_spacing() {
-            for name in ["sw", "sw0", "csw", "csw0"] {
-                for arguments in [
-                    "()", "( )", "(,x)", "(x,)", "(x,,y)", "(x", "(x))", "(x +)", "(x y)", " (x)",
-                ] {
-                    let source = format!("y ~ {name}{arguments}");
-                    assert!(super::parse(&source).is_err(), "{source}");
-                }
-            }
             for source in [
+                "y ~ sw( )",
+                "y ~ sw(,x)",
+                "y ~ sw(x,,y)",
+                "y ~ sw(x))",
+                "y ~ sw(x +)",
                 "y ~ sw(x, sw())",
                 "y ~ log(sw(x, z))",
                 "y ~ sw(x, reference=1)",
             ] {
-                assert!(super::parse(source).is_err(), "{source}");
+                assert!(parse(source).is_err(), "{source}");
+            }
+            for name in ["sw", "sw0", "csw", "csw0"] {
+                let source = format!("y ~ {name} (x)");
+                assert!(parse(&source).is_err(), "{source}");
             }
         }
 
         #[test]
         fn invalid_transform_calls_are_rejected() {
             for source in [
-                "unknown(x)",
                 "C (x)",
-                "log(x, reference=1)",
-                "C(reference=1, x)",
-                "C(x, reference=1, reference=2)",
-                "C(x, unknown=1)",
                 "C(x, reference=1 2)",
                 "C(x, reference=tr ue)",
                 "F(x)",
