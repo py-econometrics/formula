@@ -1,8 +1,8 @@
-use super::input::{input_frame, validate_numeric_input};
+use super::input::{PreparedInput, validate_numeric_field};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::error::PolarsError;
-use polars::prelude::{Column, DataType, Expr, IntoLazy, PlSmallStr, col, lit};
+use polars::prelude::{DataType, Expr, Field, IntoLazy, PlSmallStr, col, lit};
 
 type ExpressionBuilder = fn(&[Expr]) -> Result<Expr, TransformError>;
 
@@ -12,9 +12,9 @@ enum InputPolicy {
 }
 
 impl InputPolicy {
-    fn validate(self, input: &Column) -> Result<(), TransformError> {
+    fn validate(self, input: &Field) -> Result<(), TransformError> {
         match self {
-            Self::NumericFloat64 => validate_numeric_input(input),
+            Self::NumericFloat64 => validate_numeric_field(input),
         }
     }
 
@@ -43,6 +43,20 @@ pub(crate) struct ExpressionTransform {
 impl PartialEq for ExpressionTransform {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+    }
+}
+
+impl TransformDefinition for ExpressionTransform {
+    fn expands(&self) -> bool {
+        false
+    }
+
+    fn argument_count(&self) -> ArgumentCount {
+        self.argument_count
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
     }
 }
 
@@ -116,49 +130,31 @@ impl ExpressionTransform {
         },
     };
 
-    fn output_name(&self, inputs: &[Column]) -> PlSmallStr {
-        call_name(self.name, inputs.iter().map(|input| input.name().as_str()))
+    fn output_name(&self, inputs: &PreparedInput) -> PlSmallStr {
+        call_name(
+            self.name,
+            inputs.fields.iter().map(|input| input.name().as_str()),
+        )
     }
-
-    fn validate_inputs(&self, inputs: &[Column]) -> Result<(), TransformError> {
-        if !self.argument_count.accepts(inputs.len()) {
+    fn validate_inputs(&self, inputs: &PreparedInput) -> Result<(), TransformError> {
+        if !self.argument_count.accepts(inputs.fields.len()) {
             return Err(TransformError::InputCountMismatch {
                 expected: self.argument_count,
-                actual: inputs.len(),
+                actual: inputs.fields.len(),
             });
         }
-        for input in inputs {
-            self.input_policy.validate(input)?;
+        for field in &inputs.fields {
+            self.input_policy.validate(field)?;
         }
         Ok(())
-    }
-}
-
-impl TransformDefinition for ExpressionTransform {
-    fn expands(&self) -> bool {
-        false
-    }
-
-    fn argument_count(&self) -> ArgumentCount {
-        self.argument_count
-    }
-
-    fn name(&self) -> &'static str {
-        self.name
-    }
-}
-
-impl ExpressionTransform {
-    pub(crate) fn fit(&self) -> Self {
-        self.clone()
     }
 
     pub(crate) fn transform(
         &self,
-        inputs: &[Column],
+        inputs: &PreparedInput,
     ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
         self.validate_inputs(inputs)?;
-        let frame = input_frame(inputs)?;
+        let frame = inputs.frame.clone();
         let height = frame.height();
         let expressions = frame
             .columns()
@@ -190,6 +186,7 @@ mod tests {
     use super::*;
     use crate::parse::parse_expression;
     use crate::transform::Transform;
+    use polars::prelude::Column;
     use polars::prelude::DataFrame;
     use winnow::Parser;
 
@@ -226,6 +223,10 @@ mod tests {
                 (actual, expected) => panic!("actual {actual:?}, expected {expected:?}"),
             }
         }
+    }
+
+    fn prepare(inputs: &[Column]) -> PreparedInput {
+        PreparedInput::new(inputs, false).unwrap()
     }
 
     #[test]
@@ -410,7 +411,7 @@ mod tests {
             build: |inputs| Ok(inputs[0].clone().first()),
             ..ExpressionTransform::LOG
         };
-        let inputs = [Column::new("x".into(), [1.0, 2.0])];
+        let inputs = prepare(&[Column::new("x".into(), [1.0, 2.0])]);
         assert!(matches!(
             transform.transform(&inputs),
             Err(TransformError::Polars(PolarsError::ShapeMismatch(_)))
@@ -509,7 +510,7 @@ mod tests {
                 "number of input columns: expected at least 2, received 1",
             ),
         ] {
-            let inputs = vec![Column::new("x".into(), [1.0, 2.0]); count];
+            let inputs = prepare(&vec![Column::new("x".into(), [1.0, 2.0]); count]);
             let Err(error @ TransformError::InputCountMismatch { .. }) =
                 transform.transform(&inputs)
             else {

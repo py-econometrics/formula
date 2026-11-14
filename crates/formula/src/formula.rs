@@ -6,7 +6,7 @@ use crate::parse::{
 };
 use crate::transform::{
     ArgumentCount, GroupedTransform, IntegerEncodingDefinition, Transform, TransformError,
-    validate_numeric_input,
+    validate_numeric_field,
 };
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
@@ -468,7 +468,7 @@ impl Term {
                 let [column] = result.columns.frame.columns() else {
                     unreachable!("a variable transforms to exactly one column");
                 };
-                validate_numeric_input(column)?;
+                validate_numeric_field(&column.field())?;
             }
             factors.push(Arc::clone(&result.factor));
             factor_columns.push(
@@ -1244,7 +1244,9 @@ mod tests {
             Column::new("time".into(), [1.0, 2.0]),
             Column::new("exposure".into(), [0.5, 1.0]),
         ];
-        let output = crate::transform::GroupedTransform::new(false).transform(&inputs)?;
+        let output = Transform::G(GroupedTransform::new(false))
+            .transform(&inputs)
+            .unwrap();
 
         assert_eq!(
             output.metadata,
@@ -3403,8 +3405,8 @@ mod tests {
         let model = fit("y ~ exp(add(f1, f2)) - 1", &training);
         let transformed = model.transform(&input).unwrap();
 
-        let inner = ExpressionTransform::ADD.fit();
-        let outer = ExpressionTransform::EXP.fit();
+        let inner = Transform::Expression(ExpressionTransform::ADD);
+        let outer = Transform::Expression(ExpressionTransform::EXP);
 
         for (data, design) in [
             (&training, model.expression(Role::Independent).unwrap()),
