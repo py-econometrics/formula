@@ -411,6 +411,7 @@ fn parse_stepwise<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::P
             "sw".value(StepwiseOperator::Sw),
             "csw0".value(StepwiseOperator::Csw0),
             "csw".value(StepwiseOperator::Csw),
+            "mvsw".value(StepwiseOperator::Mvsw),
         )),
         '(',
     )
@@ -1568,6 +1569,62 @@ mod tests {
     }
 
     #[test]
+    fn multiverse_stepwise_expands_argument_subsets() {
+        let cases: &[(&str, &[&str])] = &[
+            ("y ~ mvsw(x)", &["y~1", "y~x"]),
+            (
+                "y ~ mvsw(a, b, c, d)",
+                &[
+                    "y~1",
+                    "y~a",
+                    "y~b",
+                    "y~c",
+                    "y~d",
+                    "y~a+b",
+                    "y~a+c",
+                    "y~a+d",
+                    "y~b+c",
+                    "y~b+d",
+                    "y~c+d",
+                    "y~a+b+c",
+                    "y~a+b+d",
+                    "y~a+c+d",
+                    "y~b+c+d",
+                    "y~a+b+c+d",
+                ],
+            ),
+            ("y ~ mvsw(x + z, w)", &["y~1", "y~x+z", "y~w", "y~x+z+w"]),
+            (
+                "y ~ mvsw(sw(x, z), w)",
+                &["y~1", "y~x", "y~z", "y~w", "y~x+w", "y~z+w"],
+            ),
+            (
+                "y ~ sw(mvsw(x, z), w)",
+                &["y~1", "y~x", "y~z", "y~x+z", "y~w"],
+            ),
+            ("y ~ mvsw(x, x)", &["y~1", "y~x"]),
+            (
+                "y ~ a - 1 + mvsw(x, z)",
+                &["y~a-1", "y~a+x-1", "y~a+z-1", "y~a+x+z-1"],
+            ),
+            ("y ~ mvsw(x, z):w", &["y~1", "y~x:w", "y~z:w", "y~x:w+z:w"]),
+            (
+                "y ~ x | mvsw(firm, year)",
+                &["y~x", "y~x|firm", "y~x|year", "y~x|firm+year"],
+            ),
+        ];
+
+        for &(source, expected) in cases {
+            let actual = parse(source).unwrap();
+            let expected = parse_many(expected.iter().copied()).unwrap();
+            assert_eq!(actual.len(), expected.len(), "{source}");
+            for formula in &expected {
+                assert!(actual.iter().any(|value| value == formula), "{source}");
+            }
+        }
+    }
+
+    #[test]
     fn stepwise_operators_expand_in_order() {
         let cases: &[(&str, &[&str])] = &[
             ("sw(x, z)", &["x", "z"]),
@@ -1810,7 +1867,15 @@ mod tests {
 
     #[test]
     fn stepwise_name_prefixes_remain_valid_column_names() {
-        for name in ["sw", "sw_value", "sw0_value", "csw_value", "csw0_value"] {
+        for name in [
+            "sw",
+            "sw_value",
+            "sw0_value",
+            "csw_value",
+            "csw0_value",
+            "mvsw",
+            "mvsw_value",
+        ] {
             assert_eq!(
                 parse_expression.parse(name).unwrap(),
                 vec![expression(&[&[name]])],
@@ -2315,10 +2380,14 @@ mod tests {
                 "y ~ sw(x, sw())",
                 "y ~ log(sw(x, z))",
                 "y ~ sw(x, reference=1)",
+                "y ~ mvsw()",
+                "y ~ mvsw(,x)",
+                "y ~ mvsw(x,,y)",
+                "y ~ mvsw(x +)",
             ] {
                 assert!(parse(source).is_err(), "{source}");
             }
-            for name in ["sw", "sw0", "csw", "csw0"] {
+            for name in ["sw", "sw0", "csw", "csw0", "mvsw"] {
                 let source = format!("y ~ {name} (x)");
                 assert!(parse(&source).is_err(), "{source}");
             }
