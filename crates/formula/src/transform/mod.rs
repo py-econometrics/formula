@@ -95,13 +95,21 @@ impl Transform {
     pub(crate) fn fit(&self, inputs: &[Column]) -> Result<Self, TransformError> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits + 1, transforms));
-
-        let inputs = self.input(inputs)?;
         match self {
+            Self::C(categorical) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::C(categorical.fit(&inputs)?))
+            }
+            Self::Poly(polynomial) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::Poly(polynomial.fit(&inputs)?))
+            }
+            Self::F(integer) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::F(integer.fit(&inputs)?))
+            }
+
             Self::Expression(expression) => Ok(Self::Expression(expression.clone())),
-            Self::C(categorical) => Ok(Self::C(categorical.fit(&inputs)?)),
-            Self::Poly(polynomial) => Ok(Self::Poly(polynomial.fit(&inputs)?)),
-            Self::F(integer) => Ok(Self::F(integer.fit(&inputs)?)),
             Self::G(grouped) => Ok(Self::G(grouped.clone())),
         }
     }
