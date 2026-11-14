@@ -4,6 +4,7 @@ mod grouped;
 mod input;
 mod integer;
 mod polynomial;
+pub mod state;
 
 pub(crate) use categorical::CategoricalDefinition;
 pub(crate) use expression::ExpressionTransform;
@@ -13,6 +14,7 @@ use input::PreparedInput;
 pub(crate) use input::validate_numeric_field;
 pub(crate) use integer::IntegerEncodingDefinition;
 pub(crate) use polynomial::PolynomialDefinition;
+pub use state::{StateValue, TransformState};
 use std::collections::BTreeMap;
 
 use crate::fit::{Fit, FitError};
@@ -20,6 +22,7 @@ use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::categorical::CategoricalState;
 use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
+use crate::transform::state::ExportState;
 use polars::error::PolarsError;
 use polars::prelude::{Column, PlSmallStr, Scalar};
 
@@ -132,10 +135,21 @@ impl Transform {
             Self::G(grouped) => grouped.transform(&inputs).map_err(FitError::Transform),
         }
     }
+
+    pub(crate) fn state(&self) -> Option<TransformState> {
+        match self {
+            Self::C(categorical) => categorical.state().map(|_| TransformState::default()),
+            Self::Poly(polynomial) => polynomial.state().map(|_| TransformState::default()),
+            Self::F(integer) => integer.state().map(ExportState::export_state),
+
+            Self::Expression(_) => Some(TransformState::default()),
+            Self::G(_) => Some(TransformState::default()),
+        }
+    }
 }
 
 #[cfg(test)]
-std::thread_local! {
+thread_local! {
     /// Counts (fit calls, transform calls) on the current test thread.
     pub(crate) static TRANSFORM_CALLS: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
@@ -239,6 +253,7 @@ mod tests {
         let inputs = [Column::new("group".into(), ["a", "b", "a"])];
         let transform = Transform::F(Fit::Unfitted(IntegerEncodingDefinition));
 
+        assert!(transform.state().is_none());
         assert!(!transform.expands());
         assert_eq!(transform.argument_count(), ArgumentCount::AtLeast(1));
         assert!(matches!(
@@ -247,12 +262,57 @@ mod tests {
         ));
 
         let transform = transform.fit(&inputs)?;
+        let state = transform.state().expect("fitted encoder exposes its state");
+        assert_eq!(state.iter().count(), 2);
+        assert!(matches!(state.get("codes"), Some(StateValue::DataFrame(_))));
+        assert!(matches!(
+            state.get("levels"),
+            Some(StateValue::DataFrame(_))
+        ));
         let output = transform.transform(&inputs).unwrap();
         assert_eq!(output.frame().get_column_names(), ["group"]);
         assert_eq!(
             output.frame()[0].u32()?.iter().collect::<Vec<_>>(),
             vec![Some(0), Some(1), Some(0)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn state_distinguishes_unfitted_transforms_from_empty_snapshots() -> Result<(), TransformError>
+    {
+        let inputs = [Column::new("x".into(), [1.0, 2.0, 1.0])];
+        for transform in [
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+            Transform::Poly(Fit::Unfitted(PolynomialDefinition::new(
+                None,
+                Some(Scalar::from(true)),
+            )?)),
+        ] {
+            assert!(transform.state().is_none());
+            let fitted = transform.fit(&inputs)?;
+            assert!(
+                fitted
+                    .state()
+                    .expect("fitted transform has a snapshot")
+                    .iter()
+                    .next()
+                    .is_none()
+            );
+        }
+        for transform in [
+            Transform::Expression(ExpressionTransform::LOG),
+            Transform::G(GroupedTransform::new(false)),
+        ] {
+            assert!(
+                transform
+                    .state()
+                    .expect("stateless transform has an empty snapshot")
+                    .iter()
+                    .next()
+                    .is_none()
+            );
+        }
         Ok(())
     }
 }

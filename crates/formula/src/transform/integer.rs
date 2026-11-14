@@ -1,7 +1,9 @@
 use super::input::{PreparedInput, argument_column_name};
-use super::{ArgumentCount, TransformDefinition, TransformError};
+use super::{ArgumentCount, StateValue, TransformDefinition, TransformError};
+use crate::TransformState;
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
+use crate::transform::state::ExportState;
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
     Column, DataFrame, DataType, Field, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin, NULL,
@@ -200,6 +202,47 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
     }
 }
 
+impl ExportState for IntegerEncodingState {
+    fn export_state(&self) -> TransformState {
+        let (codes, mut levels) = match &self.encoding {
+            IntegerEncoding::Mapping(mapping) => {
+                let codes = mapping
+                    .column(IntegerEncodingDefinition::CODE_COLUMN)
+                    .expect("fitted mapping contains its code column")
+                    .clone();
+
+                let levels = mapping
+                    .select((0..self.fields.len()).map(argument_column_name))
+                    .expect("fitted mapping contains each input column");
+
+                (codes, levels)
+            }
+            IntegerEncoding::Native(levels) => {
+                let codes = levels
+                    .to_physical_repr()
+                    .cast(&DataType::UInt32)
+                    .expect("categorical codes can be widened to UInt32");
+
+                (codes, levels.clone().into_frame())
+            }
+        };
+
+        let codes = codes.with_name("code".into()).into_frame();
+        let names = self
+            .fields
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        levels
+            .set_column_names(&names)
+            .expect("fitted fields match the level columns");
+        TransformState::new([
+            ("codes".into(), StateValue::DataFrame(codes)),
+            ("levels".into(), StateValue::DataFrame(levels)),
+        ])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::input::argument_column_name;
@@ -211,6 +254,115 @@ mod tests {
 
     fn prepare(inputs: &[Column]) -> PreparedInput {
         PreparedInput::new(inputs, true).unwrap()
+    }
+
+    fn exported_frame<'a>(state: &'a TransformState, name: &str) -> &'a DataFrame {
+        match state.get(name) {
+            Some(StateValue::DataFrame(frame)) => frame,
+            _ => panic!("expected a DataFrame for {name}"),
+        }
+    }
+
+    #[test]
+    fn exported_mapping_preserves_codes_and_original_level_schema() -> Result<(), TransformError> {
+        let inputs = prepare(&[
+            Column::new(
+                "firm".into(),
+                [Some("a"), Some("b"), Some("a"), Some("a"), None],
+            ),
+            Column::new("year".into(), [2020_i32, 2020, 2021, 2020, 2022]),
+        ]);
+        let fitted = Fitted::fit(IntegerEncodingDefinition, &inputs)?;
+        let state = fitted.state.export_state();
+        assert_eq!(state.iter().count(), 2);
+
+        let codes = exported_frame(&state, "codes");
+        let expected_codes = polars::df!("code" => [0_u32, 1, 2])?;
+        assert_eq!(codes.schema(), expected_codes.schema());
+        assert!(codes.equals_missing(&expected_codes));
+
+        let levels = exported_frame(&state, "levels");
+        let expected_levels = polars::df!(
+            "firm" => ["a", "b", "a"],
+            "year" => [2020_i32, 2020, 2021],
+        )?;
+        assert_eq!(levels.schema(), expected_levels.schema());
+        assert!(levels.equals_missing(&expected_levels));
+        assert_integer_output(
+            fitted.transform(&inputs)?.frame(),
+            &[Some(0), Some(1), Some(2), Some(0), None],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exported_native_levels_keep_nonconsecutive_physical_codes() -> Result<(), TransformError> {
+        for dtype in native_dtypes() {
+            let inputs =
+                prepare(&[
+                    Column::new("group".into(), [Some("d"), None, Some("b"), Some("d")])
+                        .cast(&dtype)?,
+                ]);
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &inputs)?;
+            let state = fitted.state.export_state();
+
+            let codes = exported_frame(&state, "codes");
+            let expected_codes = polars::df!("code" => [3_u32, 1])?;
+            assert_eq!(codes.schema(), expected_codes.schema());
+            assert!(codes.equals_missing(&expected_codes));
+
+            let levels = exported_frame(&state, "levels");
+            let expected_levels = Column::new("group".into(), ["d", "b"])
+                .cast(&dtype)?
+                .into_frame();
+            assert_eq!(levels.schema(), expected_levels.schema());
+            assert!(levels.equals_missing(&expected_levels));
+            assert_integer_output(
+                fitted.transform(&inputs)?.frame(),
+                &[Some(3), None, Some(1), Some(3)],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exported_empty_dictionaries_retain_codes_and_level_schemas() -> Result<(), TransformError> {
+        let mut cases = vec![
+            vec![
+                Column::new("firm".into(), Vec::<&str>::new()),
+                Column::new("year".into(), Vec::<i32>::new()),
+            ],
+            vec![
+                Column::new("firm".into(), [None::<&str>]),
+                Column::new("year".into(), [None::<i32>]),
+            ],
+        ];
+        for dtype in native_dtypes() {
+            cases.push(vec![
+                Column::new("group".into(), Vec::<&str>::new()).cast(&dtype)?,
+            ]);
+            cases.push(vec![
+                Column::new("group".into(), [None::<&str>]).cast(&dtype)?,
+            ]);
+        }
+
+        let expected_codes = Column::new("code".into(), Vec::<u32>::new()).into_frame();
+        for columns in cases {
+            let expected_levels = DataFrame::new(
+                0,
+                columns.iter().map(|column| column.head(Some(0))).collect(),
+            )?;
+            let inputs = prepare(&columns);
+            let fitted = Fitted::fit(IntegerEncodingDefinition, &inputs)?;
+            let state = fitted.state.export_state();
+            let codes = exported_frame(&state, "codes");
+            let levels = exported_frame(&state, "levels");
+            assert_eq!(codes.schema(), expected_codes.schema());
+            assert!(codes.equals_missing(&expected_codes));
+            assert_eq!(levels.schema(), expected_levels.schema());
+            assert!(levels.equals_missing(&expected_levels));
+        }
+        Ok(())
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use crate::SelectionError;
 use crate::fit::{Definition, Fit};
 use crate::model::{FittedFormula, FittedFormulas, ModelError};
 use crate::parse::{
@@ -8,6 +7,7 @@ use crate::transform::{
     ArgumentCount, GroupedTransform, IntegerEncodingDefinition, Transform, TransformError,
     validate_numeric_field,
 };
+use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -265,6 +265,10 @@ impl<'a> TransformCall<'a> {
 
     pub fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
         self.transform.parameters()
+    }
+
+    pub fn state(&self) -> Option<TransformState> {
+        self.transform.state()
     }
 }
 
