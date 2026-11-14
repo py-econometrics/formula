@@ -66,17 +66,29 @@ impl StepwiseOperator {
 
             Self::Csw | Self::Csw0 => {
                 let mut prefixes = vec![formula::Expression::from_iter([])];
-                let mut alternatives = Vec::new();
+                let mut steps = Vec::new();
 
                 for argument in arguments {
                     prefixes = cartesian_product_with(&prefixes, &argument, |prefix, value| {
                         prefix.add(value)
                     });
 
-                    alternatives.extend(prefixes.iter().cloned());
+                    steps.extend(prefixes.iter().cloned());
                 }
 
-                alternatives
+                steps
+            }
+
+            Self::Mvsw => {
+                let mut steps = vec![formula::Expression::from_iter([])];
+                for argument in arguments {
+                    let included = cartesian_product_with(&steps, &argument, |prefix, value| {
+                        prefix.add(value)
+                    });
+
+                    steps.extend(included);
+                }
+                steps
             }
         };
 

@@ -95,6 +95,7 @@ pub(super) enum StepwiseOperator {
     Sw0,
     Csw,
     Csw0,
+    Mvsw,
 }
 
 /// A nonempty sequence of stepwise arguments.
