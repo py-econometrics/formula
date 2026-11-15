@@ -1,6 +1,6 @@
 use crate::parse::ast::{
-    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParseLayers,
-    ParsedNode, StepwiseOperator,
+    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParsedNode,
+    StepwiseOperator,
 };
 use crate::{Factor, formula};
 
@@ -295,15 +295,15 @@ where
     }
 }
 
-impl<K: ParseLayers> ParsedNode<K>
+impl<K: ExpressionKind> ParsedNode<K>
 where
     K::Operand: OperandExpansion,
-    <K::Embedded as ExpressionKind>::Operand: OperandExpansion,
+    <K::Inner as ExpressionKind>::Operand: OperandExpansion,
 {
     pub(in crate::parse) fn expand(&self) -> Vec<formula::Expression> {
         match self {
-            Self::Flat(expression) => expression.expand(),
-            Self::Embedded(expression) => expression.expand(),
+            Self::Inner(expression) => expression.expand(),
+            Self::Outer(expression) => expression.expand(),
         }
     }
 
@@ -312,8 +312,8 @@ where
         accumulated: formula::Expression,
     ) -> Vec<formula::Expression> {
         match self {
-            Self::Flat(expression) => expression.apply_to(accumulated),
-            Self::Embedded(expression) => expression.apply_to(accumulated),
+            Self::Inner(expression) => expression.apply_to(accumulated),
+            Self::Outer(expression) => expression.apply_to(accumulated),
         }
     }
 }
