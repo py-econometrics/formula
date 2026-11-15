@@ -1,188 +1,119 @@
-//! Operand grammars and their composition into an expression layer.
-
+//! Recognize the language once, then construct typed operands through TryFrom.
+//! The input enum describes syntax, not the AST's available layer types.
 use super::ast::{
-    ConstructionError, ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden,
-    MultistageOperand, ParsedNode,
+    ConstructionError, ExpressionAst, ExpressionKind, FixedEffect, Forbidden, FormulaAst,
+    LayerOperand, Loaded,
 };
 use super::{construction_result, parse_factor, parse_formula_ast, parse_loadings};
+use crate::Term;
 use crate::formula::VariableDefinition;
-use crate::{Factor, Term};
-use std::sync::Arc;
 use winnow::ascii::multispace0;
-use winnow::combinator::{Postfix, alt, cut_err, fail, peek, preceded, terminated};
+use winnow::combinator::{Postfix, alt, cut_err, preceded, terminated};
 use winnow::error::{ContextError, ErrMode, StrContext, StrContextValue};
 use winnow::token::take_while;
 use winnow::{ModalResult, Parser};
 
-/// `0` spells a negated intercept. Applying the negation is expression
-/// construction, so operand parsing records it without constructing a node.
-pub(super) struct Primary<O> {
-    operand: O,
-    negate: bool,
+/// A recognized operand production, before admission to a typed AST.
+/// Rejected inputs are returned intact, allowing an atom to be tried in the
+/// inner layer without cloning it or parsing its tokens again.
+pub(super) enum ParsedOperand<I: ExpressionKind> {
+    Term(Term),
+    Child(FormulaAst),
+    Loaded(Loaded<FixedEffect<I>>),
 }
 
-impl<O> From<O> for Primary<O> {
-    fn from(operand: O) -> Self {
-        Self {
-            operand,
-            negate: false,
+impl<I: ExpressionKind> TryFrom<ParsedOperand<I>> for Term {
+    type Error = ParsedOperand<I>;
+    fn try_from(input: ParsedOperand<I>) -> Result<Self, Self::Error> {
+        match input {
+            ParsedOperand::Term(term) => Ok(term),
+            other => Err(other),
         }
     }
 }
-
-/// Parse an operand without knowing its containing layer or operator vocabulary.
-/// A postfix constructs this operand from an expression in the inner layer.
-pub(super) trait OperandSyntax<I: ExpressionKind>: Sized {
-    fn primary(cursor: &mut &str) -> ModalResult<Primary<Self>> {
-        fail.parse_next(cursor)
-    }
-
-    fn postfix(cursor: &mut &str) -> ModalResult<OperandPostfix<I, Self>> {
-        fail.parse_next(cursor)
-    }
-}
-
-impl OperandSyntax<Forbidden> for Forbidden {}
-
-impl OperandSyntax<Forbidden> for Term {
-    fn primary(cursor: &mut &str) -> ModalResult<Primary<Self>> {
-        alt((
-            take_while(1.., super::is_identifier_character)
-                .verify(|name: &str| matches!(name, "0" | "1"))
-                .map(|name| Primary {
-                    operand: Term::intercept(),
-                    negate: name == "0",
-                }),
-            parse_factor.map(|factor| Primary::from(Term::from(factor))),
-        ))
-        .parse_next(cursor)
+impl<I: ExpressionKind> TryFrom<ParsedOperand<I>> for VariableDefinition {
+    type Error = ParsedOperand<I>;
+    fn try_from(input: ParsedOperand<I>) -> Result<Self, Self::Error> {
+        match input {
+            ParsedOperand::Term(term) => {
+                Self::try_from(term.clone()).map_err(|_| ParsedOperand::Term(term))
+            }
+            other => Err(other),
+        }
     }
 }
-
-impl OperandSyntax<Forbidden> for VariableDefinition {
-    fn primary(cursor: &mut &str) -> ModalResult<Primary<Self>> {
-        let primary = Term::primary(cursor)?;
-        let operand = construction_result(
-            cursor,
-            Self::try_from(primary.operand).map_err(|_| ConstructionError::Unsupported),
-        )?;
-        Ok(Primary {
-            operand,
-            negate: primary.negate,
-        })
+impl<I: ExpressionKind> TryFrom<ParsedOperand<I>> for FormulaAst {
+    type Error = ParsedOperand<I>;
+    fn try_from(input: ParsedOperand<I>) -> Result<Self, Self::Error> {
+        match input {
+            ParsedOperand::Child(child) => Ok(child),
+            other => Err(other),
+        }
     }
 }
-
-impl<I: ExpressionKind> OperandSyntax<I> for MultistageOperand<I> {
-    fn primary(cursor: &mut &str) -> ModalResult<Primary<Self>> {
-        child_formula(cursor).map(|formula| Self::Child(Box::new(formula)).into())
+impl<I: ExpressionKind> TryFrom<ParsedOperand<I>> for Loaded<FixedEffect<I>> {
+    type Error = ParsedOperand<I>;
+    fn try_from(input: ParsedOperand<I>) -> Result<Self, Self::Error> {
+        match input {
+            ParsedOperand::Loaded(loaded) => Ok(loaded),
+            other => Err(other),
+        }
     }
 }
-
-/// Unlike a Pratt postfix, this constructs an operand from an inner expression.
-/// The shared adapter handles the change between expression layers.
-pub(super) struct OperandPostfix<I: ExpressionKind, O> {
-    precedence: i64,
-    finish: fn(&mut &str, ExpressionAst<I>) -> ModalResult<O>,
+impl<I: ExpressionKind> TryFrom<ParsedOperand<I>> for Forbidden {
+    type Error = ParsedOperand<I>;
+    fn try_from(input: ParsedOperand<I>) -> Result<Self, Self::Error> {
+        Err(input)
+    }
 }
-
-impl<I: ExpressionKind> OperandSyntax<I> for FixedEffectGroup<I> {
-    fn postfix(cursor: &mut &str) -> ModalResult<OperandPostfix<I, Self>> {
-        alt((
-            "[[".map(|_| OperandPostfix {
-                precedence: 25,
-                finish: loaded_group::<I, false>,
-            }),
-            '['.map(|_| OperandPostfix {
-                precedence: 25,
-                finish: loaded_group::<I, true>,
-            }),
-        ))
-        .parse_next(cursor)
+impl TryFrom<Term> for Forbidden {
+    type Error = ConstructionError;
+    fn try_from(_: Term) -> Result<Self, Self::Error> {
+        Err(ConstructionError::Unsupported)
+    }
+}
+impl<I: ExpressionKind, B, N> TryFrom<ParsedOperand<I>> for LayerOperand<B, N>
+where
+    N: TryFrom<ParsedOperand<I>, Error = ParsedOperand<I>>,
+{
+    type Error = ParsedOperand<I>;
+    fn try_from(input: ParsedOperand<I>) -> Result<Self, Self::Error> {
+        N::try_from(input).map(|nested| Self::Nested(Box::new(nested)))
     }
 }
 
-fn loaded_group<I: ExpressionKind, const INTERCEPT: bool>(
-    cursor: &mut &str,
-    group: ExpressionAst<I>,
-) -> ModalResult<FixedEffectGroup<I>> {
-    let loadings = loading_tail::<INTERCEPT>(cursor)?;
-    Ok(FixedEffectGroup {
-        group,
-        intercept: INTERCEPT,
-        loadings,
-    })
-}
-
-/// A shorthand for the operand-parser bounds, derived for every eligible kind.
-/// There are no grammar choices or per-layer implementations here.
-/// ParsedNode tracks one promotion boundary, so its inner layer must be a leaf;
-/// arbitrary stacks would require recursive parsing state, not more grammars.
+/// One constructor interface, independent of how many productions the language
+/// recognizes. As before, the parser carries one inner-to-outer boundary.
 pub(super) trait ParseLayer:
     ExpressionKind<
-        Operand: OperandSyntax<Self::Inner>,
-        Inner: ExpressionKind<Inner = Forbidden, Operand: OperandSyntax<Forbidden>>,
+        Operand: TryFrom<ParsedOperand<Self::Inner>, Error = ParsedOperand<Self::Inner>>,
+        Inner: ExpressionKind<Inner = Forbidden, Operand: TryFrom<Term>>,
     >
 {
 }
-
-impl<K> ParseLayer for K
-where
-    K: ExpressionKind<Operand: OperandSyntax<K::Inner>>,
-    K::Inner: ExpressionKind<Inner = Forbidden, Operand: OperandSyntax<Forbidden>>,
+impl<K> ParseLayer for K where
+    K: ExpressionKind<
+            Operand: TryFrom<ParsedOperand<K::Inner>, Error = ParsedOperand<K::Inner>>,
+            Inner: ExpressionKind<Inner = Forbidden, Operand: TryFrom<Term>>,
+        >
 {
 }
 
-pub(super) fn primary<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ParsedNode<K>> {
-    let outer = K::Operand::primary.map(|primary| {
-        (
-            ParsedNode::Outer(ExpressionAst::Operand(primary.operand)),
-            primary.negate,
-        )
-    });
-    let inner = <K::Inner as ExpressionKind>::Operand::primary.map(|primary| {
-        (
-            ParsedNode::Inner(ExpressionAst::Operand(primary.operand)),
-            primary.negate,
-        )
-    });
-    let reject_child = |cursor: &mut &str| {
-        child_formula(cursor)?;
-        construction_result(cursor, Err(ConstructionError::Unsupported))
-    };
-    let (node, negate) = alt((outer, inner, reject_child)).parse_next(cursor)?;
-    if negate {
-        construction_result(cursor, node.negate())
-    } else {
-        Ok(node)
+/// All productions use the same admission path. Only an ordinary atom can start
+/// in the inner layer; structured operands must inhabit the requested layer.
+fn construct<K: ParseLayer>(
+    input: ParsedOperand<K::Inner>,
+) -> Result<ExpressionAst<K>, ConstructionError> {
+    match K::Operand::try_from(input) {
+        Ok(operand) => Ok(ExpressionAst::Operand(operand)),
+        Err(ParsedOperand::Term(term)) => ExpressionAst::<K::Inner>::try_operand(term)
+            .and_then(ExpressionAst::<K>::try_operand::<ExpressionAst<K::Inner>>),
+        Err(_) => Err(ConstructionError::Unsupported),
     }
 }
 
-type PostfixRule<'i, K> = Postfix<&'i str, ParsedNode<K>, ErrMode<ContextError>>;
-
-pub(super) fn postfix<'i, K: ParseLayer>(cursor: &mut &'i str) -> ModalResult<PostfixRule<'i, K>> {
-    // Winnow's postfix callback is a function pointer with the same input and
-    // output type. Peek at the operand rule here, then read it in the callback
-    // that adapts the inner expression to an outer operand.
-    let supported = peek(K::Operand::postfix).map(|rule| {
-        Postfix(rule.precedence, |cursor, node: ParsedNode<K>| {
-            let rule = K::Operand::postfix(cursor)?;
-            let inner = construction_result(cursor, node.into_inner())?;
-            (rule.finish)(cursor, inner)
-                .map(|operand| ParsedNode::Outer(ExpressionAst::Operand(operand)))
-        })
-    });
-    // Recognize unsupported loading syntax too, retaining its syntax diagnostics.
-    alt((
-        supported,
-        "[[".value(Postfix(25, reject_loadings::<K, false>)),
-        '['.value(Postfix(25, reject_loadings::<K, true>)),
-    ))
-    .parse_next(cursor)
-}
-
-fn child_formula(cursor: &mut &str) -> ModalResult<super::ast::FormulaAst> {
-    preceded(
+pub(super) fn primary<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ExpressionAst<K>> {
+    let child = preceded(
         '[',
         cut_err(terminated(
             parse_formula_ast,
@@ -191,24 +122,46 @@ fn child_formula(cursor: &mut &str) -> ModalResult<super::ast::FormulaAst> {
             ))),
         )),
     )
+    .map(|child| (ParsedOperand::Child(child), false));
+    let intercept = take_while(1.., super::is_identifier_character)
+        .verify(|name: &str| matches!(name, "0" | "1"))
+        .map(|name| (ParsedOperand::Term(Term::intercept()), name == "0"));
+    let factor = parse_factor.map(|factor| (ParsedOperand::Term(Term::from(factor)), false));
+    let (input, negate) = alt((child, intercept, factor)).parse_next(cursor)?;
+    let node = construction_result(cursor, construct::<K>(input))?;
+    if negate {
+        construction_result(cursor, node.negate())
+    } else {
+        Ok(node)
+    }
+}
+
+type PostfixRule<'i, K> = Postfix<&'i str, ExpressionAst<K>, ErrMode<ContextError>>;
+pub(super) fn postfix<'i, K: ParseLayer>(cursor: &mut &'i str) -> ModalResult<PostfixRule<'i, K>> {
+    alt((
+        "[[".value(Postfix(25, loading::<K, false>)),
+        '['.value(Postfix(25, loading::<K, true>)),
+    ))
     .parse_next(cursor)
 }
 
-fn loading_tail<const INTERCEPT: bool>(cursor: &mut &str) -> ModalResult<Vec<Arc<Factor>>> {
-    let (first, rest) = if INTERCEPT {
+fn loading<K: ParseLayer, const INTERCEPT: bool>(
+    cursor: &mut &str,
+    node: ExpressionAst<K>,
+) -> ModalResult<ExpressionAst<K>> {
+    let (first_loading, rest_loadings) = if INTERCEPT {
         cut_err(terminated(parse_loadings, (']', multispace0))).parse_next(cursor)?
     } else {
         cut_err(terminated(parse_loadings, ("]]", multispace0))).parse_next(cursor)?
     };
-    Ok(std::iter::once(first).chain(rest).collect())
-}
-
-fn reject_loadings<K: ExpressionKind, const INTERCEPT: bool>(
-    cursor: &mut &str,
-    _node: ParsedNode<K>,
-) -> ModalResult<ParsedNode<K>> {
-    loading_tail::<INTERCEPT>(cursor)?;
-    construction_result(cursor, Err(ConstructionError::Unsupported))
+    let inner = construction_result(cursor, node.into_inner())?;
+    let input = ParsedOperand::Loaded(Loaded {
+        group: inner.into(),
+        intercept: INTERCEPT,
+        first_loading,
+        rest_loadings,
+    });
+    construction_result(cursor, construct::<K>(input))
 }
 
 #[cfg(test)]
@@ -218,81 +171,88 @@ mod tests {
         FormulaOperations, Layer, MultistageOperations, Permitted, SimpleFormulaExpression,
     };
 
-    struct Wrapped(ExpressionAst<SimpleFormulaExpression>);
-
-    impl From<ExpressionAst<SimpleFormulaExpression>> for Wrapped {
-        fn from(inner: ExpressionAst<SimpleFormulaExpression>) -> Self {
-            Self(inner)
+    // A new operand type admits BOTH existing structured productions. It adds no
+    // grammar declarations or parser callbacks; only ordinary value conversions.
+    enum Wrapped {
+        Child(FormulaAst),
+        Loaded(Loaded<FixedEffect<SimpleFormulaExpression>>),
+    }
+    impl TryFrom<ParsedOperand<SimpleFormulaExpression>> for Wrapped {
+        type Error = ParsedOperand<SimpleFormulaExpression>;
+        fn try_from(input: ParsedOperand<SimpleFormulaExpression>) -> Result<Self, Self::Error> {
+            match input {
+                ParsedOperand::Child(child) => Ok(Self::Child(child)),
+                ParsedOperand::Loaded(loaded) => Ok(Self::Loaded(loaded)),
+                other => Err(other),
+            }
         }
     }
-
-    // These parsers know neither the outer expression kind nor ParsedNode.
-    impl OperandSyntax<SimpleFormulaExpression> for Wrapped {
-        fn primary(cursor: &mut &str) -> ModalResult<Primary<Self>> {
-            let factor = preceded('@', cut_err(parse_factor)).parse_next(cursor)?;
-            Ok(Self(ExpressionAst::Operand(Term::from(factor))).into())
-        }
-
-        fn postfix(
-            cursor: &mut &str,
-        ) -> ModalResult<OperandPostfix<SimpleFormulaExpression, Self>> {
-            '!'.map(|_| OperandPostfix {
-                precedence: 25,
-                finish: |_, inner| Ok(Self(inner)),
-            })
-            .parse_next(cursor)
-        }
-    }
-
-    type Additive = Layer<Wrapped, SimpleFormulaExpression, MultistageOperations, Permitted>;
-    type Algebraic = Layer<Wrapped, SimpleFormulaExpression, FormulaOperations, Permitted>;
+    type Operand = LayerOperand<ExpressionAst<SimpleFormulaExpression>, Wrapped>;
+    type Additive = Layer<Operand, SimpleFormulaExpression, MultistageOperations, Permitted>;
+    type Algebraic = Layer<Operand, SimpleFormulaExpression, FormulaOperations, Permitted>;
 
     #[test]
-    fn operand_grammar_is_reusable_across_operator_vocabularies() {
-        for source in ["x*y + @z", "x*y + z!", "x*y + (z:w)!"] {
-            let ParsedNode::Outer(ExpressionAst::Add(_, pair)) =
+    fn operand_admission_is_reusable_across_operator_vocabularies() {
+        for source in ["x*y + [a ~ z]", "x*y + z[t]", "x*y + (z:w)[t]"] {
+            let ExpressionAst::Add(_, pair) =
                 super::super::parse_node::<Additive>.parse(source).unwrap()
             else {
                 panic!("expected outer addition: {source}");
             };
-            let ExpressionAst::Operand(Wrapped(inner)) = *pair.left else {
-                panic!("expected embedded inner interaction");
+            let ExpressionAst::Operand(LayerOperand::Expression(inner)) = *pair.left else {
+                panic!("expected preserved inner subtree");
             };
             assert!(matches!(inner, ExpressionAst::InteractFully(_, _)));
         }
-
         assert!(
             super::super::parse_node::<Additive>
-                .parse("@x * @y")
+                .parse("[a ~ x] * y[t]")
                 .is_err()
         );
+        let ExpressionAst::InteractFully(_, operands) = super::super::parse_node::<Algebraic>
+            .parse("[a ~ x] * y[t]")
+            .unwrap()
+        else {
+            panic!("expected outer interaction");
+        };
+        let ExpressionAst::Operand(LayerOperand::Nested(left)) = *operands.left else {
+            panic!("expected admitted child");
+        };
+        let Wrapped::Child(child) = *left else {
+            panic!("expected child payload");
+        };
         assert!(matches!(
-            super::super::parse_node::<Algebraic>
-                .parse("@x * @y")
-                .unwrap(),
-            ParsedNode::Outer(ExpressionAst::InteractFully(_, _))
+            child.right,
+            ExpressionAst::Operand(LayerOperand::Expression(_))
         ));
     }
 
     #[test]
-    fn custom_postfix_obeys_binding_power_and_recursive_grammar() {
-        let ParsedNode::Outer(ExpressionAst::Add(_, pair)) = super::super::parse_node::<Additive>
-            .parse("x + y:z!")
+    fn loading_admission_obeys_binding_power_and_recursive_grammar() {
+        let ExpressionAst::Add(_, pair) = super::super::parse_node::<Additive>
+            .parse("x + y:z[t]")
             .unwrap()
         else {
             panic!("expected outer addition");
         };
-        let ExpressionAst::Operand(Wrapped(ExpressionAst::Interact(_, _))) = *pair.right else {
-            panic!("postfix must wrap the whole interaction, but not the addition");
+        let ExpressionAst::Operand(LayerOperand::Nested(wrapped)) = *pair.right else {
+            panic!("expected constructed nested operand");
         };
-
+        let Wrapped::Loaded(loaded) = *wrapped else {
+            panic!("expected loaded payload");
+        };
+        assert!(matches!(loaded.group.group, ExpressionAst::Interact(_, _)));
         assert!(matches!(
             super::super::parse_node::<Additive>
-                .parse("sw(@x, (y:z)!)")
+                .parse("sw([a ~ x], (y:z)[t])")
                 .unwrap(),
-            ParsedNode::Outer(ExpressionAst::Stepwise(_, _))
+            ExpressionAst::Stepwise(_, _)
         ));
-        // The postfix accepts an inner expression, not an already outer operand.
-        assert!(super::super::parse_node::<Additive>.parse("@x!").is_err());
+        for source in ["[a ~ x][t]", "x[t][u]", "([a ~ x] + y)[t]", "sw(x[t], y):z"] {
+            assert!(
+                super::super::parse_node::<Additive>.parse(source).is_err(),
+                "{source}"
+            );
+        }
     }
 }

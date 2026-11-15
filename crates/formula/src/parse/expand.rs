@@ -1,6 +1,5 @@
 use crate::parse::ast::{
-    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParsedNode,
-    StepwiseOperator,
+    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, StepwiseOperator,
 };
 use crate::{Factor, formula};
 
@@ -144,54 +143,43 @@ where
 {
     fn expand_operand(&self) -> Vec<formula::Expression> {
         self.group
+            .group
             .expand()
             .into_iter()
             .map(|expression| {
-                formula::encode_fixed_effects(
-                    expression,
-                    self.intercept,
-                    self.loadings.iter().cloned(),
-                )
+                formula::encode_fixed_effects(expression, self.intercept, self.loadings().cloned())
             })
             .collect()
     }
 }
 
-impl<I: ExpressionKind> OperandExpansion for super::ast::MultistageOperand<I>
-where
-    I::Operand: OperandExpansion,
-{
+// Both child formulas and loaded fixed effects use this same traversal.
+impl<B: OperandExpansion, N: OperandExpansion> OperandExpansion for super::ast::LayerOperand<B, N> {
     fn expand_operand(&self) -> Vec<formula::Expression> {
         match self {
-            Self::Expression(expr) => expr.expand(),
-            Self::Child(formula) => formula
-                .expand()
-                .into_iter()
-                .map(|child| formula::Expression::new([], vec![child]))
-                .collect(),
+            Self::Expression(expr) => expr.expand_operand(),
+            Self::Nested(value) => value.expand_operand(),
         }
     }
-
     fn apply_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
         match self {
-            Self::Expression(expr) => expr.apply_to(accumulated),
-            Self::Child(_) => self
-                .expand_operand()
-                .into_iter()
-                .map(|value| accumulated.clone().add(value))
-                .collect(),
+            Self::Expression(expr) => expr.apply_operand(accumulated),
+            Self::Nested(value) => value.apply_operand(accumulated),
         }
     }
-
     fn subtract_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
         match self {
-            Self::Expression(expr) => expr.subtract_from(accumulated),
-            Self::Child(_) => self
-                .expand_operand()
-                .into_iter()
-                .map(|value| accumulated.clone().subtract(value))
-                .collect(),
+            Self::Expression(expr) => expr.subtract_operand(accumulated),
+            Self::Nested(value) => value.subtract_operand(accumulated),
         }
+    }
+}
+impl OperandExpansion for FormulaAst {
+    fn expand_operand(&self) -> Vec<formula::Expression> {
+        self.expand()
+            .into_iter()
+            .map(|child| formula::Expression::new([], vec![child]))
+            .collect()
     }
 }
 
@@ -295,26 +283,16 @@ where
     }
 }
 
-impl<K: ExpressionKind> ParsedNode<K>
+impl<I: ExpressionKind> OperandExpansion for super::ast::FixedEffect<I>
 where
-    K::Operand: OperandExpansion,
-    <K::Inner as ExpressionKind>::Operand: OperandExpansion,
+    I::Operand: OperandExpansion,
 {
-    pub(in crate::parse) fn expand(&self) -> Vec<formula::Expression> {
-        match self {
-            Self::Inner(expression) => expression.expand(),
-            Self::Outer(expression) => expression.expand(),
-        }
-    }
-
-    pub(in crate::parse) fn apply_to(
-        &self,
-        accumulated: formula::Expression,
-    ) -> Vec<formula::Expression> {
-        match self {
-            Self::Inner(expression) => expression.apply_to(accumulated),
-            Self::Outer(expression) => expression.apply_to(accumulated),
-        }
+    fn expand_operand(&self) -> Vec<formula::Expression> {
+        self.group
+            .expand()
+            .into_iter()
+            .map(|expression| formula::encode_fixed_effects(expression, true, []))
+            .collect()
     }
 }
 

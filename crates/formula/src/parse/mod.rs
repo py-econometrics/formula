@@ -306,13 +306,15 @@ pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>
         .parse_next(cursor)
 }
 
-fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
     expression(parse_operand::<K>)
         .prefix(
             preceded(multispace0, '-')
                 .value(Prefix(
                     PREFIX_PRECEDENCE,
-                    |cursor, node: ast::ParsedNode<K>| construction_result(cursor, node.negate()),
+                    |cursor, node: ast::ExpressionAst<K>| {
+                        construction_result(cursor, node.negate())
+                    },
                 ))
                 .context(StrContext::Expected(StrContextValue::Description(
                     "an expression",
@@ -322,31 +324,35 @@ fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K
             '+'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Add, left, right),
+                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Add, left, right),
                 )
             })),
             '-'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Subtract, left, right),
+                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Subtract, left, right),
                 )
             })),
             '*'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::InteractFully, left, right),
+                    ast::ExpressionAst::<K>::binary(
+                        ast::BinaryOperator::InteractFully,
+                        left,
+                        right,
+                    ),
                 )
             })),
             '/'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Nest, left, right),
+                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Nest, left, right),
                 )
             })),
             ':'.value(Right(INTERACTION_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ParsedNode::<K>::binary(ast::BinaryOperator::Interact, left, right),
+                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Interact, left, right),
                 )
             })),
         )))
@@ -356,7 +362,7 @@ fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K
 
 fn parse_stepwise_arguments<K: ParseLayer>(
     cursor: &mut &str,
-) -> ModalResult<(ast::ParsedNode<K>, Vec<ast::ParsedNode<K>>)> {
+) -> ModalResult<(ast::ExpressionAst<K>, Vec<ast::ExpressionAst<K>>)> {
     multispace0.parse_next(cursor)?;
 
     let first = cut_err(parse_node::<K>).parse_next(cursor)?;
@@ -377,7 +383,7 @@ fn parse_stepwise_arguments<K: ParseLayer>(
     Ok((first, rest))
 }
 
-fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
     let operator = terminated(
         alt((
             "sw0".value(StepwiseOperator::Sw0),
@@ -394,7 +400,7 @@ fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNo
 
     construction_result(
         cursor,
-        ast::ParsedNode::<K>::stepwise(ast::Stepwise {
+        ast::ExpressionAst::<K>::stepwise(ast::Stepwise {
             operator,
             first,
             rest,
@@ -402,7 +408,9 @@ fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNo
     )
 }
 
-fn parse_node_parenthesized<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_node_parenthesized<K: ParseLayer>(
+    cursor: &mut &str,
+) -> ModalResult<ast::ExpressionAst<K>> {
     '('.parse_next(cursor)?;
 
     let node = cut_err(parse_node::<K>).parse_next(cursor)?;
@@ -414,10 +422,10 @@ fn parse_node_parenthesized<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast
     )
     .parse_next(cursor)?;
 
-    Ok(node.parenthesized())
+    construction_result(cursor, node.parenthesized())
 }
 
-fn parse_operand<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_operand<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
     delimited(
         multispace0,
         alt((
@@ -457,7 +465,6 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
         PIPE_SEPARATOR,
         cut_err(
             parse_node::<ast::FixedEffectExpression>
-                .try_map(|node| node.into_outer())
                 .context(StrContext::Label("fixed-effect expression")),
         ),
     ))
@@ -505,8 +512,7 @@ pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression
             }
             Role::FixedEffect => {
                 let node = parse_node::<ast::SingleFixedEffectExpression>(cursor)?;
-                let expression = construction_result(cursor, node.into_outer())?;
-                expression.expand()
+                node.expand()
             }
         };
 
@@ -689,11 +695,12 @@ mod tests {
                 let node = parse_node::<typed::FixedEffectExpression>
                     .parse(source)
                     .unwrap();
-                let typed::ParsedNode::Outer(typed::ExpressionAst::Operand(group)) = node else {
+                let typed::ExpressionAst::Operand(typed::LayerOperand::Nested(group)) = node else {
                     panic!("expected grouped loadings for {source}");
                 };
-                assert_eq!(group.loadings.len(), 1);
-                let actual = group.loadings[0]
+                assert!(group.rest_loadings.is_empty());
+                let actual = group
+                    .first_loading
                     .value()
                     .expect("expected a numeric literal");
                 assert_eq!(actual.dtype(), value.dtype(), "{source}");
@@ -970,16 +977,13 @@ mod tests {
 
     mod syntax {
         use super::*;
-        use typed::{ExpressionAst as Ast, ParsedNode, SimpleFormulaExpression};
+        use typed::{ExpressionAst as Ast, SimpleFormulaExpression};
 
         fn simple(source: &str) -> Ast<SimpleFormulaExpression> {
-            let ParsedNode::Inner(expression) = parse_node::<typed::MultistageFormulaExpression>
+            let expression = parse_node::<typed::MultistageFormulaExpression>
                 .parse(source)
-                .unwrap()
-            else {
-                panic!("expected a flat expression for {source}");
-            };
-            expression
+                .unwrap();
+            expression.into_inner().unwrap()
         }
 
         fn assert_term(node: &Ast<SimpleFormulaExpression>, name: &str) {
@@ -992,19 +996,16 @@ mod tests {
         #[test]
         fn parsing_preserves_formula_sections_and_default_group_settings() {
             let formula = parse_formula_ast.parse("y ~ x | firm").unwrap();
-            let ParsedNode::Inner(left) = formula.left else {
-                panic!("expected flat LHS")
-            };
-            let ParsedNode::Inner(right) = formula.right else {
-                panic!("expected flat RHS")
-            };
+            let left = formula.left.into_inner().unwrap();
+            let right = formula.right.into_inner().unwrap();
             assert_term(&left, "y");
             assert_term(&right, "x");
             let Some(Ast::Operand(group)) = formula.fixed_effects else {
                 panic!("expected a complete fixed-effect operand");
             };
-            assert!(group.intercept);
-            assert!(group.loadings.is_empty());
+            let typed::LayerOperand::Expression(group) = group else {
+                panic!("plain group");
+            };
             let Ast::Operand(column) = group.group else {
                 panic!("expected a grouping column")
             };
@@ -1013,14 +1014,14 @@ mod tests {
 
         #[test]
         fn child_formulas_remain_unexpanded() {
-            let ParsedNode::Outer(Ast::Operand(typed::MultistageOperand::Child(child))) =
+            let Ast::Operand(typed::MultistageOperand::Nested(child)) =
                 parse_node::<typed::MultistageFormulaExpression>
                     .parse("[a ~ sw(x, z)]")
                     .unwrap()
             else {
                 panic!("expected a child formula");
             };
-            let ParsedNode::Inner(Ast::Stepwise(_, call)) = child.right else {
+            let Ast::Stepwise(_, call) = child.right.into_inner().unwrap() else {
                 panic!("expected an unexpanded stepwise call");
             };
             assert_term(&call.first, "x");
@@ -1038,10 +1039,11 @@ mod tests {
                 ("0x", "0x"),
                 ("1x", "1x"),
             ] {
-                let ParsedNode::Inner(Ast::Operand(column)) =
-                    parse_node::<typed::FixedEffectExpression>
-                        .parse(source)
-                        .unwrap()
+                let Ast::Operand(column) = parse_node::<typed::FixedEffectExpression>
+                    .parse(source)
+                    .unwrap()
+                    .into_inner()
+                    .unwrap()
                 else {
                     panic!("expected a grouping column for {source}");
                 };
@@ -1051,13 +1053,15 @@ mod tests {
 
         #[test]
         fn loading_postfix_wraps_the_entire_grouping_interaction() {
-            let ParsedNode::Outer(Ast::Operand(group)) = parse_node::<typed::FixedEffectExpression>
-                .parse("firm:year[time]")
-                .unwrap()
+            let Ast::Operand(typed::LayerOperand::Nested(group)) =
+                parse_node::<typed::FixedEffectExpression>
+                    .parse("firm:year[time]")
+                    .unwrap()
             else {
                 panic!("expected a loaded fixed-effect operand");
             };
-            let Ast::Interact(_, operands) = group.group else {
+            let actual_loadings = group.loadings().cloned().collect::<Vec<_>>();
+            let Ast::Interact(_, operands) = group.group.group else {
                 panic!("expected an interaction inside the group");
             };
             let (Ast::Operand(left), Ast::Operand(right)) = (*operands.left, *operands.right)
@@ -1066,7 +1070,7 @@ mod tests {
             };
             assert_eq!((left.name(), right.name()), ("firm", "year"));
             assert_eq!(
-                group.loadings.as_slice(),
+                actual_loadings.as_slice(),
                 &[std::sync::Arc::new(Factor::from("time"))]
             );
             assert!(group.intercept);
@@ -2593,14 +2597,14 @@ mod layers {
         let node = parse_node::<ast::MultistageFormulaExpression>
             .parse("x*y + ([x ~ z] + w)")
             .unwrap();
-        let ast::ParsedNode::Outer(ast::ExpressionAst::Add(_, pair)) = node else {
+        let ast::ExpressionAst::Add(_, pair) = node else {
             panic!("outer addition");
         };
         let ast::ExpressionAst::Operand(ast::MultistageOperand::Expression(inner)) = *pair.left
         else {
             panic!("inner expression operand");
         };
-        assert!(matches!(*inner, ast::ExpressionAst::InteractFully(_, _)));
+        assert!(matches!(inner, ast::ExpressionAst::InteractFully(_, _)));
         assert!(matches!(*pair.right, ast::ExpressionAst::Parenthesized(_)));
     }
 }
