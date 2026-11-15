@@ -20,8 +20,8 @@ use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat, separated,
-    terminated,
+    Prefix, alt, backtrack_err, cut_err, delimited, eof, expression, fail, opt, peek, preceded,
+    repeat, separated, terminated,
 };
 use winnow::error::{
     ContextError, ErrMode, FromExternalError, ParseError, StrContext, StrContextValue,
@@ -307,6 +307,13 @@ pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>
 }
 
 fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
+    parse_node_at::<K>(cursor, 0)
+}
+
+fn parse_node_at<K: ParseLayer>(
+    cursor: &mut &str,
+    min_power: i64,
+) -> ModalResult<ast::ExpressionAst<K>> {
     expression(parse_operand::<K>)
         .prefix(
             preceded(multispace0, '-')
@@ -357,6 +364,7 @@ fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAs
             })),
         )))
         .postfix(syntax::postfix::<K>)
+        .current_precedence_level(min_power)
         .parse_next(cursor)
 }
 
@@ -429,9 +437,14 @@ fn parse_operand<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::Expressio
     delimited(
         multispace0,
         alt((
+            syntax::nested::<K>,
+            // A source operand may itself contain grouped/stepwise nested values.
+            // If it cannot read them, retry those delimiters in this layer.
+            backtrack_err(syntax::primary::<K>),
             parse_node_parenthesized::<K>,
             parse_stepwise::<K>,
             syntax::primary::<K>,
+            syntax::reject_child::<K>,
         )),
         multispace0,
     )
@@ -695,7 +708,7 @@ mod tests {
                 let node = parse_node::<typed::FixedEffectExpression>
                     .parse(source)
                     .unwrap();
-                let typed::ExpressionAst::Operand(typed::LayerOperand::Nested(group)) = node else {
+                let typed::ExpressionAst::Nested(group) = node else {
                     panic!("expected grouped loadings for {source}");
                 };
                 assert!(group.rest_loadings.is_empty());
@@ -1003,9 +1016,6 @@ mod tests {
             let Some(Ast::Operand(group)) = formula.fixed_effects else {
                 panic!("expected a complete fixed-effect operand");
             };
-            let typed::LayerOperand::Expression(group) = group else {
-                panic!("plain group");
-            };
             let Ast::Operand(column) = group.group else {
                 panic!("expected a grouping column")
             };
@@ -1014,10 +1024,9 @@ mod tests {
 
         #[test]
         fn child_formulas_remain_unexpanded() {
-            let Ast::Operand(typed::MultistageOperand::Nested(child)) =
-                parse_node::<typed::MultistageFormulaExpression>
-                    .parse("[a ~ sw(x, z)]")
-                    .unwrap()
+            let Ast::Nested(child) = parse_node::<typed::MultistageFormulaExpression>
+                .parse("[a ~ sw(x, z)]")
+                .unwrap()
             else {
                 panic!("expected a child formula");
             };
@@ -1053,10 +1062,9 @@ mod tests {
 
         #[test]
         fn loading_postfix_wraps_the_entire_grouping_interaction() {
-            let Ast::Operand(typed::LayerOperand::Nested(group)) =
-                parse_node::<typed::FixedEffectExpression>
-                    .parse("firm:year[time]")
-                    .unwrap()
+            let Ast::Nested(group) = parse_node::<typed::FixedEffectExpression>
+                .parse("firm:year[time]")
+                .unwrap()
             else {
                 panic!("expected a loaded fixed-effect operand");
             };
@@ -2600,8 +2608,7 @@ mod layers {
         let ast::ExpressionAst::Add(_, pair) = node else {
             panic!("outer addition");
         };
-        let ast::ExpressionAst::Operand(ast::MultistageOperand::Expression(inner)) = *pair.left
-        else {
+        let ast::ExpressionAst::Operand(inner) = *pair.left else {
             panic!("inner expression operand");
         };
         assert!(matches!(inner, ast::ExpressionAst::InteractFully(_, _)));

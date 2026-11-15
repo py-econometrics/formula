@@ -148,6 +148,7 @@ impl Embedding<Forbidden> for Forbidden {}
 /// Independent operand, algebraic-operator, and expansion choices for an expression.
 pub(super) trait ExpressionKind: Sized {
     type Operand: Embedding<Self::Inner>;
+    type Nested;
     type Inner: ExpressionKind;
     type Operators: Operations;
     type Stepwise: Permission;
@@ -156,6 +157,7 @@ pub(super) trait ExpressionKind: Sized {
 /// An expression enum whose [`ExpressionKind`] determines which variants can exist
 pub(super) enum ExpressionAst<K: ExpressionKind> {
     Operand(K::Operand),
+    Nested(Box<K::Nested>),
 
     Add(<K::Operators as Operations>::Addition, Binary<Self>),
     Subtract(<K::Operators as Operations>::Subtraction, Binary<Self>),
@@ -171,6 +173,7 @@ pub(super) enum ExpressionAst<K: ExpressionKind> {
 /// A forbidden expression
 impl ExpressionKind for Forbidden {
     type Operand = Forbidden;
+    type Nested = Forbidden;
     type Inner = Forbidden;
     type Operators = Forbidden;
     type Stepwise = Forbidden;
@@ -240,12 +243,13 @@ impl Operations for FixedEffectOperations {
 
 /// An expression layer with independent operands, operators, and stepwise support.
 /// `Inner = Forbidden` denotes a layer without an embedded expression domain.
-pub(super) struct Layer<O, I, P, S>(std::marker::PhantomData<(O, I, P, S)>);
-impl<O, I: ExpressionKind, P: Operations, S: Permission> ExpressionKind for Layer<O, I, P, S>
+pub(super) struct Layer<O, I, P, S, N = Forbidden>(std::marker::PhantomData<(O, I, P, S, N)>);
+impl<O, I: ExpressionKind, P: Operations, S: Permission, N> ExpressionKind for Layer<O, I, P, S, N>
 where
     O: Embedding<I>,
 {
     type Operand = O;
+    type Nested = N;
     type Inner = I;
     type Operators = P;
     type Stepwise = S;
@@ -253,7 +257,7 @@ where
 
 // Embedding preserves the complete inner tree; operand expansion decides how
 // it participates in the outer domain.
-impl<I, O, P, S> From<ExpressionAst<I>> for ExpressionAst<Layer<O, I, P, S>>
+impl<I, O, P, S, N> From<ExpressionAst<I>> for ExpressionAst<Layer<O, I, P, S, N>>
 where
     I: ExpressionKind,
     O: Embedding<I> + From<ExpressionAst<I>>,
@@ -265,42 +269,22 @@ where
     }
 }
 
-/// One operand lifecycle for every layer: preserve an inner tree, or construct
-/// a domain-specific nested value. No syntax or domain names in this enum.
-pub(super) enum LayerOperand<B, N> {
-    Expression(B),
-    Nested(Box<N>),
-}
-impl<I: ExpressionKind, B: From<ExpressionAst<I>>, N> From<ExpressionAst<I>>
-    for LayerOperand<B, N>
-{
-    fn from(value: ExpressionAst<I>) -> Self {
-        Self::Expression(B::from(value))
-    }
-}
-
-impl<K: ExpressionKind> From<FixedEffect<K>> for ExpressionAst<K> {
-    fn from(effect: FixedEffect<K>) -> Self {
-        effect.group
-    }
-}
-impl<I: ExpressionKind, B, N> Embedding<I> for LayerOperand<B, N>
-where
-    B: From<ExpressionAst<I>> + Into<ExpressionAst<I>>,
-{
+impl<I: ExpressionKind> Embedding<I> for ExpressionAst<I> {
     fn is_inner(&self) -> bool {
-        matches!(self, Self::Expression(_))
+        true
     }
     fn into_inner(self) -> Result<ExpressionAst<I>, Self> {
-        match self {
-            Self::Expression(base) => Ok(base.into()),
-            other => Err(other),
-        }
+        Ok(self)
     }
 }
-
-pub(super) type MultistageOperand<I> = LayerOperand<ExpressionAst<I>, FormulaAst>;
-pub(super) type FixedEffectOperand<I> = LayerOperand<FixedEffect<I>, FixedEffectGroup<I>>;
+impl<I: ExpressionKind> Embedding<I> for FixedEffect<I> {
+    fn is_inner(&self) -> bool {
+        true
+    }
+    fn into_inner(self) -> Result<ExpressionAst<I>, Self> {
+        Ok(self.group)
+    }
+}
 
 pub(super) type SingleFormulaExpression =
     Layer<crate::Term, Forbidden, FormulaOperations, Forbidden>;
@@ -311,23 +295,26 @@ pub(super) type GroupingExpression =
 pub(super) type SingleGroupingExpression =
     Layer<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Forbidden>;
 pub(super) type MultistageFormulaExpression = Layer<
-    MultistageOperand<SimpleFormulaExpression>,
+    ExpressionAst<SimpleFormulaExpression>,
     SimpleFormulaExpression,
     MultistageOperations,
     Permitted,
+    FormulaAst,
 >;
 pub(super) type FixedEffectExpression = Layer<
-    FixedEffectOperand<GroupingExpression>,
+    FixedEffect<GroupingExpression>,
     GroupingExpression,
     FixedEffectOperations,
     Permitted,
+    Loaded<FixedEffect<GroupingExpression>>,
 >;
 
 pub(super) type SingleFixedEffectExpression = Layer<
-    FixedEffectOperand<SingleGroupingExpression>,
+    FixedEffect<SingleGroupingExpression>,
     SingleGroupingExpression,
     FixedEffectOperations,
     Forbidden,
+    Loaded<FixedEffect<SingleGroupingExpression>>,
 >;
 
 // Leaf operands cannot embed expressions. This is the same embedding interface
@@ -382,15 +369,14 @@ impl<K: ExpressionKind> ExpressionAst<K> {
 
     pub(super) fn parenthesized(self) -> Result<Self, ConstructionError> {
         match self.try_into_inner() {
-            Ok(inner) => Self::try_operand(ExpressionAst::Parenthesized(Box::new(inner))),
+            Ok(inner) => inner.parenthesized().and_then(Self::try_operand),
             Err(outer) => Ok(Self::Parenthesized(Box::new(outer))),
         }
     }
 
     pub(super) fn negate(self) -> Result<Self, ConstructionError> {
         match self.try_into_inner() {
-            Ok(inner) => permitted(Box::new(inner), ExpressionAst::<K::Inner>::Negate)
-                .and_then(Self::try_operand),
+            Ok(inner) => inner.negate().and_then(Self::try_operand),
             Err(outer) => permitted(Box::new(outer), Self::Negate),
         }
     }
@@ -401,8 +387,7 @@ impl<K: ExpressionKind> ExpressionAst<K> {
         right: Self,
     ) -> Result<Self, ConstructionError> {
         if left.is_inner() && right.is_inner() {
-            operator
-                .construct(Binary::new(left.into_inner()?, right.into_inner()?))
+            ExpressionAst::<K::Inner>::binary(operator, left.into_inner()?, right.into_inner()?)
                 .and_then(Self::try_operand)
         } else {
             operator.construct(Binary::new(left, right))
@@ -423,8 +408,7 @@ impl<K: ExpressionKind> ExpressionAst<K> {
                     .map(Self::into_inner)
                     .collect::<Result<_, _>>()?,
             };
-            permitted(Box::new(inner_call), ExpressionAst::<K::Inner>::Stepwise)
-                .and_then(Self::try_operand)
+            ExpressionAst::<K::Inner>::stepwise(inner_call).and_then(Self::try_operand)
         } else {
             permitted(Box::new(call), Self::Stepwise)
         }
@@ -446,12 +430,12 @@ mod tests {
     }
 
     fn loaded() -> Node {
-        ExpressionAst::Operand(LayerOperand::Nested(Box::new(FixedEffectGroup {
+        ExpressionAst::Nested(Box::new(Loaded {
             group: column("year").into_inner().unwrap().into(),
             intercept: false,
             first_loading: Arc::new(Factor::from("time")),
             rest_loadings: Vec::new(),
-        })))
+        }))
     }
 
     #[test]
@@ -473,18 +457,12 @@ mod tests {
         else {
             panic!("expected embedded addition");
         };
-        let (ExpressionAst::Operand(left), ExpressionAst::Operand(right)) =
+        let (ExpressionAst::Operand(left), ExpressionAst::Nested(right)) =
             (*operands.left, *operands.right)
         else {
             panic!("expected complete group operands");
         };
-        let LayerOperand::Expression(left) = left else {
-            panic!("plain inner");
-        };
         assert!(matches!(left.group, ExpressionAst::Interact(_, _)));
-        let LayerOperand::Nested(right) = right else {
-            panic!("loaded inner");
-        };
         assert!(!right.intercept);
         assert_eq!(
             right.loadings().cloned().collect::<Vec<_>>(),
@@ -505,13 +483,10 @@ mod tests {
         let ExpressionAst::Operand(first) = &call.first else {
             panic!("expected a complete first group");
         };
-        let [ExpressionAst::Operand(second)] = call.rest.as_slice() else {
+        let [ExpressionAst::Nested(second)] = call.rest.as_slice() else {
             panic!("expected one loaded alternative");
         };
-        assert!(matches!(first, LayerOperand::Expression(_)));
-        let LayerOperand::Nested(second) = second else {
-            panic!("loaded alternative");
-        };
+        assert!(matches!(first.group, ExpressionAst::Operand(_)));
         assert!(!second.intercept);
         assert_eq!(
             second.loadings().cloned().collect::<Vec<_>>(),
@@ -549,10 +524,7 @@ mod layers {
         .unwrap_or_else(|_| panic!("column"));
         let fixed: ExpressionAst<FixedEffectExpression> = grouping.into();
         let envelope: ExpressionAst<Enveloped> = fixed.into();
-        let ExpressionAst::Operand(Envelope(ExpressionAst::Operand(LayerOperand::Expression(
-            group,
-        )))) = envelope
-        else {
+        let ExpressionAst::Operand(Envelope(ExpressionAst::Operand(group))) = envelope else {
             panic!("wrong representation");
         };
         assert!(matches!(group.group, ExpressionAst::Operand(_)));
