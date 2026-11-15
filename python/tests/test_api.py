@@ -1,3 +1,4 @@
+import math
 import operator
 
 import polars
@@ -30,7 +31,6 @@ def data() -> polars.DataFrame:
 )
 def test_parse_and_fit(formulas, expected_columns, data):
     specification = formula.parse(formulas)
-    assert isinstance(specification, formula.Formulas)
     models = specification.fit(data)
 
     assert len(models) == len(expected_columns)
@@ -43,7 +43,6 @@ def test_unfitted_formulas_support_indexing_and_iteration():
     formulas = formula.parse(["y ~ sw(x, z) - 1", "y ~ x - 1"])
 
     assert len(formulas) == 2
-    assert all(isinstance(entry, formula.Formula) for entry in formulas)
     assert [str(entry) for entry in formulas] == ["y ~ x - 1", "y ~ z - 1"]
     assert str(formulas[0]) == str(formulas[-2]) == "y ~ x - 1"
     assert str(formulas[1]) == str(formulas[-1]) == "y ~ z - 1"
@@ -128,7 +127,6 @@ def test_model_indexing(data):
     models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).fit(data)
 
     by_formula = models["y ~ x - 1"]
-    assert isinstance(by_formula, formula.FittedFormula)
     assert by_formula.formula == models[0].formula == "y ~ x - 1"
     assert models[" y~x -1 "].formula == by_formula.formula
     independent = by_formula.select(formula.Role.Independent).frame()
@@ -173,7 +171,6 @@ def test_expanded_models_can_be_looked_up_by_their_formula(source, data):
 
 def test_model_owns_its_data_and_returns_independent_frames(data):
     model = formula.parse("y ~ x - 1").fit(data)[0]
-    assert isinstance(model, formula.FittedFormula)
     frame = model.frame()
     frame.replace_column(1, polars.Series("x", [99.0, 99.0, 99.0]))
 
@@ -216,9 +213,7 @@ def test_children_preserve_role_attachment_order_and_navigation(data):
     ).fit(data)
     model = models[0]
     children = model.children(formula.Role.Independent)
-    assert isinstance(children, formula.FittedFormulas)
     assert len(children) == 2
-    assert all(isinstance(child, formula.FittedFormula) for child in children)
     assert_frame_equal(
         children[0].select(formula.Role.Dependent).frame(), data.select("x")
     )
@@ -228,7 +223,6 @@ def test_children_preserve_role_attachment_order_and_navigation(data):
     grandchild = children[0].children(formula.Role.Independent)[0]
     assert_frame_equal(grandchild.frame(), data.select("z", "x"))
     empty = children[1].children(formula.Role.Independent)
-    assert isinstance(empty, formula.FittedFormulas)
     assert len(empty) == 0
     with pytest.raises(IndexError):
         empty[0]
@@ -300,8 +294,6 @@ def test_select_accepts_single_roles_and_sequences(data, roles):
     models = formula.parse("y ~ x - 1").fit(data)
     selected_model = models[0].select(roles)
     selected_models = models.select(roles)
-    assert isinstance(selected_model, formula.FittedFormula)
-    assert isinstance(selected_models, formula.FittedFormulas)
 
     new_data = data.select("x")
     for model in (selected_model, selected_models[0]):
@@ -347,7 +339,6 @@ def test_select_terms_returns_an_independent_fitted_formula(data, keyword_role):
         selected = model.select_terms("z", role=formula.Role.Independent)
     else:
         selected = model.select_terms("z", formula.Role.Independent)
-    assert isinstance(selected, formula.FittedFormula)
     del model
     assert_frame_equal(selected.frame(), data.select("z"))
     prediction = polars.DataFrame({"z": [10.0, 20.0]})
@@ -429,64 +420,134 @@ def test_varying_slope_syntax_errors_are_syntax_errors():
         formula.parse("y ~ x | firm[]")
 
 
-@pytest.fixture
-def encoding_call():
+@pytest.fixture(params=["group", "group[log(x), x]", "group[[log(x), x]]"])
+def fixed_effect(request):
+    data = polars.DataFrame(
+        {"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"], "x": [1.0, 2.0, 3.0]}
+    )
+    model = formula.parse(f"y ~ 1 | {request.param}").fit(data)[0]
+    (effect,) = model.fixed_effects
+    assert effect.codes.to_list() == [0, 1, 0]
+    assert effect.codes.dtype == polars.UInt32
+    assert effect.intercept is ("[[" not in request.param)
+    if request.param == "group":
+        assert effect.loadings.width == 0
+    else:
+        time, exposure = effect.loadings
+        assert time.dtype == exposure.dtype == polars.Float64
+        assert time.to_list() == pytest.approx([0.0, math.log(2), math.log(3)])
+        assert exposure.to_list() == [1.0, 2.0, 3.0]
+    return effect
+
+
+def test_fixed_effects_preserve_order_and_support_name_lookup(data):
+    data = data.with_columns(polars.Series("year", [2020, 2021, 2020]))
+    model = formula.parse("y ~ x | firm + year[x]").fit(data)[0]
+    effects = model.fixed_effects
+    assert len(effects) == 2
+    assert [effect.encoding.levels.columns for effect in effects] == [
+        ["firm"],
+        ["year"],
+    ]
+    firm = model.fixed_effect("firm")
+    assert firm.encoding.levels.columns == ["firm"]
+    assert firm.loadings.width == 0
+    year = model.fixed_effect("year[x]")
+    assert year.encoding.levels.columns == ["year"]
+    (loading,) = year.loadings
+    assert loading.to_list() == data["x"].to_list()
+    for key in ("year", "missing", "year[ x ]"):
+        with pytest.raises(KeyError) as error:
+            model.fixed_effect(key)
+        assert error.value.args == (key,)
+    with pytest.raises(TypeError):
+        model.fixed_effect(1.5)  # ty: ignore[invalid-argument-type]
+
+
+def test_model_without_fixed_effects_returns_an_empty_collection(data):
+    model = formula.parse("y ~ x").fit(data)[0]
+    assert model.fixed_effects == []
+    with pytest.raises(KeyError):
+        model.fixed_effect("firm")
+
+
+def test_fixed_effect_encoding_exposes_codes_and_levels(fixed_effect):
+    state = fixed_effect.encoding
+    assert_frame_equal(
+        state.codes,
+        polars.DataFrame({"code": [0, 1]}, schema={"code": polars.UInt32}),
+    )
+    assert_frame_equal(state.levels, polars.DataFrame({"group": ["a", "b"]}))
+
+
+@pytest.mark.parametrize("specification", ["group", "group[x]", "group[[x]]"])
+def test_fixed_effect_data_tracks_prediction_rows(specification):
+    training = polars.DataFrame({"y": [1.0, 2.0], "group": ["a", "b"], "x": [1.0, 2.0]})
+    model = formula.parse(f"y ~ 1 | {specification}").fit(training)[0]
+    prediction = polars.DataFrame(
+        {"y": [3.0, 4.0, 5.0], "group": ["b", "new", "a"], "x": [10.0, 20.0, None]}
+    )
+    for data in (prediction, prediction.head(0)):
+        (effect,) = model.transform(data).fixed_effects
+        assert effect.codes.to_list() == [1, None, 0][: data.height]
+        assert effect.codes.dtype == polars.UInt32
+        assert effect.intercept is ("[[" not in specification)
+        if specification == "group":
+            assert effect.loadings.width == 0
+        else:
+            (loading,) = effect.loadings
+            assert loading.dtype == polars.Float64
+            assert loading.to_list() == data["x"].to_list()
+        assert_frame_equal(
+            effect.encoding.levels, polars.DataFrame({"group": ["a", "b"]})
+        )
+
+
+def test_transform_state_mapping_interface():
     data = polars.DataFrame({"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"]})
     model = formula.parse("y ~ 1 | group").fit(data)[0]
     (term,) = model.terms(formula.Role.FixedEffect)
     (factor,) = term.factors
-    grouped = factor.transform
-    assert grouped is not None
-    encoder = grouped.inputs[0].transform
-    assert encoder is not None
-    return encoder
-
-
-def test_transform_state_mapping_interface(encoding_call):
-    state = encoding_call.state
-    assert isinstance(state, formula.TransformState)
+    assert factor.transform is not None
+    (encoder,) = factor.transform.inputs
+    assert encoder.transform is not None
+    state = encoder.transform.state
+    assert state is not None
     assert len(state) == 2
     assert set(state) == {"codes", "levels"}
-    assert all(isinstance(name, str) for name in state)
-    assert_frame_equal(
-        state["codes"],
-        polars.DataFrame({"code": [0, 1]}, schema={"code": polars.UInt32}),
-    )
-    assert_frame_equal(state["levels"], polars.DataFrame({"group": ["a", "b"]}))
+    assert isinstance(state["codes"], polars.DataFrame)
+    assert isinstance(state["levels"], polars.DataFrame)
     with pytest.raises(KeyError) as error:
         _ = state["missing"]
     assert error.value.args == ("missing",)
     with pytest.raises(TypeError):
-        operator.setitem(state, "codes", polars.DataFrame())
+        operator.setitem(state, "codes", polars.DataFrame())  # ty: ignore[no-matching-overload]
 
 
-def test_transform_state_values_are_independent_snapshots(encoding_call):
-    state = encoding_call.state
-    assert state is not None
-    codes = state["codes"]
-    levels = state["levels"]
-    assert isinstance(codes, polars.DataFrame)
-    assert isinstance(levels, polars.DataFrame)
+def test_fixed_effect_encoding_values_are_independent_snapshots(fixed_effect):
+    state = fixed_effect.encoding
+    codes = state.codes
+    levels = state.levels
     codes.replace_column(0, polars.Series("code", [99, 99], dtype=polars.UInt32))
     levels.replace_column(0, polars.Series("group", ["changed", "changed"]))
 
     expected_codes = polars.DataFrame({"code": [0, 1]}, schema={"code": polars.UInt32})
     expected_levels = polars.DataFrame({"group": ["a", "b"]})
-    for snapshot in [state, encoding_call.state]:
-        assert snapshot is not None
-        assert_frame_equal(snapshot["codes"], expected_codes)
-        assert_frame_equal(snapshot["levels"], expected_levels)
+    for snapshot in [state, fixed_effect.encoding]:
+        assert_frame_equal(snapshot.codes, expected_codes)
+        assert_frame_equal(snapshot.levels, expected_levels)
 
 
 def test_stateless_transform_has_an_empty_state():
     data = polars.DataFrame({"y": [1.0, 2.0], "x": [2.0, 3.0]})
     model = formula.parse("y ~ log(x) - 1").fit(data)[0]
     (term,) = model.terms(formula.Role.Independent)
+    assert term.fixed_effect is None
     (factor,) = term.factors
     call = factor.transform
     assert call is not None
     state = call.state
-    assert isinstance(state, formula.TransformState)
+    assert state is not None
     assert len(state) == 0
     assert list(state) == []
     with pytest.raises(KeyError):

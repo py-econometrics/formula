@@ -5,10 +5,12 @@ mod parse;
 mod transform;
 
 pub use self::formula::{
-    ComponentKey, Factor, FittedTerm, Formula, FormulaColumn, Formulas, Role, Term, TransformCall,
-    ValidationError,
+    ComponentKey, Factor, FittedFixedEffect, FittedTerm, Formula, FormulaColumn, Formulas, Role,
+    Term, TransformCall, ValidationError,
 };
 pub use fit::FitError;
 pub use model::{FittedFormula, FittedFormulas, ModelError, SelectionError};
 pub use parse::{parse, parse_many};
-pub use transform::{ArgumentCount, StateValue, TransformError, TransformState};
+pub use transform::{
+    ArgumentCount, IntegerEncodingState, StateValue, TransformError, TransformState,
+};

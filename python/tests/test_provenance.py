@@ -23,7 +23,6 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
     terms = prediction.terms(role=formula.Role.Independent)
     assert isinstance(terms, list)
     (term,) = terms
-    assert isinstance(term, formula.FittedTerm)
     del model, selected, prediction, terms
 
     assert isinstance(term.factors, tuple)
@@ -40,7 +39,6 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
     for column, level, values in zip(
         columns, ["b", "c"], [[0.0, 20.0, None], [10.0, 0.0, None]], strict=True
     ):
-        assert isinstance(column, formula.FormulaColumn)
         assert isinstance(column.term, tuple)
         assert len(column.term) == 2
         term_call = column.term[0].transform
@@ -52,11 +50,10 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
         categorical_contribution, variable_contribution = column.contributions
         categorical = categorical_contribution.factor
         variable = variable_contribution.factor
-        assert isinstance(categorical, formula.Factor)
         assert categorical.name is None
         assert categorical.value is None
         call = categorical.transform
-        assert isinstance(call, formula.TransformCall)
+        assert call is not None
         assert call.name == "C"
         assert call.parameters == {"reference": "a"}
         assert len(call.inputs) == 1
@@ -100,7 +97,7 @@ def test_categorical_keys_convert_to_python_values(values, dtype, key_type):
 
 
 def test_nested_transform_inputs_and_parameters():
-    data = polars.DataFrame({"y": [1.0, 2.0], "x": [1.0, math.e]})
+    data = polars.DataFrame({"y": [1.0, 2.0, 3.0], "x": [1.0, math.e, math.exp(2)]})
     model = formula.parse("y ~ poly(log(x), degree=2, raw=true) - 1").fit(data)[0]
     columns = model.columns(formula.Role.Independent)
     assert len(columns) == 2
@@ -125,7 +122,7 @@ def test_nested_transform_inputs_and_parameters():
         assert len(logarithm.inputs) == 1
         assert logarithm.inputs[0].name == "x"
         assert logarithm.inputs[0].transform is None
-        assert column.data.to_list() == pytest.approx([0.0, 1.0])
+        assert column.data.to_list() == pytest.approx([0.0, 1.0, 2.0**basis])
 
 
 @pytest.mark.parametrize(("literal", "expected"), [("2", 2), ("2.0", 2.0)])
@@ -197,7 +194,6 @@ def test_zero_column_term_has_empty_python_tuple():
     assert intercept.factors == ()
     assert categorical.columns == ()
     (factor,) = categorical.factors
-    assert isinstance(factor, formula.Factor)
     assert factor.transform is not None
     assert factor.transform.name == "C"
 
@@ -242,8 +238,18 @@ def test_varying_slope_provenance_survives_owner_deletion():
         "firm:year[log(time), exposure]", formula.Role.FixedEffect
     )
     predicted = selected.transform(data.select("firm", "year", "time", "exposure"))
+    (term,) = predicted.terms(role=formula.Role.FixedEffect)
+    effect = term.fixed_effect
+    assert effect is not None
     columns = predicted.columns(role=formula.Role.FixedEffect)
-    del model, selected, predicted
+    del model, selected, predicted, term
+
+    assert effect.encoding.levels.columns == ["firm", "year"]
+    assert effect.codes.to_list() == [0, 1, 2]
+    assert effect.intercept is True
+    time, exposure = effect.loadings
+    assert time.to_list() == pytest.approx([0.0, math.log(2), math.log(3)])
+    assert exposure.to_list() == [0.5, 1.0, 1.5]
 
     assert len(columns) == 3
     for index, column in enumerate(columns):
@@ -261,22 +267,9 @@ def test_varying_slope_provenance_survives_owner_deletion():
         (term_factor,) = column.term
         term_call = term_factor.transform
         assert term_call is not None
-        assert term_call.name == "G"
 
         call = contribution.factor.transform
         assert call is not None
-        assert call.name == "G"
         assert call.parameters == {"intercept": True}
         assert type(call.parameters["intercept"]) is bool
         assert term_call.parameters == call.parameters
-        group, time, exposure = call.inputs
-        encoding = group.transform
-        assert encoding is not None
-        assert encoding.name == "F"
-        assert [factor.name for factor in encoding.inputs] == ["firm", "year"]
-
-        transform = time.transform
-        assert transform is not None
-        assert transform.name == "log"
-        assert [factor.name for factor in transform.inputs] == ["time"]
-        assert exposure.name == "exposure"

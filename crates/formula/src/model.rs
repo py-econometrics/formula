@@ -485,7 +485,7 @@ mod tests {
         }
 
         #[test]
-        fn provenance_identifies_output_roles_group_inputs_and_nested_loadings() {
+        fn fixed_effect_data_exposes_output_roles_codes_and_loadings() {
             let training = polars::df!(
                 "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
                 "firm" => ["a", "a", "b"], "year" => [2020_i32, 2021, 2020],
@@ -501,10 +501,58 @@ mod tests {
             .unwrap();
             let predicted = model.transform(&input).unwrap();
 
-            for model in [&model, &predicted] {
+            for (model, expected_observation_codes, expected_loadings) in [
+                (
+                    &model,
+                    vec![Some(0), Some(1), Some(2)],
+                    vec![vec![0.0, 4_f64.ln(), 9_f64.ln()], vec![0.5, 1.0, 1.5]],
+                ),
+                (
+                    &predicted,
+                    vec![Some(2), None],
+                    vec![vec![16_f64.ln(), 25_f64.ln()], vec![2.0, 2.5]],
+                ),
+            ] {
                 let [term] = model.terms(Role::FixedEffect).unwrap() else {
                     panic!("expected one grouped term");
                 };
+                let effect = term.as_fixed_effect().unwrap();
+                assert_eq!(effect.render(), "firm:year[log(time), exposure]");
+                assert!(effect.intercept());
+                assert_eq!(
+                    effect.codes().u32().unwrap().iter().collect::<Vec<_>>(),
+                    expected_observation_codes
+                );
+                assert_eq!(effect.loadings().width(), expected_loadings.len());
+                for (actual, expected) in effect.loadings().columns().iter().zip(expected_loadings)
+                {
+                    assert_eq!(actual.len(), expected.len());
+                    for (actual, expected) in actual.f64().unwrap().iter().zip(expected) {
+                        assert!((actual.unwrap() - expected).abs() < 1e-12);
+                    }
+                }
+
+                let state = effect.encoding();
+                let codes = state.codes();
+                let levels = state.levels();
+                let expected_codes = polars::df!("code" => [0_u32, 1, 2]).unwrap();
+                assert!(codes.equals_missing(&expected_codes));
+                assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
+
+                let grouped = term.factors().next().unwrap().transform().unwrap();
+                let encoder = grouped.inputs().next().unwrap().transform().unwrap();
+                let exported = encoder.state().unwrap();
+                let Some(crate::StateValue::DataFrame(exported_codes)) = exported.get("codes")
+                else {
+                    panic!("expected the fitted code table");
+                };
+                let Some(crate::StateValue::DataFrame(exported_levels)) = exported.get("levels")
+                else {
+                    panic!("expected the fitted level table");
+                };
+                assert!(exported_codes.equals_missing(&codes));
+                assert!(exported_levels.equals_missing(&levels));
+
                 let columns = term.columns().collect::<Vec<_>>();
                 assert_eq!(columns.len(), 3);
                 for (index, column) in columns.iter().enumerate() {
@@ -531,42 +579,6 @@ mod tests {
                     );
                     assert_eq!(term.factors().collect::<Vec<_>>(), vec![*factor]);
                     assert_eq!(column.term().factors().collect::<Vec<_>>(), vec![*factor]);
-                    let call = factor.transform().unwrap();
-                    assert_eq!(call.name(), "G");
-                    assert_eq!(call.parameters()["intercept"], Scalar::from(true));
-                    let inputs = call.inputs().collect::<Vec<_>>();
-                    let [group, time, exposure] = inputs.as_slice() else {
-                        panic!("expected a group and two loadings");
-                    };
-                    let encoding = group.transform().unwrap();
-                    assert_eq!(encoding.name(), "F");
-                    let state = encoding.state().expect("fitted encoder exposes its state");
-                    let Some(crate::StateValue::DataFrame(codes)) = state.get("codes") else {
-                        panic!("expected the fitted code table");
-                    };
-                    let Some(crate::StateValue::DataFrame(levels)) = state.get("levels") else {
-                        panic!("expected the fitted level table");
-                    };
-                    let expected_codes = polars::df!("code" => [0_u32, 1, 2]).unwrap();
-                    assert!(codes.equals_missing(&expected_codes));
-                    assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
-                    assert_eq!(
-                        encoding
-                            .inputs()
-                            .map(|factor| factor.name())
-                            .collect::<Vec<_>>(),
-                        [Some("firm"), Some("year")]
-                    );
-                    let transform = time.transform().unwrap();
-                    assert_eq!(transform.name(), "log");
-                    assert_eq!(
-                        transform
-                            .inputs()
-                            .map(|factor| factor.name())
-                            .collect::<Vec<_>>(),
-                        [Some("time")]
-                    );
-                    assert_eq!(exposure.name(), Some("exposure"));
                 }
             }
             assert_eq!(

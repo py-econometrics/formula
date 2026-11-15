@@ -4,8 +4,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, Transform, TransformError,
-    validate_numeric_field,
+    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState, Transform,
+    TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -103,17 +103,14 @@ impl Definition<VariableState> for VariableDefinition {
     }
 }
 
-struct FixedEffect<'a> {
-    group: &'a [Arc<Factor>],
-    loadings: &'a [Arc<Factor>],
+#[derive(Clone, Debug)]
+struct FixedEffect {
+    group: Vec<Arc<Factor>>,
+    loadings: Vec<Arc<Factor>>,
     intercept: bool,
 }
 
-impl FixedEffect<'_> {
-    fn is_intercept(&self) -> bool {
-        self.intercept
-    }
-
+impl FixedEffect {
     fn render(&self) -> String {
         let group = self
             .group
@@ -138,6 +135,37 @@ impl FixedEffect<'_> {
         } else {
             format!("{group}[[{loadings}]]")
         }
+    }
+}
+
+/// A fitted fixed effect with observation codes, evaluated loadings, and encoding
+#[derive(Clone, Debug)]
+pub struct FittedFixedEffect {
+    effect: FixedEffect,
+    encoding: IntegerEncodingState,
+    codes: Column,
+    loadings: DataFrame,
+}
+
+impl FittedFixedEffect {
+    pub fn codes(&self) -> &Column {
+        &self.codes
+    }
+
+    pub fn loadings(&self) -> &DataFrame {
+        &self.loadings
+    }
+
+    pub fn intercept(&self) -> bool {
+        self.effect.intercept
+    }
+
+    pub fn encoding(&self) -> &IntegerEncodingState {
+        &self.encoding
+    }
+
+    pub fn render(&self) -> String {
+        self.effect.render()
     }
 }
 
@@ -329,7 +357,8 @@ impl Term {
         })
     }
 
-    fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
+    fn as_fixed_effect(&self) -> Option<FixedEffect> {
+        // A fixed-effect is defined by the composition of internal transforms G(F(...))
         let FactorKind::Call {
             transform: Transform::G(grouped),
             arguments,
@@ -338,22 +367,23 @@ impl Term {
             return None;
         };
 
-        let (group, loadings) = arguments.as_slice().split_first()?;
+        let (encoder, loadings) = arguments.as_slice().split_first()?;
 
         let FactorKind::Call {
             transform: Transform::F(_),
-            arguments,
-        } = &group.kind
+            arguments: group,
+        } = &encoder.kind
         else {
             return None;
         };
 
         Some(FixedEffect {
-            group: arguments,
-            loadings,
+            group: group.clone(),
+            loadings: loadings.to_vec(),
             intercept: grouped.intercept(),
         })
     }
+
     pub fn factors(&self) -> impl Iterator<Item = &Factor> {
         self.factors.iter().map(Arc::as_ref)
     }
@@ -542,7 +572,7 @@ impl Expression {
     pub(crate) fn has_fixed_effect_intercept(&self) -> bool {
         self.terms.iter().any(|term| {
             term.as_fixed_effect()
-                .is_some_and(|effect| effect.is_intercept())
+                .is_some_and(|effect| effect.intercept)
         })
     }
 
@@ -889,6 +919,30 @@ impl FittedTerm {
                 term: &self.term,
                 metadata,
             })
+    }
+
+    pub fn as_fixed_effect(&self) -> Option<FittedFixedEffect> {
+        let effect = self.term.as_fixed_effect()?;
+
+        let grouped = self.term.as_factor()?.transform()?;
+        let encoder = grouped.inputs().next()?.transform()?;
+        // Get specialized IntegerEncodingState instead of generic TransformState
+        let Transform::F(integer) = encoder.transform else {
+            return None;
+        };
+        let encoding = integer.state()?.clone();
+
+        let frame = self.columns.frame();
+        let (codes, loadings) = frame.columns().split_first()?;
+        let loadings = DataFrame::new(frame.height(), loadings.to_vec())
+            .expect("loading columns retain the fitted frame's height and unique names");
+
+        Some(FittedFixedEffect {
+            effect,
+            encoding,
+            codes: codes.clone(),
+            loadings,
+        })
     }
 }
 

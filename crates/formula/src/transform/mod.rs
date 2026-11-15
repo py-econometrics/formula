@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use crate::fit::{Fit, FitError};
 use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::categorical::CategoricalState;
-use crate::transform::integer::IntegerEncodingState;
+pub use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use crate::transform::state::ExportState;
 use polars::error::PolarsError;

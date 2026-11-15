@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 mod _formula {
     #[pymodule_export]
     use super::{
-        Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, Formula,
-        FormulaColumn, Formulas, Role, TransformCall, TransformState, parse, parse_many,
+        Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, FixedEffect,
+        FixedEffectEncoding, Formula, FormulaColumn, Formulas, Role, TransformCall, TransformState,
+        parse, parse_many,
     };
 }
 
@@ -238,6 +239,24 @@ impl FittedFormula {
                 formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
             })
     }
+
+    #[getter]
+    fn fixed_effects(&self) -> Vec<FixedEffect> {
+        self.inner
+            .terms(formula::Role::FixedEffect)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(formula::FittedTerm::as_fixed_effect)
+            .map(|inner| FixedEffect { inner })
+            .collect()
+    }
+
+    fn fixed_effect(&self, name: &str) -> PyResult<FixedEffect> {
+        self.fixed_effects()
+            .into_iter()
+            .find(|effect| effect.inner.render() == name)
+            .ok_or_else(|| PyKeyError::new_err(name.to_owned()))
+    }
 }
 
 #[pyclass(frozen, eq, from_py_object, module = "formula")]
@@ -449,6 +468,13 @@ impl FittedTerm {
 
         PyTuple::new(py, columns)
     }
+
+    #[getter]
+    fn fixed_effect(&self) -> Option<FixedEffect> {
+        self.inner
+            .as_fixed_effect()
+            .map(|inner| FixedEffect { inner })
+    }
 }
 
 #[pyclass(frozen, module = "formula")]
@@ -471,6 +497,59 @@ impl From<formula::FormulaColumn<'_>> for FormulaColumn {
                 })
                 .collect(),
         }
+    }
+}
+
+#[pyclass(frozen, skip_from_py_object, module = "formula")]
+#[derive(Clone, Debug)]
+struct FixedEffect {
+    inner: formula::FittedFixedEffect,
+}
+
+#[pymethods]
+impl FixedEffect {
+    fn __repr__(&self) -> String {
+        self.inner.render()
+    }
+    #[getter]
+    fn codes(&self) -> PySeries {
+        PySeries(self.inner.codes().as_materialized_series().clone())
+    }
+
+    #[getter]
+    fn loadings(&self) -> PyDataFrame {
+        PyDataFrame(self.inner.loadings().clone())
+    }
+
+    #[getter]
+    fn intercept(&self) -> bool {
+        self.inner.intercept()
+    }
+
+    #[getter]
+    fn encoding(&self) -> FixedEffectEncoding {
+        FixedEffectEncoding {
+            inner: self.inner.encoding().clone(),
+        }
+    }
+}
+
+#[pyclass(frozen, skip_from_py_object, module = "formula")]
+#[derive(Clone, Debug)]
+struct FixedEffectEncoding {
+    inner: formula::IntegerEncodingState,
+}
+
+#[pymethods]
+impl FixedEffectEncoding {
+    #[getter]
+    fn codes(&self) -> PyDataFrame {
+        PyDataFrame(self.inner.codes())
+    }
+
+    #[getter]
+    fn levels(&self) -> PyDataFrame {
+        PyDataFrame(self.inner.levels())
     }
 }
 
