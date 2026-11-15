@@ -250,6 +250,13 @@ impl FittedFormula {
             .map(|inner| FixedEffect { inner })
             .collect()
     }
+
+    fn fixed_effect(&self, name: &str) -> PyResult<FixedEffect> {
+        self.fixed_effects()
+            .into_iter()
+            .find(|effect| effect.inner.render() == name)
+            .ok_or_else(|| PyKeyError::new_err(name.to_owned()))
+    }
 }
 
 #[pyclass(frozen, eq, from_py_object, module = "formula")]
@@ -501,11 +508,8 @@ struct FixedEffect {
 
 #[pymethods]
 impl FixedEffect {
-    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let specification = pyo3::types::PyString::new(py, &self.inner.render());
-        let quoted = specification.repr()?;
-
-        Ok(format!("FixedEffect({})", quoted.to_str()?))
+    fn __repr__(&self) -> String {
+        self.inner.render()
     }
     #[getter]
     fn group(&self) -> Vec<Factor> {

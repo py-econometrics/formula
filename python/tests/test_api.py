@@ -425,9 +425,7 @@ def fixed_effect(request):
         {"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"], "x": [1.0, 2.0, 3.0]}
     )
     model = formula.parse(f"y ~ 1 | {request.param}").fit(data)[0]
-    (term,) = model.terms(formula.Role.FixedEffect)
-    effect = term.fixed_effect
-    assert effect is not None
+    (effect,) = model.fixed_effects
     assert [factor.name for factor in effect.group] == ["group"]
     assert effect.intercept is ("[[" not in request.param)
     if request.param == "group":
@@ -438,6 +436,36 @@ def fixed_effect(request):
         assert time.transform.name == "log"
         assert exposure.name == "x"
     return effect
+
+
+def test_fixed_effects_preserve_order_and_support_name_lookup(data):
+    data = data.with_columns(polars.Series("year", [2020, 2021, 2020]))
+    model = formula.parse("y ~ x | firm + year[x]").fit(data)[0]
+    effects = model.fixed_effects
+    assert len(effects) == 2
+    assert [[factor.name for factor in effect.group] for effect in effects] == [
+        ["firm"],
+        ["year"],
+    ]
+    firm = model.fixed_effect("firm")
+    assert [factor.name for factor in firm.group] == ["firm"]
+    assert firm.loadings == []
+    year = model.fixed_effect("year[x]")
+    assert [factor.name for factor in year.group] == ["year"]
+    assert [factor.name for factor in year.loadings] == ["x"]
+    for key in ("year", "missing", "year[ x ]"):
+        with pytest.raises(KeyError) as error:
+            model.fixed_effect(key)
+        assert error.value.args == (key,)
+    with pytest.raises(TypeError):
+        model.fixed_effect(1.5)  # ty: ignore[invalid-argument-type]
+
+
+def test_model_without_fixed_effects_returns_an_empty_collection(data):
+    model = formula.parse("y ~ x").fit(data)[0]
+    assert model.fixed_effects == []
+    with pytest.raises(KeyError):
+        model.fixed_effect("firm")
 
 
 def test_fixed_effect_encoding_exposes_codes_and_levels(fixed_effect):
