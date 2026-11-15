@@ -485,7 +485,7 @@ mod tests {
         }
 
         #[test]
-        fn provenance_identifies_output_roles_group_inputs_and_nested_loadings() {
+        fn fixed_effect_metadata_exposes_output_roles_group_and_loadings() {
             let training = polars::df!(
                 "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],
                 "firm" => ["a", "a", "b"], "year" => [2020_i32, 2021, 2020],
@@ -505,6 +505,43 @@ mod tests {
                 let [term] = model.terms(Role::FixedEffect).unwrap() else {
                     panic!("expected one grouped term");
                 };
+                let effect = term.as_fixed_effect().unwrap();
+                assert!(effect.intercept());
+                assert_eq!(
+                    effect
+                        .group()
+                        .map(|factor| factor.name())
+                        .collect::<Vec<_>>(),
+                    [Some("firm"), Some("year")]
+                );
+                let loadings = effect.loadings().collect::<Vec<_>>();
+                let [time, exposure] = loadings.as_slice() else {
+                    panic!("expected two loadings");
+                };
+                let transform = time.transform().unwrap();
+                assert_eq!(transform.name(), "log");
+                assert_eq!(
+                    transform
+                        .inputs()
+                        .map(|factor| factor.name())
+                        .collect::<Vec<_>>(),
+                    [Some("time")]
+                );
+                assert_eq!(exposure.name(), Some("exposure"));
+
+                let state = effect
+                    .encoding()
+                    .expect("fitted effect exposes its encoding");
+                let Some(crate::StateValue::DataFrame(codes)) = state.get("codes") else {
+                    panic!("expected the fitted code table");
+                };
+                let Some(crate::StateValue::DataFrame(levels)) = state.get("levels") else {
+                    panic!("expected the fitted level table");
+                };
+                let expected_codes = polars::df!("code" => [0_u32, 1, 2]).unwrap();
+                assert!(codes.equals_missing(&expected_codes));
+                assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
+
                 let columns = term.columns().collect::<Vec<_>>();
                 assert_eq!(columns.len(), 3);
                 for (index, column) in columns.iter().enumerate() {
@@ -531,42 +568,6 @@ mod tests {
                     );
                     assert_eq!(term.factors().collect::<Vec<_>>(), vec![*factor]);
                     assert_eq!(column.term().factors().collect::<Vec<_>>(), vec![*factor]);
-                    let call = factor.transform().unwrap();
-                    assert_eq!(call.name(), "G");
-                    assert_eq!(call.parameters()["intercept"], Scalar::from(true));
-                    let inputs = call.inputs().collect::<Vec<_>>();
-                    let [group, time, exposure] = inputs.as_slice() else {
-                        panic!("expected a group and two loadings");
-                    };
-                    let encoding = group.transform().unwrap();
-                    assert_eq!(encoding.name(), "F");
-                    let state = encoding.state().expect("fitted encoder exposes its state");
-                    let Some(crate::StateValue::DataFrame(codes)) = state.get("codes") else {
-                        panic!("expected the fitted code table");
-                    };
-                    let Some(crate::StateValue::DataFrame(levels)) = state.get("levels") else {
-                        panic!("expected the fitted level table");
-                    };
-                    let expected_codes = polars::df!("code" => [0_u32, 1, 2]).unwrap();
-                    assert!(codes.equals_missing(&expected_codes));
-                    assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
-                    assert_eq!(
-                        encoding
-                            .inputs()
-                            .map(|factor| factor.name())
-                            .collect::<Vec<_>>(),
-                        [Some("firm"), Some("year")]
-                    );
-                    let transform = time.transform().unwrap();
-                    assert_eq!(transform.name(), "log");
-                    assert_eq!(
-                        transform
-                            .inputs()
-                            .map(|factor| factor.name())
-                            .collect::<Vec<_>>(),
-                        [Some("time")]
-                    );
-                    assert_eq!(exposure.name(), Some("exposure"));
                 }
             }
             assert_eq!(

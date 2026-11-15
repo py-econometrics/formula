@@ -103,15 +103,29 @@ impl Definition<VariableState> for VariableDefinition {
     }
 }
 
-struct FixedEffect<'a> {
-    group: &'a [Arc<Factor>],
-    loadings: &'a [Arc<Factor>],
+#[derive(Clone, Debug)]
+pub struct FixedEffect {
+    group: Vec<Arc<Factor>>,
+    encoder: Arc<Factor>,
+    loadings: Vec<Arc<Factor>>,
     intercept: bool,
 }
 
-impl FixedEffect<'_> {
-    fn is_intercept(&self) -> bool {
+impl FixedEffect {
+    pub fn group(&self) -> impl Iterator<Item = &Factor> {
+        self.group.iter().map(Arc::as_ref)
+    }
+
+    pub fn loadings(&self) -> impl Iterator<Item = &Factor> {
+        self.loadings.iter().map(Arc::as_ref)
+    }
+
+    pub fn intercept(&self) -> bool {
         self.intercept
+    }
+
+    pub fn encoding(&self) -> Option<TransformState> {
+        self.encoder.transform()?.state()
     }
 
     fn render(&self) -> String {
@@ -329,7 +343,8 @@ impl Term {
         })
     }
 
-    fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
+    pub fn as_fixed_effect(&self) -> Option<FixedEffect> {
+        // A fixed-effect is defined by the composition of internal transforms G(F(...))
         let FactorKind::Call {
             transform: Transform::G(grouped),
             arguments,
@@ -338,22 +353,24 @@ impl Term {
             return None;
         };
 
-        let (group, loadings) = arguments.as_slice().split_first()?;
+        let (encoder, loadings) = arguments.as_slice().split_first()?;
 
         let FactorKind::Call {
             transform: Transform::F(_),
-            arguments,
-        } = &group.kind
+            arguments: group,
+        } = &encoder.kind
         else {
             return None;
         };
 
         Some(FixedEffect {
-            group: arguments,
-            loadings,
+            group: group.clone(),
+            encoder: Arc::clone(encoder),
+            loadings: loadings.to_vec(),
             intercept: grouped.intercept(),
         })
     }
+
     pub fn factors(&self) -> impl Iterator<Item = &Factor> {
         self.factors.iter().map(Arc::as_ref)
     }
@@ -542,7 +559,7 @@ impl Expression {
     pub(crate) fn has_fixed_effect_intercept(&self) -> bool {
         self.terms.iter().any(|term| {
             term.as_fixed_effect()
-                .is_some_and(|effect| effect.is_intercept())
+                .is_some_and(|effect| effect.intercept())
         })
     }
 
@@ -889,6 +906,10 @@ impl FittedTerm {
                 term: &self.term,
                 metadata,
             })
+    }
+
+    pub fn as_fixed_effect(&self) -> Option<FixedEffect> {
+        self.term.as_fixed_effect()
     }
 }
 
