@@ -1,5 +1,8 @@
 mod ast;
 mod expand;
+mod syntax;
+
+use syntax::Syntax;
 
 use crate::Role;
 use crate::fit::Fit;
@@ -15,8 +18,8 @@ use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    Postfix, Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat,
-    separated, terminated,
+    Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat, separated,
+    terminated,
 };
 use winnow::error::{
     ContextError, ErrMode, FromExternalError, ParseError, StrContext, StrContextValue,
@@ -28,7 +31,6 @@ pub(crate) const FORMULA_SEPARATOR: char = '~';
 pub(crate) const PIPE_SEPARATOR: char = '|';
 const SUM_PRECEDENCE: i64 = 10;
 const PRODUCT_PRECEDENCE: i64 = 20;
-const GROUPED_PRECEDENCE: i64 = 25;
 const INTERACTION_PRECEDENCE: i64 = 30;
 const PREFIX_PRECEDENCE: i64 = 40;
 
@@ -154,7 +156,7 @@ fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
     .parse_next(cursor)
 }
 
-fn parse_intercept<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_intercept<K: Syntax>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let name = take_while(1.., is_identifier_character)
         .verify(|name: &str| matches!(name, "0" | "1"))
         .parse_next(cursor)?;
@@ -316,7 +318,7 @@ pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>
         .parse_next(cursor)
 }
 
-fn parse_node<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_node<K: Syntax>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     expression(parse_operand::<K>)
         .prefix(
             preceded(multispace0, '-')
@@ -360,28 +362,11 @@ fn parse_node<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::Parse
                 )
             })),
         )))
-        .postfix(alt((
-            "[[".value(Postfix(
-                GROUPED_PRECEDENCE,
-                |cursor, group: ast::ParsedNode<K>| {
-                    let (first, rest) = cut_err(terminated(parse_loadings, ("]]", multispace0)))
-                        .parse_next(cursor)?;
-                    construction_result(cursor, group.grouped(false, first, rest))
-                },
-            )),
-            '['.value(Postfix(
-                GROUPED_PRECEDENCE,
-                |cursor, group: ast::ParsedNode<K>| {
-                    let (first, rest) = cut_err(terminated(parse_loadings, (']', multispace0)))
-                        .parse_next(cursor)?;
-                    construction_result(cursor, group.grouped(true, first, rest))
-                },
-            )),
-        )))
+        .postfix(K::postfix)
         .parse_next(cursor)
 }
 
-fn parse_stepwise_arguments<K: ast::ParseGrammar>(
+fn parse_stepwise_arguments<K: Syntax>(
     cursor: &mut &str,
 ) -> ModalResult<(ast::ParsedNode<K>, Vec<ast::ParsedNode<K>>)> {
     multispace0.parse_next(cursor)?;
@@ -404,7 +389,7 @@ fn parse_stepwise_arguments<K: ast::ParseGrammar>(
     Ok((first, rest))
 }
 
-fn parse_stepwise<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_stepwise<K: Syntax>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let operator = terminated(
         alt((
             "sw0".value(StepwiseOperator::Sw0),
@@ -429,9 +414,7 @@ fn parse_stepwise<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::P
     )
 }
 
-fn parse_node_parenthesized<K: ast::ParseGrammar>(
-    cursor: &mut &str,
-) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_node_parenthesized<K: Syntax>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     '('.parse_next(cursor)?;
 
     let node = cut_err(parse_node::<K>).parse_next(cursor)?;
@@ -446,7 +429,7 @@ fn parse_node_parenthesized<K: ast::ParseGrammar>(
     Ok(node.parenthesized())
 }
 
-fn parse_operand<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
+fn parse_operand<K: Syntax>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
     let factor = |cursor: &mut &str| {
         let factor = parse_factor.parse_next(cursor)?;
         construction_result(cursor, ast::ParsedNode::<K>::from_term(Term::from(factor)))
@@ -457,28 +440,13 @@ fn parse_operand<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::Pa
         alt((
             parse_node_parenthesized::<K>,
             parse_stepwise::<K>,
-            parse_multistage::<K>,
+            K::special_operand,
             parse_intercept::<K>,
             factor,
         )),
         multispace0,
     )
     .parse_next(cursor)
-}
-
-fn parse_multistage<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::ParsedNode<K>> {
-    let formula = preceded(
-        '[',
-        cut_err(terminated(
-            parse_formula_ast,
-            ']'.context(StrContext::Expected(StrContextValue::Description(
-                "']' to close the nested formula",
-            ))),
-        )),
-    )
-    .parse_next(cursor)?;
-
-    construction_result(cursor, ast::ParsedNode::<K>::child(formula))
 }
 
 fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
@@ -1063,9 +1031,10 @@ mod tests {
 
         #[test]
         fn child_formulas_remain_unexpanded() {
-            let ParsedNode::Embedded(Ast::Child(_, child)) = parse_node::<SimpleFormulaExpression>
-                .parse("[a ~ sw(x, z)]")
-                .unwrap()
+            let ParsedNode::Embedded(Ast::Operand(typed::MultistageOperand::Child(child))) =
+                parse_node::<SimpleFormulaExpression>
+                    .parse("[a ~ sw(x, z)]")
+                    .unwrap()
             else {
                 panic!("expected a child formula");
             };
@@ -2627,5 +2596,29 @@ mod tests {
                 assert!(parse_scalar.parse(source).is_err(), "{source}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod layers {
+    use super::*;
+    #[test]
+    fn mixed_layer_example_keeps_inner_interaction_and_outer_parentheses() {
+        assert_eq!(
+            parse("out ~ x*y + ([x ~ z] + w)").unwrap(),
+            parse("out ~ x + y + x:y + w + [x ~ z]").unwrap()
+        );
+        let node = parse_node::<ast::SimpleFormulaExpression>
+            .parse("x*y + ([x ~ z] + w)")
+            .unwrap();
+        let ast::ParsedNode::Embedded(ast::ExpressionAst::Add(_, pair)) = node else {
+            panic!("outer addition");
+        };
+        let ast::ExpressionAst::Operand(ast::MultistageOperand::Expression(inner)) = *pair.left
+        else {
+            panic!("inner expression operand");
+        };
+        assert!(matches!(*inner, ast::ExpressionAst::InteractFully(_, _)));
+        assert!(matches!(*pair.right, ast::ExpressionAst::Parenthesized(_)));
     }
 }

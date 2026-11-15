@@ -122,204 +122,192 @@ impl<K: ExpressionKind> From<ExpressionAst<K>> for FixedEffectGroup<K> {
     }
 }
 
-/// An expression's operand type and permitted operations.
+/// Independent operand, algebraic-operator, and expansion choices for an expression.
 pub(super) trait ExpressionKind: Sized {
     type Operand;
-
-    type Addition: Permission;
-    type Subtraction: Permission;
-    type Negation: Permission;
-    type Interaction: Permission;
-    type FullInteraction: Permission;
-    type Nesting: Permission;
+    type Inner: ExpressionKind;
+    type Operators: Operations;
     type Stepwise: Permission;
-    type Child: Permission;
 }
 
 /// An expression enum whose [`ExpressionKind`] determines which variants can exist
 pub(super) enum ExpressionAst<K: ExpressionKind> {
     Operand(K::Operand),
 
-    Add(K::Addition, Binary<Self>),
-    Subtract(K::Subtraction, Binary<Self>),
-    Negate(K::Negation, Box<Self>),
-    Interact(K::Interaction, Binary<Self>),
-    InteractFully(K::FullInteraction, Binary<Self>),
-    Nesting(K::Nesting, Binary<Self>),
+    Add(<K::Operators as Operations>::Addition, Binary<Self>),
+    Subtract(<K::Operators as Operations>::Subtraction, Binary<Self>),
+    Negate(<K::Operators as Operations>::Negation, Box<Self>),
+    Interact(<K::Operators as Operations>::Interaction, Binary<Self>),
+    InteractFully(<K::Operators as Operations>::FullInteraction, Binary<Self>),
+    Nesting(<K::Operators as Operations>::Nesting, Binary<Self>),
 
     Parenthesized(Box<Self>),
     Stepwise(K::Stepwise, Box<Stepwise<Self>>),
-
-    Child(K::Child, Box<FormulaAst>),
 }
 
 /// A forbidden expression
 impl ExpressionKind for Forbidden {
     type Operand = Forbidden;
+    type Inner = Forbidden;
+    type Operators = Forbidden;
+    type Stepwise = Forbidden;
+}
 
+impl Operations for Forbidden {
     type Addition = Forbidden;
     type Subtraction = Forbidden;
     type Negation = Forbidden;
     type Interaction = Forbidden;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
-    type Stepwise = Forbidden;
-    type Child = Forbidden;
 }
 
-/// An expression without stepwise calls or multistage formulas
-pub(super) enum SingleFormulaExpression {}
+pub(super) trait Operations {
+    type Addition: Permission;
+    type Subtraction: Permission;
+    type Negation: Permission;
+    type Interaction: Permission;
+    type FullInteraction: Permission;
+    type Nesting: Permission;
+}
 
-impl ExpressionKind for SingleFormulaExpression {
-    type Operand = crate::Term;
+pub(super) enum FormulaOperations {}
 
+impl Operations for FormulaOperations {
     type Addition = Permitted;
     type Subtraction = Permitted;
     type Negation = Permitted;
     type Interaction = Permitted;
     type FullInteraction = Permitted;
     type Nesting = Permitted;
-    type Stepwise = Forbidden;
-    type Child = Forbidden;
 }
 
-/// An expression over formula terms including stepwise but without multistage terms
-pub(super) enum SimpleFormulaExpression {}
+pub(super) enum MultistageOperations {}
 
-impl ExpressionKind for SimpleFormulaExpression {
-    type Operand = crate::Term;
-
-    type Addition = Permitted;
-    type Subtraction = Permitted;
-    type Negation = Permitted;
-    type Interaction = Permitted;
-    type FullInteraction = Permitted;
-    type Nesting = Permitted;
-    type Stepwise = Permitted;
-    type Child = Forbidden;
-}
-
-/// An expression over formula terms including stepwise and multistage
-pub(super) enum MultistageFormulaExpression {}
-
-impl ExpressionKind for MultistageFormulaExpression {
-    type Operand = ExpressionAst<SimpleFormulaExpression>;
-
+impl Operations for MultistageOperations {
     type Addition = Permitted;
     type Subtraction = Permitted;
     type Negation = Forbidden;
     type Interaction = Forbidden;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
-    type Stepwise = Permitted;
-    type Child = Permitted;
 }
 
-/// An expression over potentially grouped column terms, including stepwise expansion
-pub(super) enum GroupingExpression {}
+pub(super) enum GroupingOperations {}
 
-impl ExpressionKind for GroupingExpression {
-    type Operand = crate::formula::VariableDefinition;
-
+impl Operations for GroupingOperations {
     type Addition = Permitted;
     type Subtraction = Forbidden;
     type Negation = Forbidden;
     type Interaction = Permitted;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
-    type Stepwise = Permitted;
-    type Child = Forbidden;
 }
 
-/// An expression over fixed-effect terms, potentially loaded with varying slopes, including stepwise expansion
-pub(super) enum FixedEffectExpression {}
+pub(super) enum FixedEffectOperations {}
 
-impl ExpressionKind for FixedEffectExpression {
-    type Operand = FixedEffectGroup<GroupingExpression>;
-
+impl Operations for FixedEffectOperations {
     type Addition = Permitted;
     type Subtraction = Forbidden;
     type Negation = Forbidden;
     type Interaction = Forbidden;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
-    type Stepwise = Permitted;
-    type Child = Forbidden;
 }
 
-/// An expression over potentially grouped column terms, excluding stepwise expansion
-pub(super) enum SingleGroupingExpression {}
-
-impl ExpressionKind for SingleGroupingExpression {
-    type Operand = crate::formula::VariableDefinition;
-
-    type Addition = Permitted;
-    type Subtraction = Forbidden;
-    type Negation = Forbidden;
-    type Interaction = Permitted;
-    type FullInteraction = Forbidden;
-    type Nesting = Forbidden;
-    type Stepwise = Forbidden;
-    type Child = Forbidden;
+/// An expression layer with independent operands, operators, and stepwise support.
+/// `Inner = Forbidden` denotes a layer without an embedded expression domain.
+pub(super) struct Layer<O, I, P, S>(std::marker::PhantomData<(O, I, P, S)>);
+impl<O, I: ExpressionKind, P: Operations, S: Permission> ExpressionKind for Layer<O, I, P, S> {
+    type Operand = O;
+    type Inner = I;
+    type Operators = P;
+    type Stepwise = S;
 }
 
-/// An expression over fixed-effect terms, potentially loaded with varying slopes, excluding stepwise expansion
-pub(super) enum SingleFixedEffectExpression {}
-
-impl ExpressionKind for SingleFixedEffectExpression {
-    type Operand = FixedEffectGroup<SingleGroupingExpression>;
-
-    type Addition = Permitted;
-    type Subtraction = Forbidden;
-    type Negation = Forbidden;
-    type Interaction = Forbidden;
-    type FullInteraction = Forbidden;
-    type Nesting = Forbidden;
-    type Stepwise = Forbidden;
-    type Child = Forbidden;
-}
-
-/// Defines an [`ExpressionKind`] with its embedded counterpart
-pub(super) trait ParseGrammar: ExpressionKind<Operand: TryFrom<crate::Term>> {
-    type Embedded: ExpressionKind<Operand: TryFrom<ExpressionAst<Self>>>;
-
-    fn grouped(
-        _group: FixedEffectGroup<Self>,
-    ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Err(ConstructionError::Unsupported)
+// Embedding preserves the complete inner tree; operand expansion decides how
+// it participates in the outer domain.
+impl<I, O, P, S> From<ExpressionAst<I>> for ExpressionAst<Layer<O, I, P, S>>
+where
+    I: ExpressionKind,
+    O: From<ExpressionAst<I>>,
+    P: Operations,
+    S: Permission,
+{
+    fn from(inner: ExpressionAst<I>) -> Self {
+        Self::Operand(O::from(inner))
     }
 }
 
-impl ParseGrammar for SingleFormulaExpression {
+/// A multistage operand is either an embedded simple expression or a child formula.
+pub(super) enum MultistageOperand<I: ExpressionKind> {
+    Expression(Box<ExpressionAst<I>>),
+    Child(Box<FormulaAst>),
+}
+impl<I: ExpressionKind> From<ExpressionAst<I>> for MultistageOperand<I> {
+    fn from(value: ExpressionAst<I>) -> Self {
+        Self::Expression(Box::new(value))
+    }
+}
+impl<I: ExpressionKind> From<FormulaAst> for MultistageOperand<I> {
+    fn from(value: FormulaAst) -> Self {
+        Self::Child(Box::new(value))
+    }
+}
+
+pub(super) type SingleFormulaExpression =
+    Layer<crate::Term, Forbidden, FormulaOperations, Forbidden>;
+pub(super) type SimpleFormulaExpression =
+    Layer<crate::Term, Forbidden, FormulaOperations, Permitted>;
+pub(super) type GroupingExpression =
+    Layer<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Permitted>;
+pub(super) type SingleGroupingExpression =
+    Layer<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Forbidden>;
+pub(super) type MultistageFormulaExpression = Layer<
+    MultistageOperand<SimpleFormulaExpression>,
+    SimpleFormulaExpression,
+    MultistageOperations,
+    Permitted,
+>;
+pub(super) type FixedEffectExpression = Layer<
+    FixedEffectGroup<GroupingExpression>,
+    GroupingExpression,
+    FixedEffectOperations,
+    Permitted,
+>;
+
+/// The expression domains used by a parsed node. This describes promotion only;
+/// syntax-specific operand constructors live in the parser.
+pub(super) trait ParseLayers: ExpressionKind {
+    type Embedded: ExpressionKind<Operand: TryFrom<ExpressionAst<Self>>>;
+}
+
+impl ParseLayers for SingleFormulaExpression {
     type Embedded = Forbidden;
 }
 
-impl ParseGrammar for SimpleFormulaExpression {
+impl ParseLayers for SimpleFormulaExpression {
     type Embedded = MultistageFormulaExpression;
 }
-
-impl ParseGrammar for GroupingExpression {
-    type Embedded = FixedEffectExpression;
-
-    fn grouped(
-        group: FixedEffectGroup<Self>,
-    ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Ok(ExpressionAst::Operand(group))
-    }
+impl<S: Permission> ParseLayers
+    for Layer<crate::formula::VariableDefinition, Forbidden, GroupingOperations, S>
+{
+    type Embedded = Layer<FixedEffectGroup<Self>, Self, FixedEffectOperations, S>;
 }
 
-impl ParseGrammar for SingleGroupingExpression {
-    type Embedded = SingleFixedEffectExpression;
-
-    fn grouped(
-        group: FixedEffectGroup<Self>,
-    ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Ok(ExpressionAst::Operand(group))
+impl<K: ExpressionKind> ExpressionAst<K> {
+    pub(super) fn try_operand<T>(input: T) -> Result<Self, ConstructionError>
+    where
+        K::Operand: TryFrom<T>,
+    {
+        K::Operand::try_from(input)
+            .map(Self::Operand)
+            .map_err(|_| ConstructionError::Unsupported)
     }
 }
 
 /// Homogeneous result returned by the Pratt parser.
-pub(super) enum ParsedNode<K: ParseGrammar> {
+pub(super) enum ParsedNode<K: ParseLayers> {
     Flat(ExpressionAst<K>),
     Embedded(ExpressionAst<K::Embedded>),
 }
@@ -333,8 +321,8 @@ pub(super) struct FormulaAst {
     pub(super) fixed_effects: Option<ExpressionAst<FixedEffectExpression>>,
 }
 
-impl<K: ParseGrammar> ParsedNode<K> {
-    fn into_flat(self) -> Result<ExpressionAst<K>, ConstructionError> {
+impl<K: ParseLayers> ParsedNode<K> {
+    pub(super) fn into_flat(self) -> Result<ExpressionAst<K>, ConstructionError> {
         match self {
             Self::Flat(expression) => Ok(expression),
             Self::Embedded(_) => Err(ConstructionError::Unsupported),
@@ -364,23 +352,16 @@ impl<K: ParseGrammar> ParsedNode<K> {
         }
     }
 
-    pub(super) fn child(formula: FormulaAst) -> Result<Self, ConstructionError> {
-        permitted(Box::new(formula), ExpressionAst::<K::Embedded>::Child).map(Self::Embedded)
-    }
-
-    pub(super) fn from_term(term: crate::Term) -> Result<Self, ConstructionError> {
-        let operand = K::Operand::try_from(term).map_err(|_| ConstructionError::Unsupported)?;
-        Ok(Self::Flat(ExpressionAst::Operand(operand)))
+    pub(super) fn from_term(term: crate::Term) -> Result<Self, ConstructionError>
+    where
+        K::Operand: TryFrom<crate::Term>,
+    {
+        ExpressionAst::try_operand(term).map(Self::Flat)
     }
 
     pub(super) fn into_embedded(self) -> Result<ExpressionAst<K::Embedded>, ConstructionError> {
         match self {
-            Self::Flat(expression) => {
-                let operand = <K::Embedded as ExpressionKind>::Operand::try_from(expression)
-                    .map_err(|_| ConstructionError::Unsupported)?;
-
-                Ok(ExpressionAst::Operand(operand))
-            }
+            Self::Flat(expression) => ExpressionAst::try_operand(expression),
             Self::Embedded(expression) => Ok(expression),
         }
     }
@@ -399,21 +380,6 @@ impl<K: ParseGrammar> ParsedNode<K> {
                 operator.construct(operands).map(Self::Embedded)
             }
         }
-    }
-
-    pub(super) fn grouped(
-        self,
-        intercept: bool,
-        first: Arc<Factor>,
-        rest: Vec<Arc<Factor>>,
-    ) -> Result<Self, ConstructionError> {
-        let group = FixedEffectGroup {
-            group: self.into_flat()?,
-            intercept,
-            loadings: std::iter::once(first).chain(rest).collect(),
-        };
-
-        K::grouped(group).map(Self::Embedded)
     }
 
     pub(super) fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError> {
@@ -463,9 +429,11 @@ mod tests {
     }
 
     fn loaded() -> Node {
-        column("year")
-            .grouped(false, Arc::new(Factor::from("time")), Vec::new())
-            .unwrap()
+        Node::Embedded(ExpressionAst::Operand(FixedEffectGroup {
+            group: column("year").into_flat().unwrap(),
+            intercept: false,
+            loadings: vec![Arc::new(Factor::from("time"))],
+        }))
     }
 
     #[test]
@@ -519,5 +487,34 @@ mod tests {
         assert!(first.loadings.is_empty());
         assert!(!second.intercept);
         assert_eq!(second.loadings, vec![Arc::new(Factor::from("time"))]);
+    }
+}
+
+#[cfg(test)]
+mod layers {
+    use super::*;
+
+    // A third layer with a new operand type: no Child or Grouped vocabulary.
+    struct Envelope(ExpressionAst<FixedEffectExpression>);
+    impl From<ExpressionAst<FixedEffectExpression>> for Envelope {
+        fn from(value: ExpressionAst<FixedEffectExpression>) -> Self {
+            Self(value)
+        }
+    }
+    type Enveloped = Layer<Envelope, FixedEffectExpression, FixedEffectOperations, Forbidden>;
+
+    #[test]
+    fn new_layer_embeds_an_existing_layer_without_changing_the_ast() {
+        let grouping = ExpressionAst::<GroupingExpression>::try_operand(crate::Term::from(
+            Factor::from("firm"),
+        ))
+        .unwrap_or_else(|_| panic!("column"));
+        let fixed: ExpressionAst<FixedEffectExpression> = grouping.into();
+        let envelope: ExpressionAst<Enveloped> = fixed.into();
+        let ExpressionAst::Operand(Envelope(ExpressionAst::Operand(group))) = envelope else {
+            panic!("wrong representation");
+        };
+        assert!(group.intercept);
+        assert!(group.loadings.is_empty());
     }
 }
