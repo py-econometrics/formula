@@ -140,6 +140,7 @@ impl OperandExpansion for Forbidden {
 impl<K: ExpressionKind> OperandExpansion for FixedEffectGroup<K>
 where
     K::Operand: OperandExpansion,
+    K::Nested: OperandExpansion,
 {
     fn expand_operand(&self) -> Vec<formula::Expression> {
         self.group
@@ -153,27 +154,6 @@ where
     }
 }
 
-// Both child formulas and loaded fixed effects use this same traversal.
-impl<B: OperandExpansion, N: OperandExpansion> OperandExpansion for super::ast::LayerOperand<B, N> {
-    fn expand_operand(&self) -> Vec<formula::Expression> {
-        match self {
-            Self::Expression(expr) => expr.expand_operand(),
-            Self::Nested(value) => value.expand_operand(),
-        }
-    }
-    fn apply_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        match self {
-            Self::Expression(expr) => expr.apply_operand(accumulated),
-            Self::Nested(value) => value.apply_operand(accumulated),
-        }
-    }
-    fn subtract_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        match self {
-            Self::Expression(expr) => expr.subtract_operand(accumulated),
-            Self::Nested(value) => value.subtract_operand(accumulated),
-        }
-    }
-}
 impl OperandExpansion for FormulaAst {
     fn expand_operand(&self) -> Vec<formula::Expression> {
         self.expand()
@@ -186,6 +166,7 @@ impl OperandExpansion for FormulaAst {
 impl<K: ExpressionKind> OperandExpansion for ExpressionAst<K>
 where
     K::Operand: OperandExpansion,
+    K::Nested: OperandExpansion,
 {
     fn expand_operand(&self) -> Vec<formula::Expression> {
         self.expand()
@@ -203,10 +184,12 @@ where
 impl<K: ExpressionKind> ExpressionAst<K>
 where
     K::Operand: OperandExpansion,
+    K::Nested: OperandExpansion,
 {
     pub(in crate::parse) fn expand(&self) -> Vec<formula::Expression> {
         match self {
             Self::Operand(operand) => operand.expand_operand(),
+            Self::Nested(nested) => nested.expand_operand(),
 
             Self::Add(_, _) | Self::Subtract(_, _) | Self::Negate(_, _) => {
                 self.apply_to(formula::Expression::from_iter([]))
@@ -286,6 +269,7 @@ where
 impl<I: ExpressionKind> OperandExpansion for super::ast::FixedEffect<I>
 where
     I::Operand: OperandExpansion,
+    I::Nested: OperandExpansion,
 {
     fn expand_operand(&self) -> Vec<formula::Expression> {
         self.group
@@ -366,7 +350,7 @@ mod tests {
         type Embedded = ExpressionAst<MultistageFormulaExpression>;
         let removed = || subtract(operand("x"), Ast::Operand(formula::Term::intercept()));
         let seed = value([formula::Term::intercept()]);
-        let node = Embedded::Operand(removed().into());
+        let node = Embedded::Operand(removed());
         assert_eq!(node.apply_to(seed.clone()), [value([term("x")])]);
 
         let grouped = Embedded::Parenthesized(Box::new(node));
@@ -376,7 +360,7 @@ mod tests {
         );
 
         // Subtracting an embedded negation adds its operand to the accumulator.
-        let negated = Embedded::Operand(negate(operand("x")).into());
+        let negated = Embedded::Operand(negate(operand("x")));
         assert_eq!(
             negated.subtract_from(seed),
             [value([formula::Term::intercept(), term("x")])]
