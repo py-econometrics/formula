@@ -429,21 +429,29 @@ def test_varying_slope_syntax_errors_are_syntax_errors():
         formula.parse("y ~ x | firm[]")
 
 
-@pytest.fixture
-def encoding_call():
-    data = polars.DataFrame({"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"]})
-    model = formula.parse("y ~ 1 | group").fit(data)[0]
+@pytest.fixture(params=["group", "group[log(x), x]", "group[[log(x), x]]"])
+def fixed_effect(request):
+    data = polars.DataFrame(
+        {"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"], "x": [1.0, 2.0, 3.0]}
+    )
+    model = formula.parse(f"y ~ 1 | {request.param}").fit(data)[0]
     (term,) = model.terms(formula.Role.FixedEffect)
-    (factor,) = term.factors
-    grouped = factor.transform
-    assert grouped is not None
-    encoder = grouped.inputs[0].transform
-    assert encoder is not None
-    return encoder
+    effect = term.fixed_effect
+    assert isinstance(effect, formula.FixedEffect)
+    assert [factor.name for factor in effect.group] == ["group"]
+    assert effect.intercept is ("[[" not in request.param)
+    if request.param == "group":
+        assert effect.loadings == []
+    else:
+        time, exposure = effect.loadings
+        assert time.transform is not None
+        assert time.transform.name == "log"
+        assert exposure.name == "x"
+    return effect
 
 
-def test_transform_state_mapping_interface(encoding_call):
-    state = encoding_call.state
+def test_transform_state_mapping_interface(fixed_effect):
+    state = fixed_effect.encoding
     assert isinstance(state, formula.TransformState)
     assert len(state) == 2
     assert set(state) == {"codes", "levels"}
@@ -460,9 +468,8 @@ def test_transform_state_mapping_interface(encoding_call):
         operator.setitem(state, "codes", polars.DataFrame())
 
 
-def test_transform_state_values_are_independent_snapshots(encoding_call):
-    state = encoding_call.state
-    assert state is not None
+def test_transform_state_values_are_independent_snapshots(fixed_effect):
+    state = fixed_effect.encoding
     codes = state["codes"]
     levels = state["levels"]
     assert isinstance(codes, polars.DataFrame)
@@ -472,8 +479,7 @@ def test_transform_state_values_are_independent_snapshots(encoding_call):
 
     expected_codes = polars.DataFrame({"code": [0, 1]}, schema={"code": polars.UInt32})
     expected_levels = polars.DataFrame({"group": ["a", "b"]})
-    for snapshot in [state, encoding_call.state]:
-        assert snapshot is not None
+    for snapshot in [state, fixed_effect.encoding]:
         assert_frame_equal(snapshot["codes"], expected_codes)
         assert_frame_equal(snapshot["levels"], expected_levels)
 
@@ -482,6 +488,7 @@ def test_stateless_transform_has_an_empty_state():
     data = polars.DataFrame({"y": [1.0, 2.0], "x": [2.0, 3.0]})
     model = formula.parse("y ~ log(x) - 1").fit(data)[0]
     (term,) = model.terms(formula.Role.Independent)
+    assert term.fixed_effect is None
     (factor,) = term.factors
     call = factor.transform
     assert call is not None

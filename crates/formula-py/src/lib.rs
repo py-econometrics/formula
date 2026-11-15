@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 mod _formula {
     #[pymodule_export]
     use super::{
-        Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, Formula,
-        FormulaColumn, Formulas, Role, TransformCall, TransformState, parse, parse_many,
+        Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, FixedEffect,
+        Formula, FormulaColumn, Formulas, Role, TransformCall, TransformState, parse, parse_many,
     };
 }
 
@@ -449,6 +449,13 @@ impl FittedTerm {
 
         PyTuple::new(py, columns)
     }
+
+    #[getter]
+    fn fixed_effect(&self) -> Option<FixedEffect> {
+        self.inner
+            .as_fixed_effect()
+            .map(|inner| FixedEffect { inner })
+    }
 }
 
 #[pyclass(frozen, module = "formula")]
@@ -470,6 +477,37 @@ impl From<formula::FormulaColumn<'_>> for FormulaColumn {
                     key: key.clone(),
                 })
                 .collect(),
+        }
+    }
+}
+
+#[pyclass(frozen, skip_from_py_object, module = "formula")]
+#[derive(Clone, Debug)]
+struct FixedEffect {
+    inner: formula::FittedFixedEffect,
+}
+
+#[pymethods]
+impl FixedEffect {
+    #[getter]
+    fn group(&self) -> Vec<Factor> {
+        self.inner.group().map(Factor::from).collect()
+    }
+
+    #[getter]
+    fn loadings(&self) -> Vec<Factor> {
+        self.inner.loadings().map(Factor::from).collect()
+    }
+
+    #[getter]
+    fn intercept(&self) -> bool {
+        self.inner.intercept()
+    }
+
+    #[getter]
+    fn encoding(&self) -> TransformState {
+        TransformState {
+            inner: self.inner.encoding().clone(),
         }
     }
 }

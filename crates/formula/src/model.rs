@@ -529,9 +529,7 @@ mod tests {
                 );
                 assert_eq!(exposure.name(), Some("exposure"));
 
-                let state = effect
-                    .encoding()
-                    .expect("fitted effect exposes its encoding");
+                let state = effect.encoding();
                 let Some(crate::StateValue::DataFrame(codes)) = state.get("codes") else {
                     panic!("expected the fitted code table");
                 };

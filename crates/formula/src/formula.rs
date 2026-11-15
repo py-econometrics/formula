@@ -103,31 +103,13 @@ impl Definition<VariableState> for VariableDefinition {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct FixedEffect {
-    group: Vec<Arc<Factor>>,
-    encoder: Arc<Factor>,
-    loadings: Vec<Arc<Factor>>,
+struct FixedEffect<'a> {
+    group: &'a [Arc<Factor>],
+    loadings: &'a [Arc<Factor>],
     intercept: bool,
 }
 
-impl FixedEffect {
-    pub fn group(&self) -> impl Iterator<Item = &Factor> {
-        self.group.iter().map(Arc::as_ref)
-    }
-
-    pub fn loadings(&self) -> impl Iterator<Item = &Factor> {
-        self.loadings.iter().map(Arc::as_ref)
-    }
-
-    pub fn intercept(&self) -> bool {
-        self.intercept
-    }
-
-    pub fn encoding(&self) -> Option<TransformState> {
-        self.encoder.transform()?.state()
-    }
-
+impl FixedEffect<'_> {
     fn render(&self) -> String {
         let group = self
             .group
@@ -152,6 +134,33 @@ impl FixedEffect {
         } else {
             format!("{group}[[{loadings}]]")
         }
+    }
+}
+
+/// A fitted fixed effect with its grouping factors, loadings, and encoding
+#[derive(Clone, Debug)]
+pub struct FittedFixedEffect {
+    group: Vec<Arc<Factor>>,
+    loadings: Vec<Arc<Factor>>,
+    intercept: bool,
+    encoding: TransformState,
+}
+
+impl FittedFixedEffect {
+    pub fn group(&self) -> impl Iterator<Item = &Factor> {
+        self.group.iter().map(Arc::as_ref)
+    }
+
+    pub fn loadings(&self) -> impl Iterator<Item = &Factor> {
+        self.loadings.iter().map(Arc::as_ref)
+    }
+
+    pub fn intercept(&self) -> bool {
+        self.intercept
+    }
+
+    pub fn encoding(&self) -> &TransformState {
+        &self.encoding
     }
 }
 
@@ -343,7 +352,7 @@ impl Term {
         })
     }
 
-    pub fn as_fixed_effect(&self) -> Option<FixedEffect> {
+    fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
         // A fixed-effect is defined by the composition of internal transforms G(F(...))
         let FactorKind::Call {
             transform: Transform::G(grouped),
@@ -364,9 +373,8 @@ impl Term {
         };
 
         Some(FixedEffect {
-            group: group.clone(),
-            encoder: Arc::clone(encoder),
-            loadings: loadings.to_vec(),
+            group,
+            loadings,
             intercept: grouped.intercept(),
         })
     }
@@ -559,7 +567,7 @@ impl Expression {
     pub(crate) fn has_fixed_effect_intercept(&self) -> bool {
         self.terms.iter().any(|term| {
             term.as_fixed_effect()
-                .is_some_and(|effect| effect.intercept())
+                .is_some_and(|effect| effect.intercept)
         })
     }
 
@@ -908,8 +916,19 @@ impl FittedTerm {
             })
     }
 
-    pub fn as_fixed_effect(&self) -> Option<FixedEffect> {
-        self.term.as_fixed_effect()
+    pub fn as_fixed_effect(&self) -> Option<FittedFixedEffect> {
+        let effect = self.term.as_fixed_effect()?;
+
+        let grouped = self.term.as_factor()?.transform()?;
+        let encoder = grouped.inputs().next()?.transform()?;
+        let encoding = encoder.state()?;
+
+        Some(FittedFixedEffect {
+            group: effect.group.to_vec(),
+            loadings: effect.loadings.to_vec(),
+            intercept: effect.intercept,
+            encoding,
+        })
     }
 }
 
