@@ -1,5 +1,5 @@
 use crate::parse::ast::{
-    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParseGrammar,
+    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParseLayers,
     ParsedNode, StepwiseOperator,
 };
 use crate::{Factor, formula};
@@ -157,6 +157,44 @@ where
     }
 }
 
+impl<I: ExpressionKind> OperandExpansion for super::ast::MultistageOperand<I>
+where
+    I::Operand: OperandExpansion,
+{
+    fn expand_operand(&self) -> Vec<formula::Expression> {
+        match self {
+            Self::Expression(expr) => expr.expand(),
+            Self::Child(formula) => formula
+                .expand()
+                .into_iter()
+                .map(|child| formula::Expression::new([], vec![child]))
+                .collect(),
+        }
+    }
+
+    fn apply_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
+        match self {
+            Self::Expression(expr) => expr.apply_to(accumulated),
+            Self::Child(_) => self
+                .expand_operand()
+                .into_iter()
+                .map(|value| accumulated.clone().add(value))
+                .collect(),
+        }
+    }
+
+    fn subtract_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
+        match self {
+            Self::Expression(expr) => expr.subtract_from(accumulated),
+            Self::Child(_) => self
+                .expand_operand()
+                .into_iter()
+                .map(|value| accumulated.clone().subtract(value))
+                .collect(),
+        }
+    }
+}
+
 impl<K: ExpressionKind> OperandExpansion for ExpressionAst<K>
 where
     K::Operand: OperandExpansion,
@@ -211,12 +249,6 @@ where
                     .chain(call.rest.iter())
                     .map(Self::expand),
             ),
-
-            Self::Child(_, formula) => formula
-                .expand()
-                .into_iter()
-                .map(|child| formula::Expression::new([], vec![child]))
-                .collect(),
         }
     }
 
@@ -263,7 +295,7 @@ where
     }
 }
 
-impl<K: ParseGrammar> ParsedNode<K>
+impl<K: ParseLayers> ParsedNode<K>
 where
     K::Operand: OperandExpansion,
     <K::Embedded as ExpressionKind>::Operand: OperandExpansion,
@@ -356,7 +388,7 @@ mod tests {
         type Embedded = ExpressionAst<MultistageFormulaExpression>;
         let removed = || subtract(operand("x"), Ast::Operand(formula::Term::intercept()));
         let seed = value([formula::Term::intercept()]);
-        let node = Embedded::Operand(removed());
+        let node = Embedded::Operand(removed().into());
         assert_eq!(node.apply_to(seed.clone()), [value([term("x")])]);
 
         let grouped = Embedded::Parenthesized(Box::new(node));
@@ -366,7 +398,7 @@ mod tests {
         );
 
         // Subtracting an embedded negation adds its operand to the accumulator.
-        let negated = Embedded::Operand(negate(operand("x")));
+        let negated = Embedded::Operand(negate(operand("x")).into());
         assert_eq!(
             negated.subtract_from(seed),
             [value([formula::Term::intercept(), term("x")])]
