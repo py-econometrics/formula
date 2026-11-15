@@ -105,26 +105,49 @@ pub(super) struct Stepwise<E> {
     pub(super) rest: Vec<E>,
 }
 
-/// A fixed effect with optional varying-slope loadings.
-pub(super) struct FixedEffectGroup<K: ExpressionKind> {
+/// An unloaded fixed effect, with its grouping algebra still intact.
+pub(super) struct FixedEffect<K: ExpressionKind> {
     pub(super) group: ExpressionAst<K>,
-    pub(super) intercept: bool,
-    pub(super) loadings: Vec<Arc<Factor>>,
 }
-
-impl<K: ExpressionKind> From<ExpressionAst<K>> for FixedEffectGroup<K> {
+impl<K: ExpressionKind> From<ExpressionAst<K>> for FixedEffect<K> {
     fn from(group: ExpressionAst<K>) -> Self {
-        Self {
-            group,
-            intercept: true,
-            loadings: Vec::new(),
-        }
+        Self { group }
     }
 }
 
+/// Loading is a wrapper around an unloaded fixed effect.
+pub(super) struct Loaded<T> {
+    pub(super) group: T,
+    pub(super) intercept: bool,
+    pub(super) first_loading: Arc<Factor>,
+    pub(super) rest_loadings: Vec<Arc<Factor>>,
+}
+
+impl<T> Loaded<T> {
+    pub(super) fn loadings(&self) -> impl Iterator<Item = &Arc<Factor>> {
+        std::iter::once(&self.first_loading).chain(self.rest_loadings.iter())
+    }
+}
+
+pub(super) type FixedEffectGroup<K> = Loaded<FixedEffect<K>>;
+
+/// Embedding is reversible: the parser can recover an inner tree without
+/// maintaining a second representation of the expression's current layer.
+pub(super) trait Embedding<I: ExpressionKind>: TryFrom<ExpressionAst<I>> {
+    fn is_inner(&self) -> bool {
+        false
+    }
+    fn into_inner(self) -> Result<ExpressionAst<I>, Self> {
+        Err(self)
+    }
+}
+impl Embedding<Forbidden> for crate::Term {}
+impl Embedding<Forbidden> for crate::formula::VariableDefinition {}
+impl Embedding<Forbidden> for Forbidden {}
+
 /// Independent operand, algebraic-operator, and expansion choices for an expression.
 pub(super) trait ExpressionKind: Sized {
-    type Operand: TryFrom<ExpressionAst<Self::Inner>>;
+    type Operand: Embedding<Self::Inner>;
     type Inner: ExpressionKind;
     type Operators: Operations;
     type Stepwise: Permission;
@@ -220,7 +243,7 @@ impl Operations for FixedEffectOperations {
 pub(super) struct Layer<O, I, P, S>(std::marker::PhantomData<(O, I, P, S)>);
 impl<O, I: ExpressionKind, P: Operations, S: Permission> ExpressionKind for Layer<O, I, P, S>
 where
-    O: TryFrom<ExpressionAst<I>>,
+    O: Embedding<I>,
 {
     type Operand = O;
     type Inner = I;
@@ -233,7 +256,7 @@ where
 impl<I, O, P, S> From<ExpressionAst<I>> for ExpressionAst<Layer<O, I, P, S>>
 where
     I: ExpressionKind,
-    O: From<ExpressionAst<I>>,
+    O: Embedding<I> + From<ExpressionAst<I>>,
     P: Operations,
     S: Permission,
 {
@@ -242,21 +265,42 @@ where
     }
 }
 
-/// A multistage operand is either an embedded simple expression or a child formula.
-pub(super) enum MultistageOperand<I: ExpressionKind> {
-    Expression(Box<ExpressionAst<I>>),
-    Child(Box<FormulaAst>),
+/// One operand lifecycle for every layer: preserve an inner tree, or construct
+/// a domain-specific nested value. No syntax or domain names in this enum.
+pub(super) enum LayerOperand<B, N> {
+    Expression(B),
+    Nested(Box<N>),
 }
-impl<I: ExpressionKind> From<ExpressionAst<I>> for MultistageOperand<I> {
+impl<I: ExpressionKind, B: From<ExpressionAst<I>>, N> From<ExpressionAst<I>>
+    for LayerOperand<B, N>
+{
     fn from(value: ExpressionAst<I>) -> Self {
-        Self::Expression(Box::new(value))
+        Self::Expression(B::from(value))
     }
 }
-impl<I: ExpressionKind> From<FormulaAst> for MultistageOperand<I> {
-    fn from(value: FormulaAst) -> Self {
-        Self::Child(Box::new(value))
+
+impl<K: ExpressionKind> From<FixedEffect<K>> for ExpressionAst<K> {
+    fn from(effect: FixedEffect<K>) -> Self {
+        effect.group
     }
 }
+impl<I: ExpressionKind, B, N> Embedding<I> for LayerOperand<B, N>
+where
+    B: From<ExpressionAst<I>> + Into<ExpressionAst<I>>,
+{
+    fn is_inner(&self) -> bool {
+        matches!(self, Self::Expression(_))
+    }
+    fn into_inner(self) -> Result<ExpressionAst<I>, Self> {
+        match self {
+            Self::Expression(base) => Ok(base.into()),
+            other => Err(other),
+        }
+    }
+}
+
+pub(super) type MultistageOperand<I> = LayerOperand<ExpressionAst<I>, FormulaAst>;
+pub(super) type FixedEffectOperand<I> = LayerOperand<FixedEffect<I>, FixedEffectGroup<I>>;
 
 pub(super) type SingleFormulaExpression =
     Layer<crate::Term, Forbidden, FormulaOperations, Forbidden>;
@@ -273,14 +317,14 @@ pub(super) type MultistageFormulaExpression = Layer<
     Permitted,
 >;
 pub(super) type FixedEffectExpression = Layer<
-    FixedEffectGroup<GroupingExpression>,
+    FixedEffectOperand<GroupingExpression>,
     GroupingExpression,
     FixedEffectOperations,
     Permitted,
 >;
 
 pub(super) type SingleFixedEffectExpression = Layer<
-    FixedEffectGroup<SingleGroupingExpression>,
+    FixedEffectOperand<SingleGroupingExpression>,
     SingleGroupingExpression,
     FixedEffectOperations,
     Forbidden,
@@ -312,55 +356,42 @@ impl<K: ExpressionKind> ExpressionAst<K> {
     }
 }
 
-/// Homogeneous result returned by the Pratt parser.
-pub(super) enum ParsedNode<K: ExpressionKind> {
-    Inner(ExpressionAst<K::Inner>),
-    Outer(ExpressionAst<K>),
-}
-
-pub(super) type FormulaNode = ParsedNode<MultistageFormulaExpression>;
-
 /// A formula before expansion into estimation alternatives.
 pub(super) struct FormulaAst {
-    pub(super) left: FormulaNode,
-    pub(super) right: FormulaNode,
+    pub(super) left: ExpressionAst<MultistageFormulaExpression>,
+    pub(super) right: ExpressionAst<MultistageFormulaExpression>,
     pub(super) fixed_effects: Option<ExpressionAst<FixedEffectExpression>>,
 }
 
-impl<K: ExpressionKind> ParsedNode<K> {
-    pub(super) fn into_inner(self) -> Result<ExpressionAst<K::Inner>, ConstructionError> {
+impl<K: ExpressionKind> ExpressionAst<K> {
+    fn is_inner(&self) -> bool {
+        matches!(self, Self::Operand(operand) if operand.is_inner())
+    }
+
+    fn try_into_inner(self) -> Result<ExpressionAst<K::Inner>, Self> {
         match self {
-            Self::Inner(expression) => Ok(expression),
-            Self::Outer(_) => Err(ConstructionError::Unsupported),
+            Self::Operand(operand) => operand.into_inner().map_err(Self::Operand),
+            other => Err(other),
         }
     }
 
-    pub(super) fn parenthesized(self) -> Self {
-        match self {
-            Self::Inner(expression) => {
-                Self::Inner(ExpressionAst::Parenthesized(Box::new(expression)))
-            }
-            Self::Outer(expression) => {
-                Self::Outer(ExpressionAst::Parenthesized(Box::new(expression)))
-            }
+    pub(super) fn into_inner(self) -> Result<ExpressionAst<K::Inner>, ConstructionError> {
+        self.try_into_inner()
+            .map_err(|_| ConstructionError::Unsupported)
+    }
+
+    pub(super) fn parenthesized(self) -> Result<Self, ConstructionError> {
+        match self.try_into_inner() {
+            Ok(inner) => Self::try_operand(ExpressionAst::Parenthesized(Box::new(inner))),
+            Err(outer) => Ok(Self::Parenthesized(Box::new(outer))),
         }
     }
 
     pub(super) fn negate(self) -> Result<Self, ConstructionError> {
-        match self {
-            Self::Inner(expression) => {
-                permitted(Box::new(expression), ExpressionAst::<K::Inner>::Negate).map(Self::Inner)
-            }
-            Self::Outer(expression) => {
-                permitted(Box::new(expression), ExpressionAst::<K>::Negate).map(Self::Outer)
-            }
-        }
-    }
-
-    pub(super) fn into_outer(self) -> Result<ExpressionAst<K>, ConstructionError> {
-        match self {
-            Self::Inner(expression) => ExpressionAst::try_operand(expression),
-            Self::Outer(expression) => Ok(expression),
+        match self.try_into_inner() {
+            Ok(inner) => permitted(Box::new(inner), ExpressionAst::<K::Inner>::Negate)
+                .and_then(Self::try_operand),
+            Err(outer) => permitted(Box::new(outer), Self::Negate),
         }
     }
 
@@ -369,49 +400,33 @@ impl<K: ExpressionKind> ParsedNode<K> {
         left: Self,
         right: Self,
     ) -> Result<Self, ConstructionError> {
-        match (left, right) {
-            (Self::Inner(left), Self::Inner(right)) => operator
-                .construct(Binary::new(left, right))
-                .map(Self::Inner),
-            (left, right) => {
-                let operands = Binary::new(left.into_outer()?, right.into_outer()?);
-                operator.construct(operands).map(Self::Outer)
-            }
+        if left.is_inner() && right.is_inner() {
+            operator
+                .construct(Binary::new(left.into_inner()?, right.into_inner()?))
+                .and_then(Self::try_operand)
+        } else {
+            operator.construct(Binary::new(left, right))
         }
     }
 
     pub(super) fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError> {
-        let has_outer = std::iter::once(&call.first)
+        let all_inner = std::iter::once(&call.first)
             .chain(call.rest.iter())
-            .any(|argument| matches!(argument, Self::Outer(_)));
-
-        let Stepwise {
-            operator,
-            first,
-            rest,
-        } = call;
-
-        if has_outer {
-            let call = Stepwise {
-                operator,
-                first: first.into_outer()?,
-                rest: rest
-                    .into_iter()
-                    .map(Self::into_outer)
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-            permitted(Box::new(call), ExpressionAst::<K>::Stepwise).map(Self::Outer)
-        } else {
-            let call = Stepwise {
-                operator,
-                first: first.into_inner()?,
-                rest: rest
+            .all(|argument| argument.is_inner());
+        if all_inner {
+            let inner_call = Stepwise {
+                operator: call.operator,
+                first: call.first.into_inner()?,
+                rest: call
+                    .rest
                     .into_iter()
                     .map(Self::into_inner)
-                    .collect::<Result<Vec<_>, _>>()?,
+                    .collect::<Result<_, _>>()?,
             };
-
-            permitted(Box::new(call), ExpressionAst::<K::Inner>::Stepwise).map(Self::Inner)
+            permitted(Box::new(inner_call), ExpressionAst::<K::Inner>::Stepwise)
+                .and_then(Self::try_operand)
+        } else {
+            permitted(Box::new(call), Self::Stepwise)
         }
     }
 }
@@ -420,18 +435,23 @@ impl<K: ExpressionKind> ParsedNode<K> {
 mod tests {
     use super::*;
 
-    type Node = ParsedNode<FixedEffectExpression>;
+    type Node = ExpressionAst<FixedEffectExpression>;
 
     fn column(name: &str) -> Node {
-        Node::Inner(ExpressionAst::try_operand(crate::Term::from(Factor::from(name))).unwrap())
+        Node::try_operand(
+            ExpressionAst::<GroupingExpression>::try_operand(crate::Term::from(Factor::from(name)))
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     fn loaded() -> Node {
-        Node::Outer(ExpressionAst::Operand(FixedEffectGroup {
-            group: column("year").into_inner().unwrap(),
+        ExpressionAst::Operand(LayerOperand::Nested(Box::new(FixedEffectGroup {
+            group: column("year").into_inner().unwrap().into(),
             intercept: false,
-            loadings: vec![Arc::new(Factor::from("time"))],
-        }))
+            first_loading: Arc::new(Factor::from("time")),
+            rest_loadings: Vec::new(),
+        })))
     }
 
     #[test]
@@ -439,7 +459,7 @@ mod tests {
         let node = ExpressionAst::<SingleFormulaExpression>::try_operand(crate::Term::intercept())
             .unwrap();
         assert!(matches!(
-            ParsedNode::<SingleFormulaExpression>::Outer(node).into_inner(),
+            node.into_inner(),
             Err(ConstructionError::Unsupported)
         ));
     }
@@ -448,7 +468,7 @@ mod tests {
     fn mixed_binary_wraps_the_flat_subtree_with_default_group_settings() {
         let flat =
             Node::binary(BinaryOperator::Interact, column("firm"), column("sector")).unwrap();
-        let Node::Outer(ExpressionAst::Add(_, operands)) =
+        let ExpressionAst::Add(_, operands) =
             Node::binary(BinaryOperator::Add, flat, loaded()).unwrap()
         else {
             panic!("expected embedded addition");
@@ -458,16 +478,23 @@ mod tests {
         else {
             panic!("expected complete group operands");
         };
+        let LayerOperand::Expression(left) = left else {
+            panic!("plain inner");
+        };
         assert!(matches!(left.group, ExpressionAst::Interact(_, _)));
-        assert!(left.intercept);
-        assert!(left.loadings.is_empty());
+        let LayerOperand::Nested(right) = right else {
+            panic!("loaded inner");
+        };
         assert!(!right.intercept);
-        assert_eq!(right.loadings, vec![Arc::new(Factor::from("time"))]);
+        assert_eq!(
+            right.loadings().cloned().collect::<Vec<_>>(),
+            vec![Arc::new(Factor::from("time"))]
+        );
     }
 
     #[test]
     fn mixed_stepwise_wraps_flat_arguments_and_preserves_loaded_arguments() {
-        let Node::Outer(ExpressionAst::Stepwise(_, call)) = Node::stepwise(Stepwise {
+        let ExpressionAst::Stepwise(_, call) = Node::stepwise(Stepwise {
             operator: StepwiseOperator::Sw,
             first: column("firm"),
             rest: vec![loaded()],
@@ -481,10 +508,15 @@ mod tests {
         let [ExpressionAst::Operand(second)] = call.rest.as_slice() else {
             panic!("expected one loaded alternative");
         };
-        assert!(first.intercept);
-        assert!(first.loadings.is_empty());
+        assert!(matches!(first, LayerOperand::Expression(_)));
+        let LayerOperand::Nested(second) = second else {
+            panic!("loaded alternative");
+        };
         assert!(!second.intercept);
-        assert_eq!(second.loadings, vec![Arc::new(Factor::from("time"))]);
+        assert_eq!(
+            second.loadings().cloned().collect::<Vec<_>>(),
+            vec![Arc::new(Factor::from("time"))]
+        );
     }
 }
 
@@ -499,6 +531,14 @@ mod layers {
             Self(value)
         }
     }
+    impl Embedding<FixedEffectExpression> for Envelope {
+        fn is_inner(&self) -> bool {
+            true
+        }
+        fn into_inner(self) -> Result<ExpressionAst<FixedEffectExpression>, Self> {
+            Ok(self.0)
+        }
+    }
     type Enveloped = Layer<Envelope, FixedEffectExpression, FixedEffectOperations, Forbidden>;
 
     #[test]
@@ -509,10 +549,12 @@ mod layers {
         .unwrap_or_else(|_| panic!("column"));
         let fixed: ExpressionAst<FixedEffectExpression> = grouping.into();
         let envelope: ExpressionAst<Enveloped> = fixed.into();
-        let ExpressionAst::Operand(Envelope(ExpressionAst::Operand(group))) = envelope else {
+        let ExpressionAst::Operand(Envelope(ExpressionAst::Operand(LayerOperand::Expression(
+            group,
+        )))) = envelope
+        else {
             panic!("wrong representation");
         };
-        assert!(group.intercept);
-        assert!(group.loadings.is_empty());
+        assert!(matches!(group.group, ExpressionAst::Operand(_)));
     }
 }
