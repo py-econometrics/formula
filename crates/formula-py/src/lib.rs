@@ -501,6 +501,12 @@ struct FixedEffect {
 
 #[pymethods]
 impl FixedEffect {
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let specification = pyo3::types::PyString::new(py, &self.inner.render());
+        let quoted = specification.repr()?;
+
+        Ok(format!("FixedEffect({})", quoted.to_str()?))
+    }
     #[getter]
     fn group(&self) -> Vec<Factor> {
         self.inner.group().map(Factor::from).collect()

@@ -506,6 +506,7 @@ mod tests {
                     panic!("expected one grouped term");
                 };
                 let effect = term.as_fixed_effect().unwrap();
+                assert_eq!(effect.render(), "firm:year[log(time), exposure]");
                 assert!(effect.intercept());
                 assert_eq!(
                     effect

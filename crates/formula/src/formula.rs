@@ -103,13 +103,14 @@ impl Definition<VariableState> for VariableDefinition {
     }
 }
 
-struct FixedEffect<'a> {
-    group: &'a [Arc<Factor>],
-    loadings: &'a [Arc<Factor>],
+#[derive(Clone, Debug)]
+struct FixedEffect {
+    group: Vec<Arc<Factor>>,
+    loadings: Vec<Arc<Factor>>,
     intercept: bool,
 }
 
-impl FixedEffect<'_> {
+impl FixedEffect {
     fn render(&self) -> String {
         let group = self
             .group
@@ -140,27 +141,29 @@ impl FixedEffect<'_> {
 /// A fitted fixed effect with its grouping factors, loadings, and encoding
 #[derive(Clone, Debug)]
 pub struct FittedFixedEffect {
-    group: Vec<Arc<Factor>>,
-    loadings: Vec<Arc<Factor>>,
-    intercept: bool,
+    effect: FixedEffect,
     encoding: IntegerEncodingState,
 }
 
 impl FittedFixedEffect {
     pub fn group(&self) -> impl Iterator<Item = &Factor> {
-        self.group.iter().map(Arc::as_ref)
+        self.effect.group.iter().map(Arc::as_ref)
     }
 
     pub fn loadings(&self) -> impl Iterator<Item = &Factor> {
-        self.loadings.iter().map(Arc::as_ref)
+        self.effect.loadings.iter().map(Arc::as_ref)
     }
 
     pub fn intercept(&self) -> bool {
-        self.intercept
+        self.effect.intercept
     }
 
     pub fn encoding(&self) -> &IntegerEncodingState {
         &self.encoding
+    }
+
+    pub fn render(&self) -> String {
+        self.effect.render()
     }
 }
 
@@ -352,7 +355,7 @@ impl Term {
         })
     }
 
-    fn as_fixed_effect(&self) -> Option<FixedEffect<'_>> {
+    fn as_fixed_effect(&self) -> Option<FixedEffect> {
         // A fixed-effect is defined by the composition of internal transforms G(F(...))
         let FactorKind::Call {
             transform: Transform::G(grouped),
@@ -373,8 +376,8 @@ impl Term {
         };
 
         Some(FixedEffect {
-            group,
-            loadings,
+            group: group.clone(),
+            loadings: loadings.to_vec(),
             intercept: grouped.intercept(),
         })
     }
@@ -927,12 +930,7 @@ impl FittedTerm {
         };
         let encoding = integer.state()?.clone();
 
-        Some(FittedFixedEffect {
-            group: effect.group.to_vec(),
-            loadings: effect.loadings.to_vec(),
-            intercept: effect.intercept,
-            encoding,
-        })
+        Some(FittedFixedEffect { effect, encoding })
     }
 }
 
