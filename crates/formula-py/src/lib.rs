@@ -10,7 +10,8 @@ mod _formula {
     #[pymodule_export]
     use super::{
         Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, FixedEffect,
-        Formula, FormulaColumn, Formulas, Role, TransformCall, TransformState, parse, parse_many,
+        FixedEffectEncoding, Formula, FormulaColumn, Formulas, Role, TransformCall, TransformState,
+        parse, parse_many,
     };
 }
 
@@ -505,10 +506,29 @@ impl FixedEffect {
     }
 
     #[getter]
-    fn encoding(&self) -> TransformState {
-        TransformState {
+    fn encoding(&self) -> FixedEffectEncoding {
+        FixedEffectEncoding {
             inner: self.inner.encoding().clone(),
         }
+    }
+}
+
+#[pyclass(frozen, skip_from_py_object, module = "formula")]
+#[derive(Clone, Debug)]
+struct FixedEffectEncoding {
+    inner: formula::IntegerEncodingState,
+}
+
+#[pymethods]
+impl FixedEffectEncoding {
+    #[getter]
+    fn codes(&self) -> PyDataFrame {
+        PyDataFrame(self.inner.codes())
+    }
+
+    #[getter]
+    fn levels(&self) -> PyDataFrame {
+        PyDataFrame(self.inner.levels())
     }
 }
 

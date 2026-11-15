@@ -4,8 +4,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, Transform, TransformError,
-    validate_numeric_field,
+    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState, Transform,
+    TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -143,7 +143,7 @@ pub struct FittedFixedEffect {
     group: Vec<Arc<Factor>>,
     loadings: Vec<Arc<Factor>>,
     intercept: bool,
-    encoding: TransformState,
+    encoding: IntegerEncodingState,
 }
 
 impl FittedFixedEffect {
@@ -159,7 +159,7 @@ impl FittedFixedEffect {
         self.intercept
     }
 
-    pub fn encoding(&self) -> &TransformState {
+    pub fn encoding(&self) -> &IntegerEncodingState {
         &self.encoding
     }
 }
@@ -921,7 +921,11 @@ impl FittedTerm {
 
         let grouped = self.term.as_factor()?.transform()?;
         let encoder = grouped.inputs().next()?.transform()?;
-        let encoding = encoder.state()?;
+        // Get specialized IntegerEncodingState instead of generic TransformState
+        let Transform::F(integer) = encoder.transform else {
+            return None;
+        };
+        let encoding = integer.state()?.clone();
 
         Some(FittedFixedEffect {
             group: effect.group.to_vec(),

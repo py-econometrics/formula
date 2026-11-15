@@ -530,15 +530,25 @@ mod tests {
                 assert_eq!(exposure.name(), Some("exposure"));
 
                 let state = effect.encoding();
-                let Some(crate::StateValue::DataFrame(codes)) = state.get("codes") else {
-                    panic!("expected the fitted code table");
-                };
-                let Some(crate::StateValue::DataFrame(levels)) = state.get("levels") else {
-                    panic!("expected the fitted level table");
-                };
+                let codes = state.codes();
+                let levels = state.levels();
                 let expected_codes = polars::df!("code" => [0_u32, 1, 2]).unwrap();
                 assert!(codes.equals_missing(&expected_codes));
                 assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
+
+                let grouped = term.factors().next().unwrap().transform().unwrap();
+                let encoder = grouped.inputs().next().unwrap().transform().unwrap();
+                let exported = encoder.state().unwrap();
+                let Some(crate::StateValue::DataFrame(exported_codes)) = exported.get("codes")
+                else {
+                    panic!("expected the fitted code table");
+                };
+                let Some(crate::StateValue::DataFrame(exported_levels)) = exported.get("levels")
+                else {
+                    panic!("expected the fitted level table");
+                };
+                assert!(exported_codes.equals_missing(&codes));
+                assert!(exported_levels.equals_missing(&levels));
 
                 let columns = term.columns().collect::<Vec<_>>();
                 assert_eq!(columns.len(), 3);

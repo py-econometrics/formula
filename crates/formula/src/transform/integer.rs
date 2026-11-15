@@ -13,13 +13,13 @@ use polars::prelude::{
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IntegerEncodingDefinition;
 
-#[derive(Debug)]
-pub(crate) struct IntegerEncodingState {
+#[derive(Clone, Debug)]
+pub struct IntegerEncodingState {
     fields: Vec<Field>,
     encoding: IntegerEncoding,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum IntegerEncoding {
     Mapping(DataFrame),
     Native(Column),
@@ -202,43 +202,51 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
     }
 }
 
-impl ExportState for IntegerEncodingState {
-    fn export_state(&self) -> TransformState {
-        let (codes, mut levels) = match &self.encoding {
-            IntegerEncoding::Mapping(mapping) => {
-                let codes = mapping
-                    .column(IntegerEncodingDefinition::CODE_COLUMN)
-                    .expect("fitted mapping contains its code column")
-                    .clone();
+impl IntegerEncodingState {
+    pub fn codes(&self) -> DataFrame {
+        let codes = match &self.encoding {
+            IntegerEncoding::Mapping(mapping) => mapping
+                .column(IntegerEncodingDefinition::CODE_COLUMN)
+                .expect("fitted mapping contains its code column")
+                .clone(),
 
-                let levels = mapping
-                    .select((0..self.fields.len()).map(argument_column_name))
-                    .expect("fitted mapping contains each input column");
-
-                (codes, levels)
-            }
-            IntegerEncoding::Native(levels) => {
-                let codes = levels
-                    .to_physical_repr()
-                    .cast(&DataType::UInt32)
-                    .expect("categorical codes can be widened to UInt32");
-
-                (codes, levels.clone().into_frame())
-            }
+            IntegerEncoding::Native(levels) => levels
+                .to_physical_repr()
+                .cast(&DataType::UInt32)
+                .expect("categorical codes can be widened to UInt32"),
         };
 
-        let codes = codes.with_name("code".into()).into_frame();
+        codes.with_name("code".into()).into_frame()
+    }
+
+    pub fn levels(&self) -> DataFrame {
+        let mut levels = match &self.encoding {
+            IntegerEncoding::Mapping(mapping) => mapping
+                .select((0..self.fields.len()).map(argument_column_name))
+                .expect("fitted mapping contains each input column"),
+
+            IntegerEncoding::Native(levels) => levels.clone().into_frame(),
+        };
+
         let names = self
             .fields
             .iter()
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
+
         levels
             .set_column_names(&names)
             .expect("fitted fields match the level columns");
+
+        levels
+    }
+}
+
+impl ExportState for IntegerEncodingState {
+    fn export_state(&self) -> TransformState {
         TransformState::new([
-            ("codes".into(), StateValue::DataFrame(codes)),
-            ("levels".into(), StateValue::DataFrame(levels)),
+            ("codes".into(), StateValue::DataFrame(self.codes())),
+            ("levels".into(), StateValue::DataFrame(self.levels())),
         ])
     }
 }
