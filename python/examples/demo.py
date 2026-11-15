@@ -14,7 +14,7 @@ data = polars.DataFrame(
 )
 
 # Parsing formula strings returns a collection of `Formula` objects
-source = "y ~ sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year"
+source = "y ~ sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm[x1] + year"
 formulas = formula.parse(source)  # Parse and expand formulas
 first_formula = formulas[0]  # Parsed formulas are an indexable collection
 same_formula = formulas[str(first_formula)]  # Look-up by formula-string also work

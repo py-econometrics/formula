@@ -244,14 +244,12 @@ def test_varying_slope_provenance_survives_owner_deletion():
     columns = predicted.columns(role=formula.Role.FixedEffect)
     del model, selected, predicted, term
 
-    assert [factor.name for factor in effect.group] == ["firm", "year"]
+    assert effect.encoding.levels.columns == ["firm", "year"]
+    assert effect.codes.to_list() == [0, 1, 2]
     assert effect.intercept is True
     time, exposure = effect.loadings
-    transform = time.transform
-    assert transform is not None
-    assert transform.name == "log"
-    assert [factor.name for factor in transform.inputs] == ["time"]
-    assert exposure.name == "exposure"
+    assert time.to_list() == pytest.approx([0.0, math.log(2), math.log(3)])
+    assert exposure.to_list() == [0.5, 1.0, 1.5]
 
     assert len(columns) == 3
     for index, column in enumerate(columns):

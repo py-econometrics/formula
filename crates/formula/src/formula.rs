@@ -138,20 +138,22 @@ impl FixedEffect {
     }
 }
 
-/// A fitted fixed effect with its grouping factors, loadings, and encoding
+/// A fitted fixed effect with observation codes, evaluated loadings, and encoding
 #[derive(Clone, Debug)]
 pub struct FittedFixedEffect {
     effect: FixedEffect,
     encoding: IntegerEncodingState,
+    codes: Column,
+    loadings: DataFrame,
 }
 
 impl FittedFixedEffect {
-    pub fn group(&self) -> impl Iterator<Item = &Factor> {
-        self.effect.group.iter().map(Arc::as_ref)
+    pub fn codes(&self) -> &Column {
+        &self.codes
     }
 
-    pub fn loadings(&self) -> impl Iterator<Item = &Factor> {
-        self.effect.loadings.iter().map(Arc::as_ref)
+    pub fn loadings(&self) -> &DataFrame {
+        &self.loadings
     }
 
     pub fn intercept(&self) -> bool {
@@ -930,7 +932,17 @@ impl FittedTerm {
         };
         let encoding = integer.state()?.clone();
 
-        Some(FittedFixedEffect { effect, encoding })
+        let frame = self.columns.frame();
+        let (codes, loadings) = frame.columns().split_first()?;
+        let loadings = DataFrame::new(frame.height(), loadings.to_vec())
+            .expect("loading columns retain the fitted frame's height and unique names");
+
+        Some(FittedFixedEffect {
+            effect,
+            encoding,
+            codes: codes.clone(),
+            loadings,
+        })
     }
 }
 

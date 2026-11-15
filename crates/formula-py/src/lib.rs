@@ -512,13 +512,13 @@ impl FixedEffect {
         self.inner.render()
     }
     #[getter]
-    fn group(&self) -> Vec<Factor> {
-        self.inner.group().map(Factor::from).collect()
+    fn codes(&self) -> PySeries {
+        PySeries(self.inner.codes().as_materialized_series().clone())
     }
 
     #[getter]
-    fn loadings(&self) -> Vec<Factor> {
-        self.inner.loadings().map(Factor::from).collect()
+    fn loadings(&self) -> PyDataFrame {
+        PyDataFrame(self.inner.loadings().clone())
     }
 
     #[getter]

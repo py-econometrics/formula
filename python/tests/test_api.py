@@ -1,3 +1,4 @@
+import math
 import operator
 
 import polars
@@ -426,15 +427,16 @@ def fixed_effect(request):
     )
     model = formula.parse(f"y ~ 1 | {request.param}").fit(data)[0]
     (effect,) = model.fixed_effects
-    assert [factor.name for factor in effect.group] == ["group"]
+    assert effect.codes.to_list() == [0, 1, 0]
+    assert effect.codes.dtype == polars.UInt32
     assert effect.intercept is ("[[" not in request.param)
     if request.param == "group":
-        assert effect.loadings == []
+        assert effect.loadings.width == 0
     else:
         time, exposure = effect.loadings
-        assert time.transform is not None
-        assert time.transform.name == "log"
-        assert exposure.name == "x"
+        assert time.dtype == exposure.dtype == polars.Float64
+        assert time.to_list() == pytest.approx([0.0, math.log(2), math.log(3)])
+        assert exposure.to_list() == [1.0, 2.0, 3.0]
     return effect
 
 
@@ -443,16 +445,17 @@ def test_fixed_effects_preserve_order_and_support_name_lookup(data):
     model = formula.parse("y ~ x | firm + year[x]").fit(data)[0]
     effects = model.fixed_effects
     assert len(effects) == 2
-    assert [[factor.name for factor in effect.group] for effect in effects] == [
+    assert [effect.encoding.levels.columns for effect in effects] == [
         ["firm"],
         ["year"],
     ]
     firm = model.fixed_effect("firm")
-    assert [factor.name for factor in firm.group] == ["firm"]
-    assert firm.loadings == []
+    assert firm.encoding.levels.columns == ["firm"]
+    assert firm.loadings.width == 0
     year = model.fixed_effect("year[x]")
-    assert [factor.name for factor in year.group] == ["year"]
-    assert [factor.name for factor in year.loadings] == ["x"]
+    assert year.encoding.levels.columns == ["year"]
+    (loading,) = year.loadings
+    assert loading.to_list() == data["x"].to_list()
     for key in ("year", "missing", "year[ x ]"):
         with pytest.raises(KeyError) as error:
             model.fixed_effect(key)
@@ -475,6 +478,29 @@ def test_fixed_effect_encoding_exposes_codes_and_levels(fixed_effect):
         polars.DataFrame({"code": [0, 1]}, schema={"code": polars.UInt32}),
     )
     assert_frame_equal(state.levels, polars.DataFrame({"group": ["a", "b"]}))
+
+
+@pytest.mark.parametrize("specification", ["group", "group[x]", "group[[x]]"])
+def test_fixed_effect_data_tracks_prediction_rows(specification):
+    training = polars.DataFrame({"y": [1.0, 2.0], "group": ["a", "b"], "x": [1.0, 2.0]})
+    model = formula.parse(f"y ~ 1 | {specification}").fit(training)[0]
+    prediction = polars.DataFrame(
+        {"y": [3.0, 4.0, 5.0], "group": ["b", "new", "a"], "x": [10.0, 20.0, None]}
+    )
+    for data in (prediction, prediction.head(0)):
+        (effect,) = model.transform(data).fixed_effects
+        assert effect.codes.to_list() == [1, None, 0][: data.height]
+        assert effect.codes.dtype == polars.UInt32
+        assert effect.intercept is ("[[" not in specification)
+        if specification == "group":
+            assert effect.loadings.width == 0
+        else:
+            (loading,) = effect.loadings
+            assert loading.dtype == polars.Float64
+            assert loading.to_list() == data["x"].to_list()
+        assert_frame_equal(
+            effect.encoding.levels, polars.DataFrame({"group": ["a", "b"]})
+        )
 
 
 def test_transform_state_mapping_interface():
