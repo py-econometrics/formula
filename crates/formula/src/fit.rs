@@ -63,6 +63,13 @@ impl<D, S> Fit<D, S> {
             Self::Fitted(fitted) => &fitted.definition,
         }
     }
+
+    pub(crate) fn state(&self) -> Option<&S> {
+        match self {
+            Self::Unfitted(_) => None,
+            Self::Fitted(fitted) => Some(&fitted.state),
+        }
+    }
 }
 
 // Fitted state does not affect structural identity.

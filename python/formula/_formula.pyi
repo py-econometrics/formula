@@ -1,6 +1,6 @@
 """Type declarations for the native extension."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import ClassVar, TypeAlias
 
 import polars
@@ -54,6 +54,13 @@ class TransformCall:
     def inputs(self) -> list[Factor]: ...
     @property
     def parameters(self) -> dict[str, ParameterValue]: ...
+    @property
+    def state(self) -> TransformState | None: ...
+
+class TransformState:
+    def __getitem__(self, name: str) -> ScalarValue | polars.DataFrame | None: ...
+    def __iter__(self) -> Iterator[str]: ...
+    def __len__(self) -> int: ...
 
 class FormulaColumn:
     @property

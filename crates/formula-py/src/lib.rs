@@ -1,7 +1,7 @@
 use polars::prelude::{Column, Scalar};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PySyntaxError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::types::{PyDict, PyIterator, PyTuple};
 use pyo3_polars::{PyDataFrame, PySeries};
 use std::collections::BTreeMap;
 
@@ -10,7 +10,7 @@ mod _formula {
     #[pymodule_export]
     use super::{
         Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, Formula,
-        FormulaColumn, Formulas, Role, TransformCall, parse, parse_many,
+        FormulaColumn, Formulas, Role, TransformCall, TransformState, parse, parse_many,
     };
 }
 
@@ -285,6 +285,7 @@ struct TransformCall {
     name: String,
     inputs: Vec<Factor>,
     parameters: BTreeMap<String, Scalar>,
+    state: Option<formula::TransformState>,
 }
 
 impl From<formula::TransformCall<'_>> for TransformCall {
@@ -297,6 +298,7 @@ impl From<formula::TransformCall<'_>> for TransformCall {
                 .into_iter()
                 .map(|(name, value)| (name.to_owned(), value))
                 .collect(),
+            state: call.state(),
         }
     }
 }
@@ -326,6 +328,43 @@ impl TransformCall {
         }
 
         Ok(parameters)
+    }
+
+    #[getter]
+    fn state(&self) -> Option<TransformState> {
+        self.state.clone().map(|inner| TransformState { inner })
+    }
+}
+
+#[pyclass(frozen, skip_from_py_object, module = "formula")]
+#[derive(Clone, Debug)]
+struct TransformState {
+    inner: formula::TransformState,
+}
+
+#[pymethods]
+impl TransformState {
+    fn __getitem__(&self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        let value = self
+            .inner
+            .get(name)
+            .ok_or_else(|| PyKeyError::new_err(name.to_owned()))?;
+
+        match value {
+            formula::StateValue::Scalar(value) => scalar_to_python(py, value),
+            formula::StateValue::DataFrame(frame) => {
+                Ok(PyDataFrame(frame.clone()).into_pyobject(py)?.unbind())
+            }
+        }
+    }
+
+    fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyIterator>> {
+        let names = self.inner.iter().map(|(name, _)| name).collect::<Vec<_>>();
+        PyTuple::new(py, names)?.try_iter()
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.iter().count()
     }
 }
 

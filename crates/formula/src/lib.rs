@@ -11,4 +11,4 @@ pub use self::formula::{
 pub use fit::FitError;
 pub use model::{FittedFormula, FittedFormulas, ModelError, SelectionError};
 pub use parse::{parse, parse_many};
-pub use transform::{ArgumentCount, TransformError};
+pub use transform::{ArgumentCount, StateValue, TransformError, TransformState};
