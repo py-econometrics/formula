@@ -239,6 +239,17 @@ impl FittedFormula {
                 formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
             })
     }
+
+    #[getter]
+    fn fixed_effects(&self) -> Vec<FixedEffect> {
+        self.inner
+            .terms(formula::Role::FixedEffect)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(formula::FittedTerm::as_fixed_effect)
+            .map(|inner| FixedEffect { inner })
+            .collect()
+    }
 }
 
 #[pyclass(frozen, eq, from_py_object, module = "formula")]
