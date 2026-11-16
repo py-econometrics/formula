@@ -35,6 +35,7 @@ def test_categorical_drop_scalar_and_list(argument, parameter, remaining, dtype)
     model = formula.parse(f"y ~ C(g, drop={argument}) - 1").fit(training)[0]
     (term,) = model.terms(formula.Role.Independent)
     call = term.factors[0].transform
+    assert call is not None
     assert call.parameters == {"drop": parameter}
     assert [column.contributions[0].key for column in term.columns] == remaining
     assert [column.data.name for column in term.columns] == [
