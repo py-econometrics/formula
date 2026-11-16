@@ -1,5 +1,5 @@
 use super::input::{PreparedInput, validate_numeric_field};
-use super::{ArgumentCount, TransformDefinition, call_name};
+use super::{ArgumentCount, ParameterValue, TransformDefinition, call_name};
 use crate::formula::MaterializedColumns;
 use crate::{ComponentKey, TransformError};
 use polars::prelude::{Column, DataFrame, DataType, PlSmallStr, Scalar};
@@ -24,8 +24,11 @@ impl TransformDefinition for GroupedTransform {
         ArgumentCount::AtLeast(1)
     }
 
-    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
-        BTreeMap::from([(Self::INTERCEPT_PARAMETER, Scalar::from(self.intercept))])
+    fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
+        BTreeMap::from([(
+            Self::INTERCEPT_PARAMETER,
+            ParameterValue::Scalar(Scalar::from(self.intercept)),
+        )])
     }
 
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
@@ -280,7 +283,7 @@ mod tests {
         assert_eq!(transform.argument_count(), ArgumentCount::AtLeast(1));
         assert_eq!(
             transform.parameters(),
-            BTreeMap::from([("intercept", Scalar::from(true))])
+            BTreeMap::from([("intercept", ParameterValue::Scalar(Scalar::from(true)))])
         );
 
         let inputs = [

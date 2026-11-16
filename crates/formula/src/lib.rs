@@ -12,5 +12,5 @@ pub use fit::FitError;
 pub use model::{FittedFormula, FittedFormulas, ModelError, SelectionError};
 pub use parse::{parse, parse_many};
 pub use transform::{
-    ArgumentCount, IntegerEncodingState, StateValue, TransformError, TransformState,
+    ArgumentCount, IntegerEncodingState, ParameterValue, StateValue, TransformError, TransformState,
 };

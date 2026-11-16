@@ -1,7 +1,7 @@
 use polars::prelude::{Column, Scalar};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PySyntaxError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyIterator, PyTuple};
+use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
 use pyo3_polars::{PyDataFrame, PySeries};
 use std::collections::BTreeMap;
 
@@ -303,7 +303,7 @@ enum FormulaKey {
 struct TransformCall {
     name: String,
     inputs: Vec<Factor>,
-    parameters: BTreeMap<String, Scalar>,
+    parameters: BTreeMap<String, formula::ParameterValue>,
     state: Option<formula::TransformState>,
 }
 
@@ -343,7 +343,18 @@ impl TransformCall {
         let parameters = PyDict::new(py);
 
         for (name, value) in &self.parameters {
-            parameters.set_item(name, scalar_to_python(py, value)?)?;
+            match value {
+                formula::ParameterValue::Scalar(value) => {
+                    parameters.set_item(name, scalar_to_python(py, value)?)?;
+                }
+                formula::ParameterValue::List(values) => {
+                    let values = values
+                        .iter()
+                        .map(|value| scalar_to_python(py, value))
+                        .collect::<PyResult<Vec<_>>>()?;
+                    parameters.set_item(name, PyList::new(py, values)?)?;
+                }
+            }
         }
 
         Ok(parameters)

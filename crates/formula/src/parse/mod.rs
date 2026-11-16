@@ -7,7 +7,7 @@ use crate::formula::{Expression, FactorKind};
 use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::StepwiseOperator;
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, ParameterValue, PolynomialDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -41,7 +41,7 @@ struct TransformCall {
 #[derive(Debug)]
 enum TransformCallArgument {
     Positional(Factor),
-    Keyword { name: String, value: Scalar },
+    Keyword { name: String, value: ParameterValue },
 }
 
 #[derive(Debug)]
@@ -121,6 +121,21 @@ pub(crate) fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
         )),
         parse_argument_boundary,
     )
+    .parse_next(cursor)
+}
+
+fn parse_parameter_value(cursor: &mut &str) -> ModalResult<ParameterValue> {
+    alt((
+        preceded(
+            ('[', multispace0),
+            cut_err(terminated(
+                separated(0.., parse_scalar, (multispace0, ',', multispace0)),
+                (multispace0, ']'),
+            )),
+        )
+        .map(ParameterValue::List),
+        parse_scalar.map(ParameterValue::Scalar),
+    ))
     .parse_next(cursor)
 }
 
@@ -293,8 +308,8 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     )
     .parse_next(cursor)?;
 
-    let value =
-        cut_err(parse_scalar.context(StrContext::Label("keyword value"))).parse_next(cursor)?;
+    let value = cut_err(parse_parameter_value.context(StrContext::Label("keyword value")))
+        .parse_next(cursor)?;
 
     Ok(TransformCallArgument::Keyword {
         name: name.to_owned(),
@@ -657,8 +672,8 @@ impl TryFrom<TransformCall> for Factor {
 
 fn reject_keywords(
     transform: &'static str,
-    keywords: BTreeMap<String, Scalar>,
-) -> std::result::Result<(), TransformCallError> {
+    keywords: BTreeMap<String, ParameterValue>,
+) -> Result<(), TransformCallError> {
     if keywords.is_empty() {
         Ok(())
     } else {
@@ -674,6 +689,28 @@ mod tests {
     use super::*;
     use crate::formula::Role;
     use crate::parse::ast as typed;
+
+    #[test]
+    fn parameter_list_parser_preserves_each_elements_scalar_type() {
+        assert_eq!(
+            parse_parameter_value
+                .parse("[ 'a', 2, 3.5, true ]")
+                .unwrap(),
+            ParameterValue::List(vec![
+                Scalar::from(PlSmallStr::from_static("a")),
+                Scalar::from(2_i64),
+                Scalar::from(3.5_f64),
+                Scalar::from(true),
+            ])
+        );
+        assert_eq!(
+            parse_parameter_value.parse("[ ]").unwrap(),
+            ParameterValue::List(vec![])
+        );
+        for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
+            assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn ordinary_term_queries_reject_single_argument_stepwise_calls() {
@@ -1312,8 +1349,8 @@ mod tests {
                 kind: FactorKind::Call {
                     transform: Transform::Poly(Fit::Unfitted(
                         PolynomialDefinition::new(
-                            Some(Scalar::from(degree)),
-                            Some(Scalar::from(raw)),
+                            Some(ParameterValue::Scalar(Scalar::from(degree))),
+                            Some(ParameterValue::Scalar(Scalar::from(raw))),
                         )
                         .unwrap(),
                     )),
@@ -1473,7 +1510,7 @@ mod tests {
         );
         let categorical = call(
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                Scalar::from(PlSmallStr::from_static("a")),
+                ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
             )))),
             vec![Factor::from("group name")],
         );
@@ -1488,7 +1525,7 @@ mod tests {
                 vec![Expression::from(Term::from(nested))],
             ),
             (
-                "`outcome value` ~ C(`group name`, reference='a')",
+                "`outcome value` ~ C(`group name`, drop='a')",
                 vec![Expression::from(Term::from(categorical))],
             ),
             (
@@ -1827,10 +1864,12 @@ mod tests {
                 },
             ),
             (
-                "C(group, reference='a')",
+                "C(group, drop='a')",
                 Factor {
                     kind: FactorKind::Call {
-                        transform: categorical(Some(Scalar::from(PlSmallStr::from_static("a")))),
+                        transform: categorical(Some(ParameterValue::Scalar(Scalar::from(
+                            PlSmallStr::from_static("a"),
+                        )))),
                         arguments: vec![Arc::new(Factor::from("group"))],
                     },
                 },
@@ -1847,15 +1886,15 @@ mod tests {
 
         let expected = Expression::from(Term::from(Factor {
             kind: FactorKind::Call {
-                transform: categorical(Some(Scalar::from(1_i64))),
+                transform: categorical(Some(ParameterValue::Scalar(Scalar::from(1_i64)))),
                 arguments: vec![Arc::new(Factor::from("x"))],
             },
         }));
         for source in [
-            "C(x, reference=1)",
-            "C(x, reference= 1)",
-            "C( x , reference = 1 )",
-            " \n C(\tx,\nreference\t=\t1\n) \t",
+            "C(x, drop=1)",
+            "C(x, drop= 1)",
+            "C( x , drop = 1 )",
+            " \n C(\tx,\ndrop\t=\t1\n) \t",
         ] {
             assert_eq!(
                 parse_expression.parse(source).expect(source),
@@ -2379,7 +2418,7 @@ mod tests {
                 "y ~ sw(x +)",
                 "y ~ sw(x, sw())",
                 "y ~ log(sw(x, z))",
-                "y ~ sw(x, reference=1)",
+                "y ~ sw(x, drop=1)",
                 "y ~ mvsw()",
                 "y ~ mvsw(,x)",
                 "y ~ mvsw(x,,y)",
@@ -2395,12 +2434,7 @@ mod tests {
 
         #[test]
         fn invalid_transform_calls_are_rejected() {
-            for source in [
-                "C (x)",
-                "C(x, reference=1 2)",
-                "C(x, reference=tr ue)",
-                "F(x)",
-            ] {
+            for source in ["C (x)", "C(x, drop=1 2)", "C(x, drop=tr ue)", "F(x)"] {
                 assert!(parse_expression.parse(source).is_err(), "{source}");
             }
         }
@@ -2408,7 +2442,7 @@ mod tests {
         #[test]
         fn duplicate_keywords_identify_the_keyword() {
             for (source, keyword) in [
-                ("y ~ C(x, reference='a', reference='b')", "reference"),
+                ("y ~ C(x, drop='a', drop='b')", "drop"),
                 ("y ~ poly(x, degree=2, degree=3)", "degree"),
             ] {
                 let error = parse(source).unwrap_err();
@@ -2429,10 +2463,7 @@ mod tests {
 
         #[test]
         fn positional_arguments_after_keywords_identify_the_position() {
-            for (source, expected) in [
-                ("y ~ C(x, reference='a', y)", 3),
-                ("y ~ poly(degree=2, x)", 2),
-            ] {
+            for (source, expected) in [("y ~ C(x, drop='a', y)", 3), ("y ~ poly(degree=2, x)", 2)] {
                 let error = parse(source).unwrap_err();
                 let cause = error
                     .inner()
@@ -2483,7 +2514,7 @@ mod tests {
 
         #[test]
         fn missing_keyword_value_reports_its_context_and_offset() {
-            let source = "y ~ C(x, reference=)";
+            let source = "y ~ C(x, drop=)";
             let error = parse(source).unwrap_err();
 
             assert_eq!(error.offset(), source.find(')').unwrap());
@@ -2501,7 +2532,7 @@ mod tests {
         #[test]
         fn unterminated_quotes_report_the_expected_delimiter() {
             for (source, expected) in [
-                ("y ~ C(x, reference='a)", "a closing single quote"),
+                ("y ~ C(x, drop='a)", "a closing single quote"),
                 ("y ~ `household income", "a closing backtick"),
                 ("y ~ C(`household income)", "a closing backtick"),
             ] {
