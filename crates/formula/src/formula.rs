@@ -1657,7 +1657,7 @@ mod tests {
             "log(`1`)",
             "add(x, 2)",
             "add(x, 2.0)",
-            "C(`group name`, reference='a')",
+            "C(`group name`, omit='a')",
         ] {
             let original = parse_expression.parse(source).unwrap();
             let label = original[0].terms[0].factors[0].render();
@@ -1676,7 +1676,7 @@ mod tests {
             "y ~ x - 1",
             "y ~ x - 1 + 1",
             "y ~ x - 1 + 1 + z",
-            "y ~ C(`group name`, reference='a') + poly(x, degree=2)",
+            "y ~ C(`group name`, omit='a') + poly(x, degree=2)",
             "`outcome value` ~ log(`1`) + add(x, 2.0)",
             "y ~ x | firm:year",
             "y ~ sw(x, z) | `firm name`",
@@ -2205,7 +2205,7 @@ mod tests {
     #[test]
     fn categorical_fit_errors_include_reference_and_original_input_name() {
         let data = polars::df!("y" => [1.0, 2.0], "group name" => ["a", "b"]).unwrap();
-        let error = crate::parse("y ~ C(`group name`, reference='missing')")
+        let error = crate::parse("y ~ C(`group name`, omit='missing')")
             .unwrap()
             .fit(&data)
             .err()
@@ -2213,7 +2213,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "C(`group name`, reference='missing'): `reference` value is not among the fitted levels",
+            "C(`group name`, omit='missing'): `omit` value is not among the fitted levels",
         );
     }
 
@@ -2408,8 +2408,8 @@ mod tests {
                 "C(x, x): invalid argument count: expected exactly 1, received 2",
             ),
             (
-                "y ~ C(x, x, reference='a')",
-                "C(x, x, reference='a'): invalid argument count: expected exactly 1, received 2",
+                "y ~ C(x, x, omit='a')",
+                "C(x, x, omit='a'): invalid argument count: expected exactly 1, received 2",
             ),
             (
                 "y ~ poly(x, 2)",
@@ -2643,11 +2643,8 @@ mod tests {
 
             for (source, width) in [
                 ("y ~ C(g) + sw0(x)", 4),
-                ("y ~ C(g, reference='a') + sw0(x)", 3),
-                (
-                    "y ~ (C(g, reference='a') + C(g, reference='a'))*z + sw0(x)",
-                    6,
-                ),
+                ("y ~ C(g, omit='a') + sw0(x)", 3),
+                ("y ~ (C(g, omit='a') + C(g, omit='a'))*z + sw0(x)", 6),
                 (
                     "y ~ (poly(x, degree=2, raw=true) + poly(x, raw=true, degree=2))*z + sw0(x)",
                     6,
@@ -3001,13 +2998,9 @@ mod tests {
         for (source, count, right_index) in [
             ("log(x) ~ log(x) - 1", 2, 0),
             ("C(x) ~ C(x) - 1", 2, 0),
-            ("C(x, reference='a') ~ C(x, reference='a') - 1", 2, 0),
+            ("C(x, omit='a') ~ C(x, omit='a') - 1", 2, 0),
             ("C(x):z ~ z:C(x) - 1", 3, 1),
-            (
-                "C(x, reference='a'):C(z) ~ C(z):C(x, reference='a') - 1",
-                4,
-                1,
-            ),
+            ("C(x, omit='a'):C(z) ~ C(z):C(x, omit='a') - 1", 4, 1),
             ("poly(x, raw=true) ~ poly(x, degree=1, raw=true) - 1", 2, 0),
             ("poly(x) ~ poly(x, degree=1, raw=false) - 1", 2, 0),
             ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2, 0),
@@ -3085,7 +3078,7 @@ mod tests {
     #[test]
     fn planning_distinguishes_transform_parameters() {
         for (source, input) in [
-            ("C(g, reference='a') + C(g, reference='b')", "g"),
+            ("C(g, omit='a') + C(g, omit='b')", "g"),
             ("poly(x) + poly(x, degree=2)", "x"),
             ("poly(x, raw=true) + poly(x, degree=2, raw=true)", "x"),
             (
