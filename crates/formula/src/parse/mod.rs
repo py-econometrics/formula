@@ -1525,7 +1525,7 @@ mod tests {
                 vec![Expression::from(Term::from(nested))],
             ),
             (
-                "`outcome value` ~ C(`group name`, drop='a')",
+                "`outcome value` ~ C(`group name`, reference='a')",
                 vec![Expression::from(Term::from(categorical))],
             ),
             (
@@ -1864,7 +1864,7 @@ mod tests {
                 },
             ),
             (
-                "C(group, drop='a')",
+                "C(group, reference='a')",
                 Factor {
                     kind: FactorKind::Call {
                         transform: categorical(Some(ParameterValue::Scalar(Scalar::from(
@@ -1891,10 +1891,10 @@ mod tests {
             },
         }));
         for source in [
-            "C(x, drop=1)",
-            "C(x, drop= 1)",
-            "C( x , drop = 1 )",
-            " \n C(\tx,\ndrop\t=\t1\n) \t",
+            "C(x, reference=1)",
+            "C(x, reference= 1)",
+            "C( x , reference = 1 )",
+            " \n C(\tx,\nreference\t=\t1\n) \t",
         ] {
             assert_eq!(
                 parse_expression.parse(source).expect(source),
@@ -2418,7 +2418,7 @@ mod tests {
                 "y ~ sw(x +)",
                 "y ~ sw(x, sw())",
                 "y ~ log(sw(x, z))",
-                "y ~ sw(x, drop=1)",
+                "y ~ sw(x, reference=1)",
                 "y ~ mvsw()",
                 "y ~ mvsw(,x)",
                 "y ~ mvsw(x,,y)",
@@ -2434,7 +2434,12 @@ mod tests {
 
         #[test]
         fn invalid_transform_calls_are_rejected() {
-            for source in ["C (x)", "C(x, drop=1 2)", "C(x, drop=tr ue)", "F(x)"] {
+            for source in [
+                "C (x)",
+                "C(x, reference=1 2)",
+                "C(x, reference=tr ue)",
+                "F(x)",
+            ] {
                 assert!(parse_expression.parse(source).is_err(), "{source}");
             }
         }
@@ -2442,7 +2447,7 @@ mod tests {
         #[test]
         fn duplicate_keywords_identify_the_keyword() {
             for (source, keyword) in [
-                ("y ~ C(x, drop='a', drop='b')", "drop"),
+                ("y ~ C(x, reference='a', reference='b')", "reference"),
                 ("y ~ poly(x, degree=2, degree=3)", "degree"),
             ] {
                 let error = parse(source).unwrap_err();
@@ -2463,7 +2468,10 @@ mod tests {
 
         #[test]
         fn positional_arguments_after_keywords_identify_the_position() {
-            for (source, expected) in [("y ~ C(x, drop='a', y)", 3), ("y ~ poly(degree=2, x)", 2)] {
+            for (source, expected) in [
+                ("y ~ C(x, reference='a', y)", 3),
+                ("y ~ poly(degree=2, x)", 2),
+            ] {
                 let error = parse(source).unwrap_err();
                 let cause = error
                     .inner()
@@ -2514,7 +2522,7 @@ mod tests {
 
         #[test]
         fn missing_keyword_value_reports_its_context_and_offset() {
-            let source = "y ~ C(x, drop=)";
+            let source = "y ~ C(x, reference=)";
             let error = parse(source).unwrap_err();
 
             assert_eq!(error.offset(), source.find(')').unwrap());
@@ -2532,7 +2540,7 @@ mod tests {
         #[test]
         fn unterminated_quotes_report_the_expected_delimiter() {
             for (source, expected) in [
-                ("y ~ C(x, drop='a)", "a closing single quote"),
+                ("y ~ C(x, reference='a)", "a closing single quote"),
                 ("y ~ `household income", "a closing backtick"),
                 ("y ~ C(`household income)", "a closing backtick"),
             ] {

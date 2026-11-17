@@ -16,7 +16,7 @@ pub(crate) struct CategoricalDefinition {
 }
 
 impl CategoricalDefinition {
-    pub(crate) const REFERENCE_PARAMETER: &str = "drop";
+    pub(crate) const REFERENCE_PARAMETER: &str = "reference";
 
     pub(crate) fn new(reference: Option<ParameterValue>) -> Self {
         Self { reference }
@@ -66,7 +66,7 @@ impl CategoricalDefinition {
                 let label = value.str_value();
                 let code = mapping.get_cat(label.as_ref()).ok_or_else(|| {
                     TransformError::InvalidParameter(
-                        "`drop` value is not among the fitted levels".into(),
+                        "`reference` value is not among the fitted levels".into(),
                     )
                 })?;
 
@@ -91,7 +91,7 @@ impl CategoricalDefinition {
             // Reference not compatible with target dtype
             _ => {
                 return Err(TransformError::InvalidParameter(format!(
-                    "`drop` dtype {source:?} is incompatible with input dtype {dtype:?}"
+                    "`reference` dtype {source:?} is incompatible with input dtype {dtype:?}"
                 )));
             }
         };
@@ -100,7 +100,7 @@ impl CategoricalDefinition {
             && !reference.as_any_value().try_extract::<f64>()?.is_finite()
         {
             return Err(TransformError::InvalidParameter(
-                "`drop` must be finite after conversion to the input dtype".into(),
+                "`reference` must be finite after conversion to the input dtype".into(),
             ));
         }
 
@@ -204,7 +204,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 .transpose()?
                 .ok_or_else(|| {
                     TransformError::InvalidParameter(
-                        "`drop` value is not among the fitted levels".into(),
+                        "`reference` value is not among the fitted levels".into(),
                     )
                 })?;
 
@@ -378,7 +378,10 @@ mod tests {
             ];
             let prepared_input = prepare(&input);
             let output = fitted.transform(&prepared_input)?;
-            assert_eq!(output.frame().get_column_names(), ["C(x, drop='b')[d]"]);
+            assert_eq!(
+                output.frame().get_column_names(),
+                ["C(x, reference='b')[d]"]
+            );
             assert_output(
                 &fitted.definition,
                 &fitted.state,
@@ -403,7 +406,7 @@ mod tests {
             assert!(matches!(error, TransformError::InvalidParameter(_)));
             assert_eq!(
                 error.to_string(),
-                "`drop` value is not among the fitted levels"
+                "`reference` value is not among the fitted levels"
             );
         }
         Ok(())
@@ -845,7 +848,7 @@ mod tests {
             );
             let names = levels[1..count]
                 .iter()
-                .map(|level| format!("C(group, drop='a')[{level}]"))
+                .map(|level| format!("C(group, reference='a')[{level}]"))
                 .collect::<Vec<_>>();
             assert_eq!(
                 output

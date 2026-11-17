@@ -28,18 +28,18 @@ def data():
         ("['a', 'b', 'c']", ["a", "b", "c"], []),
     ],
 )
-def test_categorical_drop_scalar_and_list(argument, parameter, remaining, dtype):
+def test_categorical_reference_scalar_and_list(argument, parameter, remaining, dtype):
     training = polars.DataFrame(
         {"y": [1.0, 2.0, 3.0], "g": polars.Series(["a", "b", "c"], dtype=dtype)}
     )
-    model = formula.parse(f"y ~ C(g, drop={argument}) - 1").fit(training)[0]
+    model = formula.parse(f"y ~ C(g, reference={argument}) - 1").fit(training)[0]
     (term,) = model.terms(formula.Role.Independent)
     call = term.factors[0].transform
     assert call is not None
-    assert call.parameters == {"drop": parameter}
+    assert call.parameters == {"reference": parameter}
     assert [column.contributions[0].key for column in term.columns] == remaining
     assert [column.data.name for column in term.columns] == [
-        f"C(g, drop={argument})[{level}]" for level in remaining
+        f"C(g, reference={argument})[{level}]" for level in remaining
     ]
 
     prediction = model.select(formula.Role.Independent).transform(
@@ -54,9 +54,9 @@ def test_categorical_drop_scalar_and_list(argument, parameter, remaining, dtype)
 
 
 @pytest.mark.parametrize("argument", ["['a', 'missing']", "['a', 1]"])
-def test_categorical_drop_validates_every_list_element(data, argument):
+def test_categorical_reference_validates_every_list_element(data, argument):
     with pytest.raises(ValueError):
-        formula.parse(f"y ~ C(g, drop={argument})").fit(data)
+        formula.parse(f"y ~ C(g, reference={argument})").fit(data)
 
 
 @pytest.mark.parametrize("keyword", ["degree", "raw"])
@@ -66,8 +66,8 @@ def test_polynomial_rejects_list_parameters(keyword):
 
 
 def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
-    model = formula.parse("y ~ C(g, drop='a')*x").fit(data)[0]
-    selected = model.select_terms("x:C(g, drop='a')", formula.Role.Independent)
+    model = formula.parse("y ~ C(g, reference='a')*x").fit(data)[0]
+    selected = model.select_terms("x:C(g, reference='a')", formula.Role.Independent)
     prediction = selected.transform(
         polars.DataFrame({"g": ["c", "b", "new"], "x": [10.0, 20.0, 30.0]})
     )
@@ -106,7 +106,7 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
         call = categorical.transform
         assert call is not None
         assert call.name == "C"
-        assert call.parameters == {"drop": "a"}
+        assert call.parameters == {"reference": "a"}
         assert len(call.inputs) == 1
         assert call.inputs[0].name == "g"
         assert categorical_contribution.key == level
@@ -200,7 +200,7 @@ def test_literal_transform_inputs_preserve_python_types(data, literal, expected)
 
 
 def test_provenance_properties_are_read_only_and_containers_are_copies(data):
-    model = formula.parse("y ~ C(g, drop='a') - 1").fit(data)[0]
+    model = formula.parse("y ~ C(g, reference='a') - 1").fit(data)[0]
     term = model.terms(formula.Role.Independent)[0]
     column = term.columns[0]
     contribution = column.contributions[0]
@@ -228,10 +228,10 @@ def test_provenance_properties_are_read_only_and_containers_are_copies(data):
     inputs = call.inputs
     inputs.clear()
     parameters = call.parameters
-    parameters["drop"] = "changed"
+    parameters["reference"] = "changed"
     assert len(call.inputs) == 1
     assert call.inputs[0].name == "g"
-    assert call.parameters == {"drop": "a"}
+    assert call.parameters == {"reference": "a"}
 
     exported = term.columns[0].data
     exported[0] = 99.0
@@ -240,7 +240,7 @@ def test_provenance_properties_are_read_only_and_containers_are_copies(data):
 
 def test_zero_column_term_has_empty_python_tuple():
     training = polars.DataFrame({"y": [1.0, 2.0], "g": ["a", "a"]})
-    model = formula.parse("y ~ C(g, drop='a')").fit(training)[0]
+    model = formula.parse("y ~ C(g, reference='a')").fit(training)[0]
     intercept, categorical = model.terms(formula.Role.Independent)
     assert intercept.factors == ()
     assert categorical.columns == ()
@@ -256,9 +256,9 @@ def test_zero_column_term_has_empty_python_tuple():
 def test_zero_column_frame_export_preserves_height():
     data = polars.DataFrame({"y": [1.0, 2.0], "g": ["a", "a"]})
     selected = (
-        formula.parse("y ~ C(g, drop='a')")
+        formula.parse("y ~ C(g, reference='a')")
         .fit(data)[0]
-        .select_terms("C(g, drop='a')", formula.Role.Independent)
+        .select_terms("C(g, reference='a')", formula.Role.Independent)
     )
     assert selected.frame().shape == (data.height, 0)
 

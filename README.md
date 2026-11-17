@@ -24,7 +24,7 @@ data = polars.DataFrame(
 )
 
 # Parsing formula strings returns a collection of `Formula` objects
-source = "y ~ sw(log(x1)*sqrt(x2), C(category, drop='a')) | firm + year"
+source = "y ~ sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year"
 formulas = formula.parse(source)  # Parse and expand formulas
 first_formula = formulas[0]  # Parsed formulas are an indexable collection
 same_formula = formulas[str(first_formula)]  # Look-up by formula-string also work
@@ -57,9 +57,9 @@ It is also possible to query specific formula terms using `FittedFormula.select_
 # Select terms by their formula strings
 interaction_terms = fit.select_terms("log(x1)*sqrt(x2)", role=formula.Role.Independent)
 # Select the categorical term in the second formula
-categorical_fit = fits["y ~ C(category, drop='a') | firm + year"]
+categorical_fit = fits["y ~ C(category, reference='a') | firm + year"]
 categorical_terms = categorical_fit.select_terms(
-    "C(category, drop='a')", role=formula.Role.Independent
+    "C(category, reference='a')", role=formula.Role.Independent
 )
 ```
 
@@ -121,7 +121,7 @@ fn sample_data(n: usize) -> PolarsResult<DataFrame> {
 
 fn main() {
     let formula =
-        "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, drop='a')) | firm + year";
+        "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year";
 
     // Stores the expanded formulas
     let formulas = parse(formula).expect("valid formula");
@@ -228,7 +228,7 @@ or `transform()`:
 |------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
 | `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.     |
 | `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                           |
-| `C(group, drop=...)`                                                    | Create categorical indicator columns for `group`; the optional `drop` argument specifies the levels to omit. |
+| `C(group, reference=...)`                                                    | Create categorical indicator columns for `group`; the optional `reference` argument sets the reference level. |
 | `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
 
 Numeric arguments are supported inside transformation calls:
