@@ -17,8 +17,7 @@ fn sample_data(n: usize) -> PolarsResult<DataFrame> {
 }
 
 fn main() {
-    let formula =
-        "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm + year";
+    let formula = "y ~ add(x1, x2) + sw(log(x1)*sqrt(x2), C(category, omit='a')) | firm + year";
 
     // Stores the expanded formulas
     let formulas = parse(formula).expect("valid formula");

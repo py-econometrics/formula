@@ -16,7 +16,7 @@ pub(crate) struct CategoricalDefinition {
 }
 
 impl CategoricalDefinition {
-    pub(crate) const REFERENCE_PARAMETER: &str = "reference";
+    pub(crate) const OMIT_PARAMETER: &str = "omit";
 
     pub(crate) fn new(reference: Option<ParameterValue>) -> Self {
         Self { reference }
@@ -66,7 +66,7 @@ impl CategoricalDefinition {
                 let label = value.str_value();
                 let code = mapping.get_cat(label.as_ref()).ok_or_else(|| {
                     TransformError::InvalidParameter(
-                        "`reference` value is not among the fitted levels".into(),
+                        "`omit` value is not among the fitted levels".into(),
                     )
                 })?;
 
@@ -91,7 +91,7 @@ impl CategoricalDefinition {
             // Reference not compatible with target dtype
             _ => {
                 return Err(TransformError::InvalidParameter(format!(
-                    "`reference` dtype {source:?} is incompatible with input dtype {dtype:?}"
+                    "`omit` dtype {source:?} is incompatible with input dtype {dtype:?}"
                 )));
             }
         };
@@ -100,7 +100,7 @@ impl CategoricalDefinition {
             && !reference.as_any_value().try_extract::<f64>()?.is_finite()
         {
             return Err(TransformError::InvalidParameter(
-                "`reference` must be finite after conversion to the input dtype".into(),
+                "`omit` must be finite after conversion to the input dtype".into(),
             ));
         }
 
@@ -124,7 +124,7 @@ impl TransformDefinition for CategoricalDefinition {
     fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
         self.reference
             .as_ref()
-            .map(|reference| (Self::REFERENCE_PARAMETER, reference.clone()))
+            .map(|reference| (Self::OMIT_PARAMETER, reference.clone()))
             .into_iter()
             .collect()
     }
@@ -139,7 +139,7 @@ impl TransformDefinition for CategoricalDefinition {
                 }
             };
 
-            format!("{}={value}", Self::REFERENCE_PARAMETER)
+            format!("{}={value}", Self::OMIT_PARAMETER)
         });
 
         call_name(
@@ -204,7 +204,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 .transpose()?
                 .ok_or_else(|| {
                     TransformError::InvalidParameter(
-                        "`reference` value is not among the fitted levels".into(),
+                        "`omit` value is not among the fitted levels".into(),
                     )
                 })?;
 
@@ -378,10 +378,7 @@ mod tests {
             ];
             let prepared_input = prepare(&input);
             let output = fitted.transform(&prepared_input)?;
-            assert_eq!(
-                output.frame().get_column_names(),
-                ["C(x, reference='b')[d]"]
-            );
+            assert_eq!(output.frame().get_column_names(), ["C(x, omit='b')[d]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
@@ -406,7 +403,7 @@ mod tests {
             assert!(matches!(error, TransformError::InvalidParameter(_)));
             assert_eq!(
                 error.to_string(),
-                "`reference` value is not among the fitted levels"
+                "`omit` value is not among the fitted levels"
             );
         }
         Ok(())
@@ -848,7 +845,7 @@ mod tests {
             );
             let names = levels[1..count]
                 .iter()
-                .map(|level| format!("C(group, reference='a')[{level}]"))
+                .map(|level| format!("C(group, omit='a')[{level}]"))
                 .collect::<Vec<_>>();
             assert_eq!(
                 output

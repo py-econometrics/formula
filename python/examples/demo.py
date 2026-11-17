@@ -14,7 +14,7 @@ data = polars.DataFrame(
 )
 
 # Parsing formula strings returns a collection of `Formula` objects
-source = "y ~ sw(log(x1)*sqrt(x2), C(category, reference='a')) | firm[x1] + year"
+source = "y ~ sw(log(x1)*sqrt(x2), C(category, omit='a')) | firm[x1] + year"
 formulas = formula.parse(source)  # Parse and expand formulas
 first_formula = formulas[0]  # Parsed formulas are an indexable collection
 same_formula = formulas[str(first_formula)]  # Look-up by formula-string also work
@@ -35,8 +35,8 @@ fixed_effects = fit.select(formula.Role.FixedEffect).frame()
 # Select terms by their formula strings
 interaction_terms = fit.select_terms("log(x1)*sqrt(x2)", role=formula.Role.Independent)
 # Select the categorical term in the second formula
-categorical_terms = fits["y ~ C(category, reference='a') | firm + year"].select_terms(
-    "C(category, reference='a')", role=formula.Role.Independent
+categorical_terms = fits["y ~ C(category, omit='a') | firm + year"].select_terms(
+    "C(category, omit='a')", role=formula.Role.Independent
 )
 
 # Inspect metadata of materialized columns

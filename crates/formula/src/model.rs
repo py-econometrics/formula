@@ -645,7 +645,7 @@ mod tests {
             .unwrap();
             for loading in [
                 "C(category)",
-                "C(category, reference='a')",
+                "C(category, omit='a')",
                 "poly(time, degree=2, raw=true)",
                 "poly(time, degree=1, raw=true)",
                 "log(C(category))",
@@ -686,7 +686,7 @@ mod tests {
             let data =
                 polars::df!("y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [2.0, 3.0, 4.0])
                     .unwrap();
-            let fitted = fit("y ~ C(g, reference='a'):x - 1", &data);
+            let fitted = fit("y ~ C(g, omit='a'):x - 1", &data);
             let columns = fitted
                 .columns(Role::Independent)
                 .unwrap()
@@ -707,7 +707,7 @@ mod tests {
                     &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level)))
                 );
                 assert_eq!(
-                    categorical.transform().unwrap().parameters()["reference"],
+                    categorical.transform().unwrap().parameters()["omit"],
                     ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
                 );
                 let inputs = categorical
@@ -775,11 +775,11 @@ mod tests {
                 "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [2.0, 3.0, 4.0], "z" => [5.0, 6.0, 7.0],
             )
             .unwrap();
-            let fitted = fit("y ~ z + C(g, reference='a')*x", &training);
+            let fitted = fit("y ~ z + C(g, omit='a')*x", &training);
             let selected = fitted
-                .select_terms("x:C(g, reference='a')", Role::Independent)
+                .select_terms("x:C(g, omit='a')", Role::Independent)
                 .unwrap()
-                .select_terms("C(g, reference='a'):x", Role::Independent)
+                .select_terms("C(g, omit='a'):x", Role::Independent)
                 .unwrap();
             let input = polars::df!(
                 "g" => ["c", "b", "a", "new"], "x" => [10.0, 20.0, 30.0, 40.0],
@@ -901,7 +901,7 @@ mod tests {
         #[test]
         fn intercepts_and_zero_column_terms_preserve_their_semantics() {
             let training = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
-            let fitted = fit("y ~ C(g, reference='a')", &training);
+            let fitted = fit("y ~ C(g, omit='a')", &training);
             let terms = fitted.terms(Role::Independent).unwrap();
             assert_eq!(terms.len(), 2);
             assert_eq!(terms[0].factors().count(), 0);
@@ -924,7 +924,7 @@ mod tests {
             );
 
             let selected = fitted
-                .select_terms("C(g, reference='a')", Role::Independent)
+                .select_terms("C(g, omit='a')", Role::Independent)
                 .unwrap();
             let input = polars::df!("g" => ["a", "new", "a"]).unwrap();
             for data in [&input, &input.head(Some(0))] {
@@ -937,7 +937,7 @@ mod tests {
                 assert_eq!(predicted.frame().unwrap().shape(), (data.height(), 0));
                 assert!(
                     predicted
-                        .select_terms("C(g, reference='a')", Role::Independent)
+                        .select_terms("C(g, omit='a')", Role::Independent)
                         .is_ok()
                 );
             }
@@ -1021,10 +1021,10 @@ mod tests {
                 "g" => ["a", "b", "c"], "z" => [7.0, 8.0, 9.0],
             )
             .unwrap();
-            let model = fit("y ~ x + C(g, reference='a') + z", &data);
+            let model = fit("y ~ x + C(g, omit='a') + z", &data);
             let original = model.select(&[Role::Independent]).unwrap().frame().unwrap();
             let selected = model
-                .select_terms("z + C(g, reference='a')", Role::Independent)
+                .select_terms("z + C(g, omit='a')", Role::Independent)
                 .unwrap();
             assert!(
                 selected
@@ -1033,7 +1033,7 @@ mod tests {
                     .equals_missing(&original.select(&original.get_column_names()[2..]).unwrap())
             );
             let categorical = selected
-                .select_terms("C(g, reference='a')", Role::Independent)
+                .select_terms("C(g, omit='a')", Role::Independent)
                 .unwrap();
             let frame = categorical.frame().unwrap();
             assert_eq!(frame.width(), 2);
@@ -1061,9 +1061,9 @@ mod tests {
                 "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0], "g" => ["a", "b", "c"],
             )
             .unwrap();
-            let model = fit("y ~ x + C(g, reference='a')", &data);
+            let model = fit("y ~ x + C(g, omit='a')", &data);
             let selected = model
-                .select_terms("C(g, reference='a')", Role::Independent)
+                .select_terms("C(g, omit='a')", Role::Independent)
                 .unwrap();
             let input = polars::df!("g" => ["c", "b", "unseen"]).unwrap();
             let applied = selected.transform(&input).unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
             );
             assert!(
                 applied
-                    .select_terms("C(g, reference='a')", Role::Independent)
+                    .select_terms("C(g, omit='a')", Role::Independent)
                     .unwrap()
                     .frame()
                     .unwrap()
@@ -1133,8 +1133,8 @@ mod tests {
                 "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "a"],
             )
             .unwrap();
-            let model = fit("y ~ x + C(g, reference='a')", &data);
-            for query in ["x - x", "C(g, reference='a')"] {
+            let model = fit("y ~ x + C(g, omit='a')", &data);
+            for query in ["x - x", "C(g, omit='a')"] {
                 let selected = model.select_terms(query, Role::Independent).unwrap();
                 assert_eq!(selected.frame().unwrap().shape(), (2, 0));
                 for input in [&data, &data.head(Some(0))] {
@@ -1146,11 +1146,11 @@ mod tests {
             }
             // A zero-width term remains present and selectable.
             let selected = model
-                .select_terms("C(g, reference='a')", Role::Independent)
+                .select_terms("C(g, omit='a')", Role::Independent)
                 .unwrap();
             assert!(
                 selected
-                    .select_terms("C(g, reference='a')", Role::Independent)
+                    .select_terms("C(g, omit='a')", Role::Independent)
                     .is_ok()
             );
         }
@@ -1161,12 +1161,12 @@ mod tests {
                 "y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"],
             )
             .unwrap();
-            let model = fit("y ~ x + C(g, reference='a') - 1", &data);
+            let model = fit("y ~ x + C(g, omit='a') - 1", &data);
             assert!(matches!(
                 model.select_terms("g", Role::FixedEffect),
                 Err(SelectionError::MissingRole(Role::FixedEffect))
             ));
-            for query in ["missing", "x + missing", "C(g, reference='b')", "1"] {
+            for query in ["missing", "x + missing", "C(g, omit='b')", "1"] {
                 assert!(
                     matches!(
                         model.select_terms(query, Role::Independent),
@@ -1465,7 +1465,7 @@ mod tests {
     #[test]
     fn role_queries_distinguish_absence_from_zero_column_output() {
         let data = polars::df!("y" => [1.0, 2.0], "g" => ["a", "a"]).unwrap();
-        let models = crate::parse("y ~ C(g, reference='a') - 1")
+        let models = crate::parse("y ~ C(g, omit='a') - 1")
             .unwrap()
             .fit(&data)
             .unwrap();
