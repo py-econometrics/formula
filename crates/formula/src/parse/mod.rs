@@ -7,7 +7,7 @@ use crate::formula::{Expression, FactorKind};
 use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::StepwiseOperator;
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, PolynomialDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, ParameterValue, PolynomialDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -41,7 +41,7 @@ struct TransformCall {
 #[derive(Debug)]
 enum TransformCallArgument {
     Positional(Factor),
-    Keyword { name: String, value: Scalar },
+    Keyword { name: String, value: ParameterValue },
 }
 
 #[derive(Debug)]
@@ -121,6 +121,21 @@ pub(crate) fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
         )),
         parse_argument_boundary,
     )
+    .parse_next(cursor)
+}
+
+fn parse_parameter_value(cursor: &mut &str) -> ModalResult<ParameterValue> {
+    alt((
+        preceded(
+            ('[', multispace0),
+            cut_err(terminated(
+                separated(0.., parse_scalar, (multispace0, ',', multispace0)),
+                (multispace0, ']'),
+            )),
+        )
+        .map(ParameterValue::List),
+        parse_scalar.map(ParameterValue::Scalar),
+    ))
     .parse_next(cursor)
 }
 
@@ -293,8 +308,8 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     )
     .parse_next(cursor)?;
 
-    let value =
-        cut_err(parse_scalar.context(StrContext::Label("keyword value"))).parse_next(cursor)?;
+    let value = cut_err(parse_parameter_value.context(StrContext::Label("keyword value")))
+        .parse_next(cursor)?;
 
     Ok(TransformCallArgument::Keyword {
         name: name.to_owned(),
@@ -657,8 +672,8 @@ impl TryFrom<TransformCall> for Factor {
 
 fn reject_keywords(
     transform: &'static str,
-    keywords: BTreeMap<String, Scalar>,
-) -> std::result::Result<(), TransformCallError> {
+    keywords: BTreeMap<String, ParameterValue>,
+) -> Result<(), TransformCallError> {
     if keywords.is_empty() {
         Ok(())
     } else {
@@ -674,6 +689,28 @@ mod tests {
     use super::*;
     use crate::formula::Role;
     use crate::parse::ast as typed;
+
+    #[test]
+    fn parameter_list_parser_preserves_each_elements_scalar_type() {
+        assert_eq!(
+            parse_parameter_value
+                .parse("[ 'a', 2, 3.5, true ]")
+                .unwrap(),
+            ParameterValue::List(vec![
+                Scalar::from(PlSmallStr::from_static("a")),
+                Scalar::from(2_i64),
+                Scalar::from(3.5_f64),
+                Scalar::from(true),
+            ])
+        );
+        assert_eq!(
+            parse_parameter_value.parse("[ ]").unwrap(),
+            ParameterValue::List(vec![])
+        );
+        for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
+            assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn ordinary_term_queries_reject_single_argument_stepwise_calls() {
@@ -1312,8 +1349,8 @@ mod tests {
                 kind: FactorKind::Call {
                     transform: Transform::Poly(Fit::Unfitted(
                         PolynomialDefinition::new(
-                            Some(Scalar::from(degree)),
-                            Some(Scalar::from(raw)),
+                            Some(ParameterValue::Scalar(Scalar::from(degree))),
+                            Some(ParameterValue::Scalar(Scalar::from(raw))),
                         )
                         .unwrap(),
                     )),
@@ -1473,7 +1510,7 @@ mod tests {
         );
         let categorical = call(
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                Scalar::from(PlSmallStr::from_static("a")),
+                ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
             )))),
             vec![Factor::from("group name")],
         );
@@ -1830,7 +1867,9 @@ mod tests {
                 "C(group, reference='a')",
                 Factor {
                     kind: FactorKind::Call {
-                        transform: categorical(Some(Scalar::from(PlSmallStr::from_static("a")))),
+                        transform: categorical(Some(ParameterValue::Scalar(Scalar::from(
+                            PlSmallStr::from_static("a"),
+                        )))),
                         arguments: vec![Arc::new(Factor::from("group"))],
                     },
                 },
@@ -1847,7 +1886,7 @@ mod tests {
 
         let expected = Expression::from(Term::from(Factor {
             kind: FactorKind::Call {
-                transform: categorical(Some(Scalar::from(1_i64))),
+                transform: categorical(Some(ParameterValue::Scalar(Scalar::from(1_i64)))),
                 arguments: vec![Arc::new(Factor::from("x"))],
             },
         }));

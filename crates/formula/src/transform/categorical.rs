@@ -1,5 +1,5 @@
 use super::input::PreparedInput;
-use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
@@ -12,21 +12,27 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CategoricalDefinition {
-    reference: Option<Scalar>,
+    reference: Option<ParameterValue>,
 }
 
 impl CategoricalDefinition {
     pub(crate) const REFERENCE_PARAMETER: &str = "reference";
 
-    pub(crate) fn new(reference: Option<Scalar>) -> Self {
+    pub(crate) fn new(reference: Option<ParameterValue>) -> Self {
         Self { reference }
+    }
+
+    fn reference_name(value: &Scalar) -> String {
+        match value.as_any_value() {
+            AnyValue::String(value) => format!("'{value}'"),
+            AnyValue::StringOwned(value) => format!("'{value}'"),
+            _ => Self::level_name(value),
+        }
     }
 
     fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
         let call = self.call_name(&[input_name]);
-        let prefix = if self.reference.is_some() { "T." } else { "" };
-
-        format!("{call}[{prefix}{}]", Self::level_name(level)).into()
+        format!("{call}[{}]", Self::level_name(level)).into()
     }
 
     fn level_name(level: &Scalar) -> String {
@@ -47,11 +53,7 @@ impl CategoricalDefinition {
     /// combinations must match exactly. Nonfinite numeric references are rejected.
     ///
     /// Membership in the observed fitting levels is checked separately in `fit`.
-    fn reference_for_dtype(&self, dtype: &DataType) -> Result<Option<Scalar>, TransformError> {
-        // No reference provided
-        let Some(reference) = &self.reference else {
-            return Ok(None);
-        };
+    fn convert_reference(reference: &Scalar, dtype: &DataType) -> Result<Scalar, TransformError> {
         // Get the dtype of the reference provided
         let source = reference.dtype();
         // Check compatibility with and convert to dtype
@@ -102,7 +104,7 @@ impl CategoricalDefinition {
             ));
         }
 
-        Ok(Some(reference))
+        Ok(reference)
     }
 }
 
@@ -119,7 +121,7 @@ impl TransformDefinition for CategoricalDefinition {
         "C"
     }
 
-    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+    fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
         self.reference
             .as_ref()
             .map(|reference| (Self::REFERENCE_PARAMETER, reference.clone()))
@@ -129,10 +131,12 @@ impl TransformDefinition for CategoricalDefinition {
 
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
         let reference_argument = self.reference.as_ref().map(|reference| {
-            let value = match reference.as_any_value() {
-                AnyValue::String(value) => format!("'{value}'"),
-                AnyValue::StringOwned(value) => format!("'{}'", value.as_str()),
-                _ => Self::level_name(reference),
+            let value = match reference {
+                ParameterValue::Scalar(value) => Self::reference_name(value),
+                ParameterValue::List(values) => {
+                    let names = values.iter().map(Self::reference_name).collect::<Vec<_>>();
+                    format!("[{}]", names.join(", "))
+                }
             };
 
             format!("{}={value}", Self::REFERENCE_PARAMETER)
@@ -181,26 +185,37 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             levels
         };
 
-        let mut reference_index = None;
-        if let Some(reference) = self.reference_for_dtype(levels.dtype())? {
-            reference_index = (0..levels.len())
+        let references: &[Scalar] = match &self.reference {
+            None => &[],
+            Some(ParameterValue::Scalar(value)) => std::slice::from_ref(value),
+            Some(ParameterValue::List(values)) => values.as_slice(),
+        };
+        let mut reference_indices = Vec::new();
+
+        for reference in references {
+            let reference = Self::convert_reference(reference, levels.dtype())?;
+
+            let index = (0..levels.len())
                 .find_map(|index| match levels.get(index) {
                     Ok(level) if level == reference.as_any_value() => Some(Ok(index)),
                     Ok(_) => None,
                     Err(error) => Some(Err(error)),
                 })
-                .transpose()?;
+                .transpose()?
+                .ok_or_else(|| {
+                    TransformError::InvalidParameter(
+                        "`reference` value is not among the fitted levels".into(),
+                    )
+                })?;
 
-            if reference_index.is_none() {
-                return Err(TransformError::InvalidParameter(
-                    "`reference` value is not among the fitted levels".into(),
-                ));
+            if !reference_indices.contains(&index) {
+                reference_indices.push(index);
             }
         }
 
         Ok(CategoricalState {
             levels,
-            reference_index,
+            reference_indices,
         })
     }
 
@@ -240,7 +255,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let (expressions, metadata): (Vec<_>, Vec<ComponentKey>) = fitted_levels
             .into_iter()
             .enumerate()
-            .filter(|(index, _)| Some(*index) != state.reference_index)
+            .filter(|(index, _)| !state.reference_indices.contains(index))
             .map(|(_, level)| {
                 let column_name = self.output_name(field.name(), &level);
 
@@ -268,7 +283,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
     levels: Column,
-    reference_index: Option<usize>,
+    reference_indices: Vec<usize>,
 }
 
 #[cfg(test)]
@@ -354,7 +369,10 @@ mod tests {
         for dtype in native_dtypes() {
             let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
             let reference = Scalar::from(PlSmallStr::from_static("b"));
-            let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
+            let fitted = Fitted::fit(
+                CategoricalDefinition::new(Some(ParameterValue::Scalar(reference))),
+                &training,
+            )?;
             let input = [
                 Column::new("x".into(), [Some("b"), Some("a"), None, Some("d")]).cast(&dtype)?,
             ];
@@ -362,7 +380,7 @@ mod tests {
             let output = fitted.transform(&prepared_input)?;
             assert_eq!(
                 output.frame().get_column_names(),
-                ["C(x, reference='b')[T.d]"]
+                ["C(x, reference='b')[d]"]
             );
             assert_output(
                 &fitted.definition,
@@ -380,8 +398,11 @@ mod tests {
         for dtype in native_dtypes() {
             let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
             let reference = Scalar::from(PlSmallStr::from_static("a"));
-            let error =
-                Fitted::fit(CategoricalDefinition::new(Some(reference)), &training).unwrap_err();
+            let error = Fitted::fit(
+                CategoricalDefinition::new(Some(ParameterValue::Scalar(reference))),
+                &training,
+            )
+            .unwrap_err();
             assert!(matches!(error, TransformError::InvalidParameter(_)));
             assert_eq!(
                 error.to_string(),
@@ -399,7 +420,10 @@ mod tests {
             assert!(mapping.get_cat("missing").is_none());
             let reference = Scalar::from(PlSmallStr::from_static("missing"));
             assert!(matches!(
-                Fitted::fit(CategoricalDefinition::new(Some(reference)), &training),
+                Fitted::fit(
+                    CategoricalDefinition::new(Some(ParameterValue::Scalar(reference))),
+                    &training
+                ),
                 Err(TransformError::InvalidParameter(_))
             ));
             assert!(mapping.get_cat("missing").is_none());
@@ -504,7 +528,10 @@ mod tests {
         for dtype in native_dtypes() {
             let training = prepare(&[Column::new("x".into(), ["b", "b"]).cast(&dtype)?]);
             let reference = Scalar::from(PlSmallStr::from_static("b"));
-            let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
+            let fitted = Fitted::fit(
+                CategoricalDefinition::new(Some(ParameterValue::Scalar(reference))),
+                &training,
+            )?;
             let input =
                 prepare(&[Column::new("x".into(), [Some("b"), Some("a"), None]).cast(&dtype)?]);
             assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
@@ -515,7 +542,8 @@ mod tests {
     #[test]
     fn reference_only_encoding_preserves_input_height() -> Result<(), TransformError> {
         let inputs = prepare(&[Column::new("group".into(), [1_i32, 1, 1])]);
-        let definition = CategoricalDefinition::new(Some(Scalar::from(1_i64)));
+        let definition =
+            CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(1_i64))));
         let transform = definition.fit(&inputs)?;
         assert_eq!(
             definition.transform(&transform, &inputs)?.frame().shape(),
@@ -587,7 +615,9 @@ mod tests {
     fn transform_enum_delegates_categorical_operations() -> Result<(), TransformError> {
         let input = [Column::new("group".into(), ["a", "b"])];
         let reference = Scalar::from(PlSmallStr::from_static("a"));
-        let transform = Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(reference))));
+        let transform = Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
+            ParameterValue::Scalar(reference),
+        ))));
 
         assert!(transform.expands());
         assert!(matches!(
@@ -620,15 +650,14 @@ mod tests {
         assert_eq!(actual.shape(), (height, expected.len()));
 
         let levels = &transform.levels;
-        let reference = definition.reference_for_dtype(levels.dtype()).unwrap();
         let names = (0..levels.len())
+            .filter(|index| !transform.reference_indices.contains(index))
             .map(|index| {
                 Scalar::new(
                     levels.dtype().clone(),
                     levels.get(index).unwrap().into_static(),
                 )
             })
-            .filter(|level| reference.as_ref() != Some(level))
             .map(|level| definition.output_name(input[0].name(), &level))
             .collect::<Vec<_>>();
 
@@ -653,7 +682,9 @@ mod tests {
     #[test]
     fn categorical_requires_fit() {
         let reference = Scalar::from(PlSmallStr::from_static("missing"));
-        let transform = Fit::Unfitted(CategoricalDefinition::new(Some(reference)));
+        let transform = Fit::Unfitted(CategoricalDefinition::new(Some(ParameterValue::Scalar(
+            reference,
+        ))));
         let input = prepare(&[Column::new("group".into(), ["a", "b"])]);
 
         assert!(matches!(
@@ -672,8 +703,9 @@ mod tests {
 
     #[test]
     fn categorical_definition_produces_independent_fits() -> Result<(), TransformError> {
-        let definition =
-            CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
+        let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(
+            PlSmallStr::from_static("a"),
+        ))));
         let first_input = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let second_input = prepare(&[Column::new("group".into(), ["a", "c"])]);
         let input = [Column::new("group".into(), ["a", "b", "c"])];
@@ -701,8 +733,9 @@ mod tests {
 
     #[test]
     fn categorical_failed_refit_preserves_fitted_levels() -> Result<(), TransformError> {
-        let definition =
-            CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
+        let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(
+            PlSmallStr::from_static("a"),
+        ))));
         let training = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let invalid = prepare(&[Column::new("group".into(), ["b", "c"])]);
         let transform = Fit::Fitted(Fitted::fit(definition.clone(), &training)?);
@@ -791,7 +824,10 @@ mod tests {
             )];
             let prepared_input = prepare(&input);
             let reference = Scalar::from(PlSmallStr::from_static("a"));
-            let fitted = Fitted::fit(CategoricalDefinition::new(Some(reference)), &training)?;
+            let fitted = Fitted::fit(
+                CategoricalDefinition::new(Some(ParameterValue::Scalar(reference))),
+                &training,
+            )?;
             let output = fitted.transform(&prepared_input)?;
             let mut expected = vec![
                 [Some(false), Some(true), Some(false), None, None],
@@ -812,7 +848,7 @@ mod tests {
             );
             let names = levels[1..count]
                 .iter()
-                .map(|level| format!("C(group, reference='a')[T.{level}]"))
+                .map(|level| format!("C(group, reference='a')[{level}]"))
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
@@ -837,7 +873,8 @@ mod tests {
         ];
         for input in inputs {
             let prepared_input = prepare(&input);
-            let definition = CategoricalDefinition::new(Some(Scalar::from(1_i64)));
+            let definition =
+                CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(1_i64))));
             let transform = definition.fit(&prepared_input)?;
             assert_output(
                 &definition,
@@ -854,7 +891,8 @@ mod tests {
     fn categorical_resolves_float_reference_to_column_precision() -> Result<(), TransformError> {
         let input = [Column::new("group".into(), [0.1_f32, 0.2, 0.1])];
         let prepared_input = prepare(&input);
-        let definition = CategoricalDefinition::new(Some(Scalar::from(0.1_f64)));
+        let definition =
+            CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(0.1_f64))));
         let transform = definition.fit(&prepared_input)?;
 
         assert_output(
@@ -871,7 +909,8 @@ mod tests {
     fn categorical_supports_boolean_reference() -> Result<(), TransformError> {
         let input = [Column::new("group".into(), [Some(true), Some(false), None])];
         let prepared_input = prepare(&input);
-        let definition = CategoricalDefinition::new(Some(Scalar::from(false)));
+        let definition =
+            CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(false))));
         let transform = definition.fit(&prepared_input)?;
 
         assert_output(
@@ -888,7 +927,7 @@ mod tests {
     fn categorical_rejects_missing_reference() {
         let input = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let reference = Scalar::from(PlSmallStr::from_static("missing"));
-        let definition = CategoricalDefinition::new(Some(reference));
+        let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(reference)));
 
         assert!(matches!(
             definition.fit(&input),
@@ -917,7 +956,7 @@ mod tests {
 
         for (reference, input) in cases {
             let prepared_input = prepare(&input);
-            let definition = CategoricalDefinition::new(Some(reference));
+            let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(reference)));
             assert!(matches!(
                 definition.fit(&prepared_input),
                 Err(TransformError::InvalidParameter(_))
@@ -940,7 +979,7 @@ mod tests {
 
         for (reference, input) in cases {
             let prepared_input = prepare(&input);
-            let definition = CategoricalDefinition::new(Some(reference));
+            let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(reference)));
             assert!(matches!(
                 definition.fit(&prepared_input),
                 Err(TransformError::Polars(_))
@@ -953,7 +992,8 @@ mod tests {
         let input = prepare(&[Column::new("group".into(), [0.1_f32, 0.2])]);
 
         for reference in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
-            let definition = CategoricalDefinition::new(Some(Scalar::from(reference)));
+            let definition =
+                CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(reference))));
             assert!(matches!(
                 definition.fit(&input),
                 Err(TransformError::InvalidParameter(_))
@@ -967,7 +1007,7 @@ mod tests {
         let input = prepare(&[Column::new("group".into(), [1_i64, 2])]);
 
         for reference in [None, Some(Scalar::from(1_i64))] {
-            let definition = CategoricalDefinition::new(reference);
+            let definition = CategoricalDefinition::new(reference.map(ParameterValue::Scalar));
             let transform = definition.fit(&training)?;
             let Err(error @ TransformError::InputTypeMismatch { .. }) =
                 definition.validate(&transform, &input)

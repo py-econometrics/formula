@@ -4,8 +4,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState, Transform,
-    TransformError, validate_numeric_field,
+    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState,
+    ParameterValue, Transform, TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -291,7 +291,7 @@ impl<'a> TransformCall<'a> {
         self.inputs.iter().map(Arc::as_ref)
     }
 
-    pub fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+    pub fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
         self.transform.parameters()
     }
 
@@ -3345,7 +3345,7 @@ mod tests {
 
         assert_requires_one_argument(|| {
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                Scalar::from(1_i64),
+                ParameterValue::Scalar(Scalar::from(1_i64)),
             ))))
         });
     }

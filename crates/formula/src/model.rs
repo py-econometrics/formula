@@ -667,7 +667,7 @@ mod tests {
 
     mod column_provenance {
         use super::*;
-        use crate::{ComponentKey, FittedFormula};
+        use crate::{ComponentKey, FittedFormula, ParameterValue};
         use polars::prelude::{DataFrame, PlSmallStr, Scalar};
 
         fn fit(source: &str, data: &DataFrame) -> FittedFormula {
@@ -708,7 +708,7 @@ mod tests {
                 );
                 assert_eq!(
                     categorical.transform().unwrap().parameters()["reference"],
-                    Scalar::from(PlSmallStr::from_static("a")),
+                    ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
                 );
                 let inputs = categorical
                     .transform()
@@ -843,8 +843,14 @@ mod tests {
                 assert_eq!(key, &ComponentKey::Scalar(Scalar::from(basis)));
                 let parameters = polynomial.transform().unwrap().parameters();
                 assert_eq!(parameters.len(), 2);
-                assert_eq!(parameters["degree"], Scalar::from(2_i64));
-                assert_eq!(parameters["raw"], Scalar::from(true));
+                assert_eq!(
+                    parameters["degree"],
+                    ParameterValue::Scalar(Scalar::from(2_i64))
+                );
+                assert_eq!(
+                    parameters["raw"],
+                    ParameterValue::Scalar(Scalar::from(true))
+                );
 
                 let inputs = polynomial.transform().unwrap().inputs().collect::<Vec<_>>();
                 assert_eq!(inputs.len(), 1);

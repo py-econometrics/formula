@@ -14,6 +14,57 @@ def data():
     )
 
 
+@pytest.mark.parametrize(
+    "dtype", [polars.String, polars.Categorical, polars.Enum(["a", "b", "c"])]
+)
+@pytest.mark.parametrize(
+    ("argument", "parameter", "remaining"),
+    [
+        ("'a'", "a", ["b", "c"]),
+        ("['a']", ["a"], ["b", "c"]),
+        ("['a', 'b']", ["a", "b"], ["c"]),
+        ("['a', 'a']", ["a", "a"], ["b", "c"]),
+        ("[]", [], ["a", "b", "c"]),
+        ("['a', 'b', 'c']", ["a", "b", "c"], []),
+    ],
+)
+def test_categorical_reference_scalar_and_list(argument, parameter, remaining, dtype):
+    training = polars.DataFrame(
+        {"y": [1.0, 2.0, 3.0], "g": polars.Series(["a", "b", "c"], dtype=dtype)}
+    )
+    model = formula.parse(f"y ~ C(g, reference={argument}) - 1").fit(training)[0]
+    (term,) = model.terms(formula.Role.Independent)
+    call = term.factors[0].transform
+    assert call is not None
+    assert call.parameters == {"reference": parameter}
+    assert [column.contributions[0].key for column in term.columns] == remaining
+    assert [column.data.name for column in term.columns] == [
+        f"C(g, reference={argument})[{level}]" for level in remaining
+    ]
+
+    prediction = model.select(formula.Role.Independent).transform(
+        polars.DataFrame({"g": polars.Series(["a", "b", "c", None], dtype=dtype)})
+    )
+    columns = prediction.columns(formula.Role.Independent)
+    assert len(columns) == len(remaining)
+    for column, level in zip(columns, remaining, strict=True):
+        assert column.data.to_list() == [
+            value == level for value in ["a", "b", "c"]
+        ] + [None]
+
+
+@pytest.mark.parametrize("argument", ["['a', 'missing']", "['a', 1]"])
+def test_categorical_reference_validates_every_list_element(data, argument):
+    with pytest.raises(ValueError):
+        formula.parse(f"y ~ C(g, reference={argument})").fit(data)
+
+
+@pytest.mark.parametrize("keyword", ["degree", "raw"])
+def test_polynomial_rejects_list_parameters(keyword):
+    with pytest.raises(SyntaxError, match=keyword):
+        formula.parse(f"y ~ poly(x, {keyword}=[1])")
+
+
 def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
     model = formula.parse("y ~ C(g, reference='a')*x").fit(data)[0]
     selected = model.select_terms("x:C(g, reference='a')", formula.Role.Independent)

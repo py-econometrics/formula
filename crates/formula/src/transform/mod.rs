@@ -31,6 +31,12 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
     format!("{name}({arguments})").into()
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ParameterValue {
+    Scalar(Scalar),
+    List(Vec<Scalar>),
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Transform {
     Expression(ExpressionTransform),
@@ -55,7 +61,7 @@ pub(crate) trait TransformDefinition {
         false
     }
 
-    fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+    fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
         BTreeMap::new()
     }
 }
@@ -83,7 +89,7 @@ impl Transform {
         self.definition().argument_count()
     }
 
-    pub(crate) fn parameters(&self) -> BTreeMap<&'static str, Scalar> {
+    pub(crate) fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
         self.definition().parameters()
     }
 
@@ -229,8 +235,9 @@ mod tests {
 
     #[test]
     fn fit_identity_depends_on_definition_not_fitted_state() -> Result<(), TransformError> {
-        let definition =
-            CategoricalDefinition::new(Some(Scalar::from(PlSmallStr::from_static("a"))));
+        let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(
+            PlSmallStr::from_static("a"),
+        ))));
         let first_input = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let second_input = prepare(&[Column::new("group".into(), ["a", "c"])]);
         let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
@@ -286,7 +293,7 @@ mod tests {
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
             Transform::Poly(Fit::Unfitted(PolynomialDefinition::new(
                 None,
-                Some(Scalar::from(true)),
+                Some(ParameterValue::Scalar(Scalar::from(true))),
             )?)),
         ] {
             assert!(transform.state().is_none());
