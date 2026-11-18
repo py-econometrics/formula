@@ -8,7 +8,7 @@ use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::StepwiseOperator;
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, InteractionDefinition, ParameterValue,
-    PolynomialDefinition, Transform,
+    PolynomialDefinition, StandardizeDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -685,6 +685,18 @@ impl TryFrom<TransformCall> for Factor {
             "div" => {
                 reject_keywords("div", keywords)?;
                 Transform::Expression(ExpressionTransform::DIV)
+            }
+            "pow" => {
+                reject_keywords("pow", keywords)?;
+                Transform::Expression(ExpressionTransform::POW)
+            }
+            "center" => {
+                reject_keywords("center", keywords)?;
+                Transform::Standardize(Fit::Unfitted(StandardizeDefinition::CENTER))
+            }
+            "scale" => {
+                reject_keywords("scale", keywords)?;
+                Transform::Standardize(Fit::Unfitted(StandardizeDefinition::SCALE))
             }
             "C" => {
                 let reference = keywords.remove(CategoricalDefinition::OMIT_PARAMETER);
