@@ -1,17 +1,26 @@
 use polars::prelude::{Column, Scalar};
-use pyo3::exceptions::{PyIndexError, PyKeyError, PySyntaxError, PyValueError};
+use pyo3::create_exception;
+use pyo3::exceptions::{PyIndexError, PyKeyError, PySyntaxError, PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
 use pyo3_polars::{PyDataFrame, PySeries};
 use std::collections::BTreeMap;
+use std::ffi::CString;
+
+create_exception!(
+    formula,
+    RankDeficiencyWarning,
+    PyUserWarning,
+    "Terms without columns, because the intercept, fixed effects, or other terms already span them."
+);
 
 #[pymodule]
 mod _formula {
     #[pymodule_export]
     use super::{
         Factor, FactorContribution, FittedFormula, FittedFormulas, FittedTerm, FixedEffect,
-        FixedEffectEncoding, Formula, FormulaColumn, Formulas, Role, TransformCall, TransformState,
-        parse, parse_many,
+        FixedEffectEncoding, Formula, FormulaColumn, Formulas, RankDeficiencyWarning, Role,
+        TransformCall, TransformState, parse, parse_many,
     };
 }
 
@@ -77,10 +86,36 @@ impl Formulas {
         })
     }
 
-    fn fit(&self, py: Python<'_>, data: PyDataFrame) -> PyResult<FittedFormulas> {
-        py.detach(|| self.inner.fit(&data.0))
-            .map(|inner| FittedFormulas { inner })
-            .map_err(|error| PyValueError::new_err(error.to_string()))
+    #[pyo3(signature = (data, *, ensure_full_rank = true))]
+    fn fit(
+        &self,
+        py: Python<'_>,
+        data: PyDataFrame,
+        ensure_full_rank: bool,
+    ) -> PyResult<FittedFormulas> {
+        let options = formula::FitOptions { ensure_full_rank };
+        let inner = py
+            .detach(|| self.inner.fit_with_options(&data.0, options))
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+
+        // A child formula can be shared by several models; warn about it once.
+        let mut messages = Vec::new();
+        for model in &inner {
+            for deficiency in model.rank_deficiencies() {
+                let message = deficiency.to_string();
+                if !messages.contains(&message) {
+                    messages.push(message);
+                }
+            }
+        }
+        let category = py.get_type::<RankDeficiencyWarning>();
+        for message in messages {
+            let message =
+                CString::new(message).map_err(|error| PyValueError::new_err(error.to_string()))?;
+            PyErr::warn(py, &category, &message, 1)?;
+        }
+
+        Ok(FittedFormulas { inner })
     }
 }
 

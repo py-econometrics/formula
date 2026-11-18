@@ -2,6 +2,7 @@ use super::input::PreparedInput;
 use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
+use crate::rank::Scope;
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
@@ -9,6 +10,15 @@ use polars::prelude::{
     SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
+
+/// How a term materialises the levels of a categorical factor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Contrast {
+    /// One indicator per level, named `prefix[level]`.
+    Full,
+    /// Every level but the reference, named `prefix[T.level]` (treatment contrasts).
+    Reduced,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CategoricalDefinition {
@@ -31,12 +41,54 @@ impl CategoricalDefinition {
     }
 
     fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
-        self.column_name(&self.call_name(&[input_name]), level)
+        Self::column_name(&self.call_name(&[input_name]), level, Contrast::Full)
     }
 
     /// Names the indicator column of `level` after `prefix`, such as `C(a)` or a bare `a`.
-    pub(crate) fn column_name(&self, prefix: &str, level: &Scalar) -> PlSmallStr {
-        format!("{prefix}[{}]", Self::level_name(level)).into()
+    pub(crate) fn column_name(prefix: &str, level: &Scalar, contrast: Contrast) -> PlSmallStr {
+        let marker = match contrast {
+            Contrast::Full => "",
+            Contrast::Reduced => "T.",
+        };
+
+        format!("{prefix}[{marker}{}]", Self::level_name(level)).into()
+    }
+
+    /// Selects indicator columns by their positions in the fitted levels.
+    pub(crate) fn code(
+        state: &CategoricalState,
+        columns: MaterializedColumns<ComponentKey>,
+        prefix: &str,
+        scope: &Scope,
+    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+        let contrast = match scope {
+            Scope::Reduced => Contrast::Reduced,
+            Scope::Full | Scope::Levels(_) => Contrast::Full,
+            Scope::Omitted => unreachable!("omitted factors have no columns in this group"),
+        };
+        let (frame, metadata) = columns.into_parts();
+        let retained_levels =
+            (0..state.level_count()).filter(|index| !state.omitted_indices().contains(index));
+        let (columns, metadata): (Vec<_>, Vec<_>) = retained_levels
+            .zip(frame.columns().iter().zip(metadata))
+            .filter(|(index, _)| match scope {
+                Scope::Reduced => *index != 0,
+                Scope::Levels(selected) => selected.contains(index),
+                _ => true,
+            })
+            .map(|(_, (column, key))| {
+                let ComponentKey::Scalar(level) = &key else {
+                    unreachable!("categorical columns are keyed by their level");
+                };
+                let name = Self::column_name(prefix, level, contrast);
+                (column.clone().with_name(name), key)
+            })
+            .unzip();
+
+        Ok(MaterializedColumns::new(
+            DataFrame::new(frame.height(), columns)?,
+            metadata,
+        ))
     }
 
     fn level_name(level: &Scalar) -> String {
@@ -259,6 +311,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 .is_in(lit(levels.implode()?.into_series()), false)
         };
 
+        // Keep every fitted level except those explicitly omitted.
         let (expressions, metadata): (Vec<_>, Vec<ComponentKey>) = fitted_levels
             .into_iter()
             .enumerate()
@@ -291,6 +344,16 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 pub(crate) struct CategoricalState {
     levels: Column,
     reference_indices: Vec<usize>,
+}
+
+impl CategoricalState {
+    pub(crate) fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub(crate) fn omitted_indices(&self) -> &[usize] {
+        &self.reference_indices
+    }
 }
 
 #[cfg(test)]
@@ -397,17 +460,15 @@ mod tests {
     }
 
     #[test]
-    fn column_names_follow_level_with_any_prefix() {
+    fn column_names_follow_contrast_with_any_prefix() {
         let level = Scalar::from(PlSmallStr::from_static("q"));
-        let reference = Scalar::from(PlSmallStr::from_static("p"));
         assert_eq!(
-            CategoricalDefinition::new(None).column_name("a", &level),
+            CategoricalDefinition::column_name("a", &level, Contrast::Full),
             "a[q]"
         );
         assert_eq!(
-            CategoricalDefinition::new(Some(ParameterValue::Scalar(reference)))
-                .column_name("a", &level),
-            "a[q]"
+            CategoricalDefinition::column_name("C(a)", &level, Contrast::Reduced),
+            "C(a)[T.q]"
         );
     }
 
@@ -436,6 +497,16 @@ mod tests {
         Ok(())
     }
 
+    /// Codes the transform output of `fitted` with a reduced contrast.
+    fn reduced(
+        fitted: &Fitted<CategoricalDefinition, CategoricalState>,
+        input_name: &str,
+        output: MaterializedColumns<ComponentKey>,
+    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+        let prefix = fitted.definition.call_name(&[input_name]);
+        CategoricalDefinition::code(&fitted.state, output, &prefix, &Scope::Reduced)
+    }
+
     #[test]
     fn native_reference_is_omitted_without_treating_unknown_levels_as_reference()
     -> Result<(), TransformError> {
@@ -460,6 +531,25 @@ mod tests {
                 &[&[Some(false), None, None, Some(true)]],
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reduced_coding_omits_the_first_level_by_default() -> Result<(), TransformError> {
+        let input = prepare(&[Column::new("x".into(), ["c", "a", "b"])]);
+        let fitted = Fitted::fit(CategoricalDefinition::new(None), &input)?;
+        let output = reduced(&fitted, "x", fitted.transform(&input)?)?;
+        assert_eq!(
+            output.frame().get_column_names(),
+            ["C(x)[T.b]", "C(x)[T.c]"]
+        );
+        assert_eq!(
+            output.into_parts().1,
+            [
+                ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static("b"))),
+                ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static("c"))),
+            ]
+        );
         Ok(())
     }
 
@@ -719,6 +809,7 @@ mod tests {
         let height = expected.first().map_or(0, |column| column.len());
         assert_eq!(actual.shape(), (height, expected.len()));
 
+        // The transform keeps every level, the reference included.
         let levels = &transform.levels;
         let names = (0..levels.len())
             .filter(|index| !transform.reference_indices.contains(index))
@@ -907,17 +998,10 @@ mod tests {
             ];
             expected
                 .extend((3..count).map(|_| [Some(false), Some(false), Some(false), None, None]));
-            let expected = expected
-                .iter()
-                .map(|values| values.as_slice())
-                .collect::<Vec<_>>();
-            assert_output(
-                &fitted.definition,
-                &fitted.state,
-                &input,
-                output.frame(),
-                &expected,
-            );
+            for (column, expected) in output.frame().columns().iter().zip(&expected) {
+                assert_eq!(column.bool()?.iter().collect::<Vec<_>>(), expected);
+            }
+            assert_eq!(output.frame().width(), expected.len());
             let names = levels[1..count]
                 .iter()
                 .map(|level| format!("C(group, omit='a')[{level}]"))

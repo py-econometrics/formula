@@ -11,10 +11,16 @@ ComponentKey: TypeAlias = ScalarValue | None | tuple[ComponentKey, ...]
 
 class Formula: ...
 
+class RankDeficiencyWarning(UserWarning):
+    """Terms without columns, because the intercept, fixed effects, or other terms
+    already span them, whatever the data."""
+
 class Formulas:
     def __len__(self) -> int: ...
     def __getitem__(self, index: int | str) -> Formula: ...
-    def fit(self, data: polars.DataFrame) -> FittedFormulas: ...
+    def fit(
+        self, data: polars.DataFrame, *, ensure_full_rank: bool = True
+    ) -> FittedFormulas: ...
 
 class FittedFormula:
     @property
@@ -89,7 +95,14 @@ class FormulaColumn:
     @property
     def term(self) -> tuple[Factor, ...]: ...
     @property
-    def contributions(self) -> tuple[FactorContribution, ...]: ...
+    def contributions(self) -> tuple[FactorContribution, ...]:
+        """The factors of `term` this column includes, in term order, with their keys.
+
+        Full-rank coding can split a term into column groups that omit some of its
+        factors: in `y ~ a:b`, the column `b[T.v]` belongs to the term `a:b` but
+        includes only `b`. Omitted factors have no contribution, and the intercept
+        column has none.
+        """
 
 class FactorContribution:
     @property

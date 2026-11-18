@@ -6,7 +6,7 @@ mod integer;
 mod polynomial;
 pub mod state;
 
-pub(crate) use categorical::CategoricalDefinition;
+pub(crate) use categorical::{CategoricalDefinition, CategoricalState};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 
 use crate::fit::{Fit, FitError};
 use crate::formula::{ComponentKey, MaterializedColumns};
-use crate::transform::categorical::CategoricalState;
 pub use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use crate::transform::state::ExportState;

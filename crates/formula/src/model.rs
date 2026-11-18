@@ -1,6 +1,6 @@
 use crate::fit::FitError;
 use crate::formula::{
-    FittedExpression, FittedTerm, Role, ValidationError, parse_one, transform_terms,
+    FittedExpression, FittedTerm, RankDeficiency, Role, ValidationError, parse_one, transform_terms,
 };
 use crate::parse::{ParseResult, parse_term};
 use crate::transform::TransformError;
@@ -14,6 +14,8 @@ pub struct FittedFormula {
     formula: Formula,
     expressions: BTreeMap<Role, FittedExpression>,
     height: usize,
+    // Found while coding this formula's own predictors at fit time
+    deficiencies: Vec<RankDeficiency>,
 }
 
 impl FittedFormula {
@@ -21,6 +23,7 @@ impl FittedFormula {
         formula: Formula,
         expressions: BTreeMap<Role, FittedExpression>,
         height: usize,
+        deficiencies: Vec<RankDeficiency>,
     ) -> Self {
         debug_assert!(
             expressions
@@ -31,7 +34,21 @@ impl FittedFormula {
             formula,
             expressions,
             height,
+            deficiencies,
         }
+    }
+
+    /// Structural rank deficiencies found at fit time, in this formula and its children.
+    ///
+    /// They describe the fitted coding, so they carry over to transformed models.
+    pub fn rank_deficiencies(&self) -> Vec<&RankDeficiency> {
+        let mut deficiencies = self.deficiencies.iter().collect::<Vec<_>>();
+        for expression in self.expressions.values() {
+            for child in expression.children() {
+                deficiencies.extend(child.rank_deficiencies());
+            }
+        }
+        deficiencies
     }
 
     pub fn formula(&self) -> &Formula {
@@ -68,19 +85,23 @@ impl FittedFormula {
         Ok(expression.terms())
     }
 
-    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
+    pub(crate) fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
         let expressions = self
             .expressions
             .iter()
             .map(|(&role, transformed)| {
                 transformed
-                    .expression()
-                    .assemble(height, terms)
+                    .reassemble(height, terms)
                     .map(|expression| (role, expression))
             })
             .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
-        Ok(Self::new(self.formula.clone(), expressions, height))
+        Ok(Self::new(
+            self.formula.clone(),
+            expressions,
+            height,
+            self.deficiencies.clone(),
+        ))
     }
 
     pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
@@ -111,7 +132,12 @@ impl FittedFormula {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-        Ok(Self::new(self.formula.clone(), expressions, self.height))
+        Ok(Self::new(
+            self.formula.clone(),
+            expressions,
+            self.height,
+            self.deficiencies.clone(),
+        ))
     }
 
     pub fn select_terms(&self, source: &str, role: Role) -> Result<Self, SelectionError> {
@@ -128,6 +154,7 @@ impl FittedFormula {
             self.formula.clone(),
             BTreeMap::from([(role, selected)]),
             self.height,
+            self.deficiencies.clone(),
         ))
     }
 
@@ -682,10 +709,12 @@ mod tests {
             let data =
                 polars::df!("y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [2.0, 3.0, 4.0])
                     .unwrap();
-            let fitted = fit("y ~ C(g, omit='a'):x - 1", &data);
+            // The main effect `x` spans the margin, so the interaction is reduced.
+            let fitted = fit("y ~ x + C(g, omit='a'):x - 1", &data);
             let columns = fitted
                 .columns(Role::Independent)
                 .unwrap()
+                .skip(1)
                 .collect::<Vec<_>>();
             assert_eq!(columns.len(), 2);
 

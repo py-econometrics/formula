@@ -2,11 +2,12 @@ mod fit;
 mod formula;
 mod model;
 mod parse;
+mod rank;
 mod transform;
 
 pub use self::formula::{
-    ComponentKey, Factor, FittedFixedEffect, FittedTerm, Formula, FormulaColumn, Formulas, Role,
-    Term, TransformCall, ValidationError,
+    ComponentKey, Factor, FitOptions, FittedFixedEffect, FittedTerm, Formula, FormulaColumn,
+    Formulas, RankDeficiency, Role, Term, TransformCall, ValidationError,
 };
 pub use fit::FitError;
 pub use model::{FittedFormula, FittedFormulas, ModelError, SelectionError};
