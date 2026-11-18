@@ -609,12 +609,27 @@ fn postfix<'i, L: ParseLayer>(
     }
 }
 
+/// A formula, which may be child formula. Child formulas need a response.
 fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
-    let left = preceded(
-        multispace0,
-        parse_node::<ast::MultistageFormula>.context(StrContext::Label("left-hand expression")),
-    )
-    .parse_next(cursor)?;
+    parse_formula_ast_with(false, cursor)
+}
+
+/// A top-level formula, which may be one-sided.
+fn parse_top_level_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
+    parse_formula_ast_with(true, cursor)
+}
+
+fn parse_formula_ast_with(one_sided: bool, cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
+    multispace0.parse_next(cursor)?;
+    // A one-sided formula `~ x` has no response, like `0 ~ x`.
+    let left = if one_sided && cursor.starts_with(FORMULA_SEPARATOR) {
+        let zero = ast::ExpressionAst::<ast::SimpleFormula>::Atom(Term::intercept()).negate();
+        construction_result(cursor, zero.ok().map(ast::ExpressionAst::embed))?
+    } else {
+        parse_node::<ast::MultistageFormula>
+            .context(StrContext::Label("left-hand expression"))
+            .parse_next(cursor)?
+    };
 
     FORMULA_SEPARATOR
         .context(StrContext::Expected(StrContextValue::CharLiteral(
@@ -657,7 +672,7 @@ pub fn parse_many<'a>(input: impl IntoIterator<Item = &'a str>) -> ParseResult<'
 
     for source in input {
         let expanded = terminated(
-            parse_formula_ast,
+            parse_top_level_formula_ast,
             eof.context(StrContext::Expected(StrContextValue::Description(
                 "a formula operator or end of input",
             ))),
@@ -830,6 +845,21 @@ mod tests {
         );
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn one_sided_formulas_have_no_response() {
+        for (source, expected) in [
+            ("~ x", "0 ~ x"),
+            ("  ~ 0 + log(z)", "0 ~ 0 + log(z)"),
+            ("~ x | f", "0 ~ x | f"),
+            ("~ sw(x, z)", "0 ~ sw(x, z)"),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(expected).unwrap(), "{source}");
+        }
+        for source in ["~", "~ ~ x", ""] {
+            assert!(parse(source).is_err(), "{source}");
         }
     }
 
@@ -2367,7 +2397,7 @@ mod tests {
         #[test]
         fn formula_boundaries_report_context_and_offsets() {
             for (source, expected, offset) in [
-                ("~ x", StrContext::Label("left-hand expression"), 0),
+                ("~", StrContext::Label("right-hand expression"), 1),
                 (
                     "y x",
                     StrContext::Expected(StrContextValue::CharLiteral('~')),
@@ -2707,7 +2737,7 @@ mod tests {
                 " ",
                 "x",
                 "y ~",
-                "~ x",
+                "~",
                 "y ~ x ~ z",
                 "y ~ x C(group)",
                 "y ~ (x + z",

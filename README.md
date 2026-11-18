@@ -169,6 +169,7 @@ y ~ log(x) - 1  # transform x and omit the intercept
 y ~ 0 + x       # omit the intercept
 y ~ x - 1 - 0   # restore the intercept
 y ~ (0 + x)     # retain the outer default intercept
+~ 0 + log(x)    # no response, like 0 ~ 0 + log(x)
 ```
 
 Parentheses and stepwise arguments are evaluated locally. For example,
