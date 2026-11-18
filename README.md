@@ -350,7 +350,7 @@ or `transform()`:
 | `center(x)`<br>`scale(x)`                                                    | Subtract the fitted mean of `x`, and for `scale` divide by its fitted sample standard deviation. `transform()` reuses both. |
 | `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`, optionally excluding the levels specified by `omit`. |
 | `i(group, x, ref=..., ref2=..., bin=..., bin2=...)`                          | Create fixest-style indicators `group::level`, optionally interacted with a second variable (see above). |
-| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
+| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`. `poly(x, 2)` gives the degree by position. |
 
 Numeric arguments are supported inside transformation calls:
 
