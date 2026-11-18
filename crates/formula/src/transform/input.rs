@@ -5,6 +5,8 @@ use polars::prelude::{Column, DataFrame, Field, PlSmallStr};
 pub enum ArgumentCount {
     Exactly(usize),
     AtLeast(usize),
+    /// An inclusive range of argument counts.
+    Between(usize, usize),
 }
 
 impl ArgumentCount {
@@ -12,6 +14,7 @@ impl ArgumentCount {
         match self {
             Self::Exactly(expected) => actual == expected,
             Self::AtLeast(expected) => actual >= expected,
+            Self::Between(low, high) => (low..=high).contains(&actual),
         }
     }
 }
@@ -21,6 +24,7 @@ impl std::fmt::Display for ArgumentCount {
         match self {
             Self::Exactly(count) => write!(f, "exactly {count}"),
             Self::AtLeast(count) => write!(f, "at least {count}"),
+            Self::Between(low, high) => write!(f, "between {low} and {high}"),
         }
     }
 }

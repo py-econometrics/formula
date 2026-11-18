@@ -432,3 +432,126 @@ fn ordinary_interaction_values_follow_named_levels_and_numeric_inputs() {
         }
     }
 }
+
+/// `i()` spans what its `C()` spelling spans, with every column independent.
+#[test]
+fn interactions_span_their_categorical_spellings() {
+    // `x` varies within every level of `a`, so slopes are not collinear by chance.
+    let data = polars::df!(
+        "y" => [0.0; 16],
+        "a" => A.repeat(4),
+        "b" => [B[0]; 8].into_iter().chain([B[1]; 8]).collect::<Vec<_>>(),
+        "x" => (1..=16).map(|x| f64::from(x * x % 7) + 0.5).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let opt_out = FitOptions {
+        ensure_full_rank: false,
+    };
+    for (source, spelling) in [
+        ("i(a)", "C(a)"),
+        ("i(a, ref='p')", "C(a, omit='p')"),
+        ("i(a, ref=['p', 'q'])", "C(a, omit=['p', 'q'])"),
+        ("i(a, x)", "C(a):x"),
+        ("x + i(a, x)", "x + C(a):x"),
+        ("i(a, x, ref='q')", "C(a, omit='q'):x"),
+        ("i(a, b)", "C(a):C(b)"),
+        (
+            "i(a, b, ref='p', ref2='u')",
+            "C(a, omit='p'):C(b, omit='u')",
+        ),
+        ("i(a, C(b, omit='v'))", "C(a):C(b, omit='v')"),
+        ("a + i(a, b)", "a + C(a):C(b)"),
+        ("i(a) + i(a, b)", "C(a) + C(a):C(b)"),
+        ("i(b, a)", "C(b):C(a)"),
+    ] {
+        for intercept in [0, 1] {
+            let source = format!("y ~ {intercept} + {source}");
+            let spelling = format!("y ~ {intercept} + {spelling}");
+            let model = fit(&source, &data);
+            assert_full_rank(&model, &source);
+            let [cartesian] = fit_all(&spelling, &data, opt_out).try_into().unwrap();
+            assert_span(&model, design(&cartesian), &source);
+        }
+    }
+}
+
+#[test]
+fn interaction_bins_merge_levels_before_references() {
+    let data = acceptance_grid();
+    let model = fit("y ~ 0 + i(a, bin={'pq': ['p', 'q']}, ref='r')", &data);
+    assert_eq!(names(&model, Role::Independent), ["a::pq", "a::s"]);
+    let frame = predictors(&model);
+    let pq = product(&level_indicator(&data, "a", "p"), &[1.0; 8])
+        .iter()
+        .zip(level_indicator(&data, "a", "q"))
+        .map(|(p, q)| p + q)
+        .collect::<Vec<_>>();
+    assert_eq!(values(&frame["a::pq"]), pq);
+    assert_eq!(values(&frame["a::s"]), level_indicator(&data, "a", "s"));
+    // A binned variable has its own level space, reduced next to an intercept.
+    let model = fit("y ~ 1 + i(a, bin={'pq': ['p', 'q']})", &data);
+    assert_eq!(
+        names(&model, Role::Independent),
+        ["Intercept", "a::r", "a::s"]
+    );
+}
+
+#[test]
+fn interaction_contributions_key_each_axis() {
+    let data = acceptance_grid();
+    // An axis left out of a column group has no key.
+    let model = fit("y ~ i(a, b)", &data);
+    let column = model.columns(Role::Independent).unwrap().nth(1).unwrap();
+    assert_eq!(column.data().name().as_str(), "b::v");
+    let (_, key) = column.contributions().next().unwrap();
+    assert_eq!(
+        *key,
+        ComponentKey::Tuple(vec![
+            ComponentKey::None,
+            ComponentKey::Scalar(polars::prelude::Scalar::from(
+                polars::prelude::PlSmallStr::from("v")
+            )),
+        ])
+    );
+    // With `ref`, the explicit omission leaves no reduced group.
+    let model = fit("y ~ i(a, b, ref='p') + i(a, x, ref='p')", &data);
+    let keys = model
+        .columns(Role::Independent)
+        .unwrap()
+        .map(|column| {
+            let (factor, key) = column
+                .contributions()
+                .next()
+                .map_or((None, ComponentKey::None), |(factor, key)| {
+                    (factor.transform().map(|call| call.name()), key.clone())
+                });
+            (column.data().name().to_string(), factor, key)
+        })
+        .collect::<Vec<_>>();
+    let level = |level: &str| {
+        ComponentKey::Scalar(polars::prelude::Scalar::from(
+            polars::prelude::PlSmallStr::from(level),
+        ))
+    };
+    let pair = |a: Option<&str>, b: Option<&str>| {
+        ComponentKey::Tuple(vec![
+            a.map_or(ComponentKey::None, level),
+            b.map_or(ComponentKey::None, level),
+        ])
+    };
+    assert_eq!(
+        keys,
+        [
+            ("Intercept".into(), None, ComponentKey::None),
+            ("a::q:b::u".into(), Some("i"), pair(Some("q"), Some("u"))),
+            ("a::q:b::v".into(), Some("i"), pair(Some("q"), Some("v"))),
+            ("a::r:b::u".into(), Some("i"), pair(Some("r"), Some("u"))),
+            ("a::r:b::v".into(), Some("i"), pair(Some("r"), Some("v"))),
+            ("a::s:b::u".into(), Some("i"), pair(Some("s"), Some("u"))),
+            ("a::s:b::v".into(), Some("i"), pair(Some("s"), Some("v"))),
+            ("a::q:x".into(), Some("i"), pair(Some("q"), None)),
+            ("a::r:x".into(), Some("i"), pair(Some("r"), None)),
+            ("a::s:x".into(), Some("i"), pair(Some("s"), None)),
+        ]
+    );
+}

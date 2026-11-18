@@ -258,6 +258,8 @@ pub enum ModelError {
     Transform(TransformError),
     Fit(FitError<TransformError>),
     TransformCall(String),
+    /// Several columns of one expression have this name.
+    DuplicateColumn(String),
 }
 
 impl From<ValidationError> for ModelError {
@@ -285,6 +287,11 @@ impl std::fmt::Display for ModelError {
             Self::Transform(error) => error.fmt(f),
             Self::Fit(error) => error.fmt(f),
             Self::TransformCall(message) => f.write_str(message),
+            Self::DuplicateColumn(name) => write!(
+                f,
+                "the formula produces the column `{name}` more than once; remove or respell \
+                 the repeated terms, for example by giving i() distinct levels"
+            ),
         }
     }
 }

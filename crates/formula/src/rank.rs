@@ -370,6 +370,13 @@ pub(crate) fn code_terms<K: PartialEq + Copy>(
     let mut coded = vec![Vec::new(); terms.len()];
     for index in order {
         let axes = &terms_axes[index];
+        // A factor without fitted levels, such as an all-null input, leaves its
+        // terms without columns. Emit an empty group and span nothing.
+        if axes.iter().any(|axis| axis.levels == Some(0)) {
+            let group = vec![Scope::Full; axes.len()];
+            coded[index].push(expand_group(axes, group, terms[index].len()));
+            continue;
+        }
         if axes
             .iter()
             .any(|axis| !axis.omitted.is_empty() && Some(axis.omitted.len()) == axis.levels)

@@ -383,11 +383,14 @@ impl TransformCall {
                     parameters.set_item(name, scalar_to_python(py, value)?)?;
                 }
                 formula::ParameterValue::List(values) => {
-                    let values = values
-                        .iter()
-                        .map(|value| scalar_to_python(py, value))
-                        .collect::<PyResult<Vec<_>>>()?;
-                    parameters.set_item(name, PyList::new(py, values)?)?;
+                    parameters.set_item(name, scalars_to_python(py, values)?)?;
+                }
+                formula::ParameterValue::Map(entries) => {
+                    let map = PyDict::new(py);
+                    for (label, values) in entries {
+                        map.set_item(scalar_to_python(py, label)?, scalars_to_python(py, values)?)?;
+                    }
+                    parameters.set_item(name, map)?;
                 }
             }
         }
@@ -660,6 +663,14 @@ fn scalar_to_python(py: Python<'_>, value: &Scalar) -> PyResult<Py<PyAny>> {
         .into_pyobject(py)?
         .call_method0("item")
         .map(Bound::unbind)
+}
+
+fn scalars_to_python<'py>(py: Python<'py>, values: &[Scalar]) -> PyResult<Bound<'py, PyList>> {
+    let values = values
+        .iter()
+        .map(|value| scalar_to_python(py, value))
+        .collect::<PyResult<Vec<_>>>()?;
+    PyList::new(py, values)
 }
 
 fn component_key_to_python(py: Python<'_>, key: &formula::ComponentKey) -> PyResult<Py<PyAny>> {

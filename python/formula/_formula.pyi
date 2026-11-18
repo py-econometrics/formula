@@ -5,7 +5,8 @@ from typing import ClassVar, TypeAlias
 
 import polars
 
-ParameterValue: TypeAlias = bool | int | float | str | list[bool | int | float | str]
+_Scalar: TypeAlias = bool | int | float | str
+ParameterValue: TypeAlias = _Scalar | list[_Scalar] | dict[_Scalar, list[_Scalar]]
 ScalarValue: TypeAlias = bool | int | float | str | bytes | polars.Series
 ComponentKey: TypeAlias = ScalarValue | None | tuple[ComponentKey, ...]
 

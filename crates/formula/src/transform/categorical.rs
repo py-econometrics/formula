@@ -1,12 +1,15 @@
 use super::input::PreparedInput;
-use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name};
+use super::{
+    ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name, render_level,
+    render_parameter, render_scalar,
+};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::rank::Scope;
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar,
+    AnyValue, Column, DataFrame, DataType, Expr, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar,
     SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
@@ -20,42 +23,102 @@ pub(crate) enum Contrast {
     Reduced,
 }
 
+/// How a categorical encoding is spelled, and how it names its columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Style {
+    /// `C(a, omit=...)`, with columns `prefix[level]` or `prefix[T.level]`.
+    C,
+    /// One argument of fixest-style `i(...)`, with columns `prefix::level`: the
+    /// first, or the second (with parameters `ref2` and `bin2`).
+    I { second: bool },
+}
+
+/// Labels, each replacing the listed values of the input before levels are fitted.
+pub(crate) type Bins = Vec<(Scalar, Vec<Scalar>)>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CategoricalDefinition {
     reference: Option<ParameterValue>,
+    // Boxed: bins are rare, and every factor has room for a fitted `C()`.
+    bins: Option<Box<Bins>>,
+    style: Style,
 }
 
 impl CategoricalDefinition {
     pub(crate) const OMIT_PARAMETER: &str = "omit";
+    pub(crate) const REFERENCE_PARAMETER: &str = "ref";
+    pub(crate) const BIN_PARAMETER: &str = "bin";
+    const REFERENCE2_PARAMETER: &str = "ref2";
+    const BIN2_PARAMETER: &str = "bin2";
 
     pub(crate) fn new(reference: Option<ParameterValue>) -> Self {
-        Self { reference }
+        Self {
+            reference,
+            bins: None,
+            style: Style::C,
+        }
     }
 
-    fn reference_name(value: &Scalar) -> String {
-        match value.as_any_value() {
-            AnyValue::String(value) => format!("'{value}'"),
-            AnyValue::StringOwned(value) => format!("'{value}'"),
-            _ => Self::level_name(value),
+    /// The encoding of one argument of `i(...)`, with its omitted levels and bins.
+    pub(crate) fn interaction(
+        second: bool,
+        reference: Option<ParameterValue>,
+        bins: Option<Bins>,
+    ) -> Self {
+        Self {
+            reference,
+            bins: bins.map(Box::new),
+            style: Style::I { second },
+        }
+    }
+
+    pub(crate) fn style(&self) -> Style {
+        self.style
+    }
+
+    pub(crate) fn bins(&self) -> Option<&Bins> {
+        self.bins.as_deref()
+    }
+
+    /// The written parameter that omits levels.
+    fn omit_parameter(&self) -> &'static str {
+        match self.style {
+            Style::C => Self::OMIT_PARAMETER,
+            Style::I { second: false } => Self::REFERENCE_PARAMETER,
+            Style::I { second: true } => Self::REFERENCE2_PARAMETER,
+        }
+    }
+
+    /// The written parameter that bins levels.
+    fn bin_parameter(&self) -> &'static str {
+        match self.style {
+            Style::I { second: true } => Self::BIN2_PARAMETER,
+            _ => Self::BIN_PARAMETER,
         }
     }
 
     fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
-        Self::column_name(&self.call_name(&[input_name]), level, Contrast::Full)
+        self.column_name(&self.call_name(&[input_name]), level, Contrast::Full)
     }
 
     /// Names the indicator column of `level` after `prefix`, such as `C(a)` or a bare `a`.
-    pub(crate) fn column_name(prefix: &str, level: &Scalar, contrast: Contrast) -> PlSmallStr {
-        let marker = match contrast {
-            Contrast::Full => "",
-            Contrast::Reduced => "T.",
-        };
-
-        format!("{prefix}[{marker}{}]", Self::level_name(level)).into()
+    pub(crate) fn column_name(
+        &self,
+        prefix: &str,
+        level: &Scalar,
+        contrast: Contrast,
+    ) -> PlSmallStr {
+        let level = render_level(level);
+        match (self.style, contrast) {
+            (Style::I { .. }, _) => format!("{prefix}::{level}").into(),
+            (Style::C, Contrast::Full) => format!("{prefix}[{level}]").into(),
+            (Style::C, Contrast::Reduced) => format!("{prefix}[T.{level}]").into(),
+        }
     }
 
     /// Selects indicator columns by their positions in the fitted levels.
     pub(crate) fn code(
+        &self,
         state: &CategoricalState,
         columns: MaterializedColumns<ComponentKey>,
         prefix: &str,
@@ -80,7 +143,7 @@ impl CategoricalDefinition {
                 let ComponentKey::Scalar(level) = &key else {
                     unreachable!("categorical columns are keyed by their level");
                 };
-                let name = Self::column_name(prefix, level, contrast);
+                let name = self.column_name(prefix, level, contrast);
                 (column.clone().with_name(name), key)
             })
             .unzip();
@@ -91,39 +154,33 @@ impl CategoricalDefinition {
         ))
     }
 
-    fn level_name(level: &Scalar) -> String {
-        match level.as_any_value() {
-            AnyValue::Boolean(true) => "True".into(),
-            AnyValue::Boolean(false) => "False".into(),
-            AnyValue::Float32(value) => format!("{value:?}"),
-            AnyValue::Float64(value) => format!("{value:?}"),
-            value => value.str_value().into_owned(),
-        }
-    }
-
-    /// Converts the reference value to the input dtype.
+    /// Converts a written value to the input dtype.
     ///
-    /// String references for categorical and enum inputs are resolved through the
-    /// existing dictionary without inserting new levels. Numeric references may
+    /// String values for categorical and enum inputs are resolved through the
+    /// existing dictionary without inserting new levels. Numeric values may
     /// convert between integer widths or between float widths; other dtype
-    /// combinations must match exactly. Nonfinite numeric references are rejected.
+    /// combinations must match exactly. Nonfinite numeric values are rejected.
     ///
     /// Membership in the observed fitting levels is checked separately in `fit`.
-    fn convert_reference(reference: &Scalar, dtype: &DataType) -> Result<Scalar, TransformError> {
-        // Get the dtype of the reference provided
-        let source = reference.dtype();
+    fn convert_value(
+        parameter: &str,
+        value: &Scalar,
+        dtype: &DataType,
+    ) -> Result<Scalar, TransformError> {
+        // Get the dtype of the value provided
+        let source = value.dtype();
         // Check compatibility with and convert to dtype
-        let reference = match (source, dtype) {
+        let value = match (source, dtype) {
             // Source and target dtype match
-            (source, target) if source == target => reference.clone(),
-            // Target is Categorical/Enum; check if reference is in observed levels
+            (source, target) if source == target => value.clone(),
+            // Target is Categorical/Enum; check if value is in observed levels
             (DataType::String, DataType::Categorical(_, mapping) | DataType::Enum(_, mapping)) => {
-                let value = reference.as_any_value();
-                let label = value.str_value();
-                let code = mapping.get_cat(label.as_ref()).ok_or_else(|| {
-                    TransformError::InvalidParameter(
-                        "`omit` value is not among the fitted levels".into(),
-                    )
+                let label = value.as_any_value().str_value().into_owned();
+                let code = mapping.get_cat(&label).ok_or_else(|| {
+                    TransformError::InvalidParameter(format!(
+                        "`{parameter}` value {} is not among the fitted levels",
+                        render_scalar(value)
+                    ))
                 })?;
 
                 let value = match dtype {
@@ -136,31 +193,136 @@ impl CategoricalDefinition {
 
                 Scalar::new(dtype.clone(), value)
             }
-            // Reference/target are integers; we cast here compatible integers
-            (source, target) if source.is_integer() && target.is_integer() => reference
+            // Value/target are integers; we cast here compatible integers
+            (source, target) if source.is_integer() && target.is_integer() => value
                 .clone()
                 .cast_with_options(target, CastOptions::Strict)?,
-            // Reference/target are floats; we cast here compatible floats
-            (source, target) if source.is_float() && target.is_float() => reference
+            // Value/target are floats; we cast here compatible floats
+            (source, target) if source.is_float() && target.is_float() => value
                 .clone()
                 .cast_with_options(target, CastOptions::Strict)?,
-            // Reference not compatible with target dtype
+            // An integer and a float convert only if the value is exactly representable,
+            // so that `ref=-1.0` names the integer level -1, and `ref=0.5` names no
+            // integer level.
+            (source, target) if source.is_primitive_numeric() && target.is_primitive_numeric() => {
+                let converted = value
+                    .clone()
+                    .cast_with_options(target, CastOptions::NonStrict)
+                    .ok()
+                    .filter(|converted| {
+                        !converted.is_null()
+                            && converted
+                                .clone()
+                                .cast_with_options(source, CastOptions::Strict)
+                                .is_ok_and(|back| back == *value)
+                    });
+                converted.ok_or_else(|| {
+                    TransformError::InvalidParameter(format!(
+                        "`{parameter}` value {} is not among the fitted levels",
+                        render_scalar(value)
+                    ))
+                })?
+            }
+            // Value not compatible with target dtype
             _ => {
                 return Err(TransformError::InvalidParameter(format!(
-                    "`omit` dtype {source:?} is incompatible with input dtype {dtype:?}"
+                    "`{parameter}` dtype {source:?} is incompatible with input dtype {dtype:?}"
                 )));
             }
         };
 
-        if reference.dtype().is_float()
-            && !reference.as_any_value().try_extract::<f64>()?.is_finite()
-        {
-            return Err(TransformError::InvalidParameter(
-                "`omit` must be finite after conversion to the input dtype".into(),
-            ));
+        if value.dtype().is_float() && !value.as_any_value().try_extract::<f64>()?.is_finite() {
+            return Err(TransformError::InvalidParameter(format!(
+                "`{parameter}` must be finite after conversion to the input dtype"
+            )));
         }
 
-        Ok(reference)
+        Ok(value)
+    }
+
+    /// The input after binning, and its dtype.
+    ///
+    /// Bins relabel the listed values. Categorical and enum inputs are binned as
+    /// strings, since a bin label need not be a category of the input.
+    fn binned(&self, argument: Expr, dtype: &DataType) -> Result<(Expr, DataType), TransformError> {
+        let Some(bins) = &self.bins else {
+            return Ok((argument, dtype.clone()));
+        };
+        let (argument, dtype) = match dtype {
+            DataType::Categorical(..) | DataType::Enum(..) => {
+                (argument.cast(DataType::String), DataType::String)
+            }
+            dtype => (argument, dtype.clone()),
+        };
+        // Labels keep the input dtype when they all convert to it. Otherwise the
+        // binned input is a string, as in `i(t, bin={'pre': [-2, -1]})`.
+        let labels = bins
+            .iter()
+            .map(|(label, _)| Self::convert_value(self.bin_parameter(), label, &dtype).ok())
+            .collect::<Option<Vec<_>>>();
+        let (labels, output, mut binned) = match labels {
+            Some(labels) => (labels, dtype.clone(), argument.clone()),
+            None => (
+                bins.iter()
+                    .map(|(label, _)| Scalar::from(PlSmallStr::from(render_level(label))))
+                    .collect(),
+                DataType::String,
+                argument.clone().cast(DataType::String),
+            ),
+        };
+        let original = argument;
+        for ((_, values), label) in bins.iter().zip(labels) {
+            let matched = values
+                .iter()
+                .map(|value| {
+                    let value = Self::convert_value(self.bin_parameter(), value, &dtype)?;
+                    Ok(original.clone().eq(lit(value)))
+                })
+                .collect::<Result<Vec<_>, TransformError>>()?
+                .into_iter()
+                .reduce(|left, right| left.or(right))
+                .expect("bins list at least one value");
+            binned = when(matched).then(lit(label)).otherwise(binned);
+        }
+        Ok((binned, output))
+    }
+
+    /// Checks that every binned value occurs in the fitting input.
+    fn validate_bins(&self, input: &Column) -> Result<(), TransformError> {
+        let Some(bins) = &self.bins else {
+            return Ok(());
+        };
+        let dtype = match input.dtype() {
+            DataType::Categorical(..) | DataType::Enum(..) => DataType::String,
+            dtype => dtype.clone(),
+        };
+        let observed = input.cast(&dtype)?.drop_nulls().unique()?;
+        for value in bins.iter().flat_map(|(_, values)| values) {
+            let value = Self::convert_value(self.bin_parameter(), value, &dtype)?;
+            if Self::position(&observed, &value)?.is_none() {
+                return Err(TransformError::InvalidParameter(format!(
+                    "`{}` value {} is not among the input values",
+                    self.bin_parameter(),
+                    render_scalar(&value),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn position(levels: &Column, value: &Scalar) -> Result<Option<usize>, TransformError> {
+        for index in 0..levels.len() {
+            if levels.get(index)? == value.as_any_value() {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Evaluates `expression` on the single input of `inputs`.
+    fn evaluate(inputs: &PreparedInput, expression: Expr) -> Result<Column, TransformError> {
+        let frame = inputs.frame.clone().lazy().select([expression]).collect()?;
+        Ok(frame.columns()[0].clone())
     }
 }
 
@@ -174,36 +336,46 @@ impl TransformDefinition for CategoricalDefinition {
     }
 
     fn name(&self) -> &'static str {
-        "C"
+        match self.style {
+            Style::C => "C",
+            Style::I { .. } => "i",
+        }
     }
 
     fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
-        self.reference
+        let reference = self
+            .reference
             .as_ref()
-            .map(|reference| (Self::OMIT_PARAMETER, reference.clone()))
-            .into_iter()
-            .collect()
+            .map(|reference| (self.omit_parameter(), reference.clone()));
+        let bins = self.bins.as_ref().map(|bins| {
+            (
+                self.bin_parameter(),
+                ParameterValue::Map(bins.as_ref().clone()),
+            )
+        });
+        reference.into_iter().chain(bins).collect()
     }
 
     fn call_name(&self, arguments: &[&str]) -> PlSmallStr {
-        let reference_argument = self.reference.as_ref().map(|reference| {
-            let value = match reference {
-                ParameterValue::Scalar(value) => Self::reference_name(value),
-                ParameterValue::List(values) => {
-                    let names = values.iter().map(Self::reference_name).collect::<Vec<_>>();
-                    format!("[{}]", names.join(", "))
-                }
-            };
-
-            format!("{}={value}", Self::OMIT_PARAMETER)
+        let reference = self
+            .reference
+            .as_ref()
+            .map(|reference| format!("{}={}", self.omit_parameter(), render_parameter(reference)));
+        let bins = self.bins.as_ref().map(|bins| {
+            format!(
+                "{}={}",
+                self.bin_parameter(),
+                render_parameter(&ParameterValue::Map(bins.as_ref().clone()))
+            )
         });
+        let parameters = reference.into_iter().chain(bins).collect::<Vec<_>>();
 
         call_name(
             self.name(),
             arguments
                 .iter()
                 .copied()
-                .chain(reference_argument.as_deref()),
+                .chain(parameters.iter().map(String::as_str)),
         )
     }
 }
@@ -219,8 +391,9 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         inputs: &PreparedInput,
     ) -> Result<(), TransformError> {
         let (field, input) = inputs.single()?;
+        let (_, dtype) = self.binned(col(input.name().clone()), input.dtype())?;
 
-        if input.dtype() != state.levels.dtype() {
+        if dtype != *state.levels.dtype() {
             return Err(TransformError::InputTypeMismatch {
                 name: field.name().clone(),
                 expected: state.levels.dtype().to_string(),
@@ -233,6 +406,9 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 
     fn fit(&self, inputs: &PreparedInput) -> Result<CategoricalState, TransformError> {
         let (_, input) = inputs.single()?;
+        self.validate_bins(input)?;
+        let (binned, _) = self.binned(col(input.name().clone()), input.dtype())?;
+        let input = Self::evaluate(inputs, binned)?;
         let levels = input.drop_nulls().unique()?;
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
@@ -244,28 +420,22 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         // by label, and enums by category order.
         let levels = levels.sort(SortOptions::default())?;
 
-        let references: &[Scalar] = match &self.reference {
-            None => &[],
-            Some(ParameterValue::Scalar(value)) => std::slice::from_ref(value),
-            Some(ParameterValue::List(values)) => values.as_slice(),
-        };
+        let references = self
+            .reference
+            .as_ref()
+            .map_or(Some(&[][..]), ParameterValue::scalars)
+            .expect("the parser rejects mappings of omitted levels");
         let mut reference_indices = Vec::new();
 
         for reference in references {
-            let reference = Self::convert_reference(reference, levels.dtype())?;
-
-            let index = (0..levels.len())
-                .find_map(|index| match levels.get(index) {
-                    Ok(level) if level == reference.as_any_value() => Some(Ok(index)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .transpose()?
-                .ok_or_else(|| {
-                    TransformError::InvalidParameter(
-                        "`omit` value is not among the fitted levels".into(),
-                    )
-                })?;
+            let converted = Self::convert_value(self.omit_parameter(), reference, levels.dtype())?;
+            let index = Self::position(&levels, &converted)?.ok_or_else(|| {
+                TransformError::InvalidParameter(format!(
+                    "`{}` value {} is not among the fitted levels",
+                    self.omit_parameter(),
+                    render_scalar(reference)
+                ))
+            })?;
 
             if !reference_indices.contains(&index) {
                 reference_indices.push(index);
@@ -287,7 +457,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let levels = &state.levels;
         let frame = &inputs.frame;
 
-        let argument = col(frame.columns()[0].name().clone());
+        let (argument, _) = self.binned(col(frame.columns()[0].name().clone()), input.dtype())?;
         let fitted_levels = (0..levels.len())
             .map(|i| {
                 Ok(Scalar::new(
@@ -460,16 +630,66 @@ mod tests {
     }
 
     #[test]
+    fn interaction_axes_spell_their_own_parameters() {
+        let bins = vec![(
+            Scalar::from(PlSmallStr::from_static("pre")),
+            vec![Scalar::from(-1_i64), Scalar::from(0_i64)],
+        )];
+        let reference = ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("pre")));
+        let second = CategoricalDefinition::interaction(true, Some(reference), Some(bins.clone()));
+        assert_eq!(
+            second.parameters(),
+            BTreeMap::from([
+                (
+                    "ref2",
+                    ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("pre")))
+                ),
+                ("bin2", ParameterValue::Map(bins)),
+            ])
+        );
+        assert_eq!(
+            second.call_name(&["t"]),
+            "i(t, ref2='pre', bin2={'pre': [-1, 0]})"
+        );
+    }
+
+    #[test]
+    fn bin_labels_of_another_type_bin_the_input_as_strings() -> Result<(), TransformError> {
+        let bins = vec![(
+            Scalar::from(PlSmallStr::from_static("pre")),
+            vec![Scalar::from(-1_i64), Scalar::from(0_i64)],
+        )];
+        let definition = CategoricalDefinition::interaction(false, None, Some(bins));
+        let input = prepare(&[Column::new("t".into(), [-1_i64, 0, 1, 2])]);
+        let fitted = Fitted::fit(definition, &input)?;
+        assert_eq!(fitted.state.levels.dtype(), &DataType::String);
+        let output = fitted.transform(&input)?;
+        let (frame, keys) = output.into_parts();
+        assert_eq!(
+            keys,
+            ["1", "2", "pre"]
+                .map(|level| ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static(level))))
+        );
+        assert_eq!(
+            frame.columns()[2].bool()?.iter().collect::<Vec<_>>(),
+            [Some(true), Some(true), Some(false), Some(false)]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn column_names_follow_contrast_with_any_prefix() {
         let level = Scalar::from(PlSmallStr::from_static("q"));
+        let c = CategoricalDefinition::new(None);
+        assert_eq!(c.column_name("a", &level, Contrast::Full), "a[q]");
         assert_eq!(
-            CategoricalDefinition::column_name("a", &level, Contrast::Full),
-            "a[q]"
-        );
-        assert_eq!(
-            CategoricalDefinition::column_name("C(a)", &level, Contrast::Reduced),
+            c.column_name("C(a)", &level, Contrast::Reduced),
             "C(a)[T.q]"
         );
+        // `i()` names levels the same way under either contrast.
+        let i = CategoricalDefinition::interaction(false, None, None);
+        assert_eq!(i.column_name("a", &level, Contrast::Full), "a::q");
+        assert_eq!(i.column_name("a", &level, Contrast::Reduced), "a::q");
     }
 
     #[test]
@@ -504,7 +724,9 @@ mod tests {
         output: MaterializedColumns<ComponentKey>,
     ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
         let prefix = fitted.definition.call_name(&[input_name]);
-        CategoricalDefinition::code(&fitted.state, output, &prefix, &Scope::Reduced)
+        fitted
+            .definition
+            .code(&fitted.state, output, &prefix, &Scope::Reduced)
     }
 
     #[test]
@@ -566,7 +788,7 @@ mod tests {
             assert!(matches!(error, TransformError::InvalidParameter(_)));
             assert_eq!(
                 error.to_string(),
-                "`omit` value is not among the fitted levels"
+                "`omit` value 'a' is not among the fitted levels"
             );
         }
         Ok(())
@@ -1092,15 +1314,35 @@ mod tests {
     }
 
     #[test]
-    fn categorical_rejects_reference_type_changes() {
-        let cases = [
+    fn categorical_converts_numeric_references_only_without_loss() -> Result<(), TransformError> {
+        // An integer and a float name the same level when the value is exact.
+        for (reference, input) in [
             (
                 Scalar::from(1_i64),
-                [Column::new("group".into(), [1.0_f64])],
+                Column::new("group".into(), [1.0_f64, 2.0]),
             ),
             (
                 Scalar::from(1.0_f64),
+                Column::new("group".into(), [1_i32, 2]),
+            ),
+        ] {
+            let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(reference)));
+            let state = definition.fit(&prepare(&[input]))?;
+            assert_eq!(state.omitted_indices(), [0]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn categorical_rejects_reference_type_changes() {
+        let cases = [
+            (
+                Scalar::from(1.5_f64),
                 [Column::new("group".into(), [1_i32])],
+            ),
+            (
+                Scalar::from(2_i64.pow(53) + 1),
+                [Column::new("group".into(), [1.0_f64])],
             ),
             (Scalar::from(true), [Column::new("group".into(), [1_i32])]),
             (Scalar::from(1_i64), [Column::new("group".into(), [true])]),
