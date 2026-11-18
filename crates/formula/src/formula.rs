@@ -4,8 +4,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState,
-    ParameterValue, Transform, TransformError, validate_numeric_field,
+    ArgumentCount, CategoricalDefinition, GroupedTransform, IntegerEncodingDefinition,
+    IntegerEncodingState, ParameterValue, Transform, TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -73,6 +73,16 @@ impl TryFrom<Term> for VariableDefinition {
 #[derive(Debug)]
 pub(crate) struct VariableState {
     dtype: DataType,
+}
+
+impl VariableState {
+    /// Whether a bare occurrence of the variable in a term is encoded as `C(variable)`.
+    fn is_categorical(&self) -> bool {
+        matches!(
+            self.dtype,
+            DataType::String | DataType::Categorical(..) | DataType::Enum(..)
+        )
+    }
 }
 
 impl Definition<VariableState> for VariableDefinition {
@@ -489,35 +499,139 @@ impl Term {
         Ok(columns)
     }
 
+    /// Decides how each factor is materialised, from the fitted factors.
+    ///
+    /// This is where a term's categorical factors are known at fit time.
+    fn codings(&self, transformed: &[FittedFactor]) -> Vec<Coding> {
+        self.factors
+            .iter()
+            .map(|factor| match categorical_encoding(factor, transformed) {
+                Some(encoding) => {
+                    Coding::Categorical(Arc::clone(&lookup_factor(transformed, &encoding).factor))
+                }
+                None => Coding::Direct,
+            })
+            .collect()
+    }
+
     fn assemble(
         &self,
         height: usize,
         transformed: &[FittedFactor],
-    ) -> Result<(Self, MaterializedColumns<ColumnMetadata>), TransformError> {
+        codings: Vec<Coding>,
+    ) -> Result<FittedTerm, TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
-        for factor in &self.factors {
+        for (factor, coding) in self.factors.iter().zip(&codings) {
             let result = lookup_factor(transformed, factor);
-            if let FactorKind::Variable(_) = &factor.kind {
-                let [column] = result.columns.frame.columns() else {
-                    unreachable!("a variable transforms to exactly one column");
-                };
-                validate_numeric_field(&column.field())?;
-            }
+            let columns = match (coding, &factor.kind) {
+                (Coding::Categorical(encoding), FactorKind::Variable(variable)) => {
+                    let columns = lookup_factor(transformed, encoding).columns.clone();
+                    rename_categorical(columns, encoding, variable.definition().name())?
+                }
+                (Coding::Categorical(encoding), _) => {
+                    lookup_factor(transformed, encoding).columns.clone()
+                }
+                (Coding::Direct, FactorKind::Variable(_)) => {
+                    let [column] = result.columns.frame.columns() else {
+                        unreachable!("a variable transforms to exactly one column");
+                    };
+                    validate_numeric_field(&column.field())?;
+                    result.columns.clone()
+                }
+                (Coding::Direct, _) => result.columns.clone(),
+            };
             factors.push(Arc::clone(&result.factor));
-            factor_columns.push(
-                result
-                    .columns
-                    .clone()
-                    .with_factor(Arc::clone(&result.factor)),
-            );
+            factor_columns.push(columns.with_factor(Arc::clone(&result.factor)));
         }
 
         let columns = self.assemble_columns(height, factor_columns)?;
         let term = Self { factors };
 
-        Ok((term, columns))
+        Ok(FittedTerm {
+            term,
+            codings,
+            columns,
+        })
     }
+}
+
+/// How a fitted term materialises one of its factors.
+///
+/// Decided once at fit time from the fitted factors and reused on transformation.
+#[derive(Clone, Debug, PartialEq)]
+enum Coding {
+    /// The factor's own output columns.
+    Direct,
+    /// The indicator columns of the categorical encoding `C(...)`.
+    ///
+    /// A bare non-numeric variable `a` shares the encoding `C(a)` with an explicit
+    /// `C(a)`: it is materialised once, and identifies both as the same factor.
+    Categorical(Arc<Factor>),
+}
+
+/// The categorical encoding of a factor written in a term, if it has one.
+///
+/// `C(...)` calls are their own encoding. Bare variables whose fitted dtype is
+/// string, categorical, or enum are encoded as `C(variable)`. The result is
+/// unfitted when it is not already among `transformed`.
+fn categorical_encoding(factor: &Arc<Factor>, transformed: &[FittedFactor]) -> Option<Arc<Factor>> {
+    match &factor.kind {
+        FactorKind::Call {
+            transform: Transform::C(_),
+            ..
+        } => Some(Arc::clone(factor)),
+        FactorKind::Variable(_) => {
+            let FactorKind::Variable(variable) = &lookup_factor(transformed, factor).factor.kind
+            else {
+                unreachable!("a variable fits to a variable");
+            };
+            let categorical = variable
+                .state()
+                .expect("variables are fitted before their terms")
+                .is_categorical();
+
+            categorical.then(|| {
+                Arc::new(Factor {
+                    kind: FactorKind::Call {
+                        transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+                        arguments: vec![Arc::clone(factor)],
+                    },
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Renames the indicator columns of `encoding` after the bare variable `name`.
+fn rename_categorical(
+    columns: MaterializedColumns<ComponentKey>,
+    encoding: &Factor,
+    name: &str,
+) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+    let FactorKind::Call {
+        transform: Transform::C(categorical),
+        ..
+    } = &encoding.kind
+    else {
+        unreachable!("categorical codings use C()");
+    };
+
+    let renamed = columns
+        .iter()
+        .map(|(column, key)| {
+            let ComponentKey::Scalar(level) = key else {
+                unreachable!("categorical columns are keyed by their level");
+            };
+            column
+                .clone()
+                .with_name(categorical.definition().column_name(name, level))
+        })
+        .collect();
+    let frame = DataFrame::new(columns.frame.height(), renamed)?;
+
+    Ok(MaterializedColumns::new(frame, columns.metadata))
 }
 
 #[derive(Clone, Debug)]
@@ -691,9 +805,14 @@ impl Formula {
             .expressions
             .iter()
             .map(|(&role, expression)| {
-                expression
-                    .assemble(height, terms)
-                    .map(|transformed| (role, transformed))
+                let transformed = expression.assemble(height, terms)?;
+                if role == Role::Dependent {
+                    // Bare non-numeric variables are categorical only as predictors.
+                    for term in transformed.terms() {
+                        term.reject_bare_categoricals()?;
+                    }
+                }
+                Ok((role, transformed))
             })
             .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
@@ -903,12 +1022,55 @@ struct FittedFactor {
 #[derive(Clone, Debug)]
 pub struct FittedTerm {
     term: Term,
+    // One fitted coding per factor of `term`, in the same order
+    codings: Vec<Coding>,
     columns: MaterializedColumns<ColumnMetadata>,
 }
 
 impl FittedTerm {
     pub fn factors(&self) -> impl Iterator<Item = &Factor> {
         self.term.factors()
+    }
+
+    /// The categorical factors of this term, as written and with their encoding.
+    ///
+    /// The encoding identifies the factor: bare `a` and `C(a)` both have `C(a)`.
+    pub(crate) fn categorical_factors(&self) -> impl Iterator<Item = (&Factor, &Factor)> {
+        self.term
+            .factors()
+            .zip(&self.codings)
+            .filter_map(|(factor, coding)| match coding {
+                Coding::Categorical(encoding) => Some((factor, encoding.as_ref())),
+                Coding::Direct => None,
+            })
+    }
+
+    /// The factors to transform to materialise this term.
+    fn materialized_factors(&self) -> impl Iterator<Item = &Arc<Factor>> {
+        self.term
+            .factors
+            .iter()
+            .zip(&self.codings)
+            .map(|(factor, coding)| match coding {
+                Coding::Categorical(encoding) => encoding,
+                Coding::Direct => factor,
+            })
+    }
+
+    /// Rejects bare variables coded as categorical, which only predictors allow.
+    fn reject_bare_categoricals(&self) -> Result<(), TransformError> {
+        for (factor, _) in self.categorical_factors() {
+            if let FactorKind::Variable(variable) = &factor.kind {
+                let state = variable
+                    .state()
+                    .expect("fitted terms hold fitted variables");
+                return Err(TransformError::NonNumericInput {
+                    name: variable.definition().name().into(),
+                    actual: state.dtype.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
@@ -1047,8 +1209,9 @@ fn literal_column(value: &Scalar, height: usize) -> Column {
 fn fit_and_transform_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
+    mut transformed: Vec<FittedFactor>,
 ) -> Result<Vec<FittedFactor>, ModelError> {
-    let mut transformed = Vec::with_capacity(scheduled.len());
+    transformed.reserve(scheduled.len());
 
     for factor in scheduled {
         let result = match &factor.kind {
@@ -1152,27 +1315,47 @@ fn transform_factors(
     Ok(transformed)
 }
 
-fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
-    fn schedule(factor: &Arc<Factor>, scheduled: &mut Vec<Arc<Factor>>) {
-        // Structural equality check if factor is already scheduled.
-        if scheduled.contains(factor) {
-            return;
-        }
-        // Traverse arguments of factor call recursively.
-        if let FactorKind::Call { arguments, .. } = &factor.kind {
-            for argument in arguments {
-                schedule(argument, scheduled);
-            }
-        }
-        // At this point, arguments have been scheduled before the parent factor.
-        scheduled.push(Arc::clone(factor));
+fn schedule_factor(factor: &Arc<Factor>, scheduled: &mut Vec<Arc<Factor>>) {
+    // Structural equality check if factor is already scheduled.
+    if scheduled.contains(factor) {
+        return;
     }
+    // Traverse arguments of factor call recursively.
+    if let FactorKind::Call { arguments, .. } = &factor.kind {
+        for argument in arguments {
+            schedule_factor(argument, scheduled);
+        }
+    }
+    // At this point, arguments have been scheduled before the parent factor.
+    scheduled.push(Arc::clone(factor));
+}
 
+fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
     let mut scheduled = Vec::new();
     for expression in expressions {
         for term in &expression.terms {
             for factor in &term.factors {
-                schedule(factor, &mut scheduled);
+                schedule_factor(factor, &mut scheduled);
+            }
+        }
+    }
+
+    scheduled
+}
+
+/// Schedules the categorical encodings of term factors that are not yet fitted.
+///
+/// Their arguments are term factors, so they are already fitted.
+fn schedule_encodings(expressions: &[&Expression], factors: &[FittedFactor]) -> Vec<Arc<Factor>> {
+    let mut scheduled = Vec::new();
+    for expression in expressions {
+        for term in &expression.terms {
+            for factor in &term.factors {
+                if let Some(encoding) = categorical_encoding(factor, factors)
+                    && !factors.iter().any(|entry| entry.factor == encoding)
+                {
+                    push_unique(&mut scheduled, encoding);
+                }
             }
         }
     }
@@ -1192,21 +1375,41 @@ fn assemble_terms(
             if transformed.iter().any(|entry| &entry.term == term) {
                 continue;
             }
-            let (term, columns) = term.assemble(height, factors)?;
-            transformed.push(FittedTerm { term, columns });
+            transformed.push(term.assemble(height, factors, term.codings(factors))?);
         }
     }
 
     Ok(transformed)
 }
 
+/// Materialises fitted terms on new data, reusing their fitted codings.
 pub(crate) fn transform_terms(
-    expressions: &[&Expression],
+    terms: &[&FittedTerm],
     data: &DataFrame,
 ) -> Result<Vec<FittedTerm>, ModelError> {
-    let scheduled = schedule_factors(expressions);
+    let mut scheduled = Vec::new();
+    for term in terms {
+        for factor in term.materialized_factors() {
+            schedule_factor(factor, &mut scheduled);
+        }
+    }
     let factors = transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors)?)
+
+    let mut transformed: Vec<FittedTerm> = Vec::new();
+    for term in terms {
+        if transformed
+            .iter()
+            .any(|entry| entry.term == term.term && entry.codings == term.codings)
+        {
+            continue;
+        }
+        transformed.push(
+            term.term
+                .assemble(data.height(), &factors, term.codings.clone())?,
+        );
+    }
+
+    Ok(transformed)
 }
 
 fn fit_and_transform_terms(
@@ -1214,7 +1417,10 @@ fn fit_and_transform_terms(
     data: &DataFrame,
 ) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
-    let factors = fit_and_transform_factors(&scheduled, data)?;
+    let factors = fit_and_transform_factors(&scheduled, data, Vec::new())?;
+    // Whether a bare variable is categorical depends on its fitted dtype.
+    let encodings = schedule_encodings(expressions, &factors);
+    let factors = fit_and_transform_factors(&encodings, data, factors)?;
     Ok(assemble_terms(expressions, data.height(), &factors)?)
 }
 
@@ -2068,7 +2274,7 @@ mod tests {
         let expression = expressions.first().unwrap();
         let scheduled = schedule_factors(&[expression]);
         let training = polars::df!("x" => [1.0, 2.0]).unwrap();
-        let fitted = fit_and_transform_factors(&scheduled, &training).unwrap();
+        let fitted = fit_and_transform_factors(&scheduled, &training, Vec::new()).unwrap();
         let fitted_factors = fitted
             .iter()
             .map(|entry| Arc::clone(&entry.factor))
@@ -2149,25 +2355,24 @@ mod tests {
     }
 
     #[test]
-    fn bare_nonnumeric_columns_are_rejected_before_interaction_casting() {
+    fn bare_boolean_and_dependent_string_columns_are_rejected_before_interaction_casting() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "x" => [2.0, 3.0, 4.0],
             "group" => ["a", "b", "a"],
-            "numeric_text" => ["2", "3", "2"],
             "flag" => [true, false, true],
         )
         .unwrap();
 
         for (source, column) in [
-            ("y ~ group", "group"),
             ("group ~ x", "group"),
-            ("y ~ numeric_text:x", "numeric_text"),
-            ("y ~ x:numeric_text", "numeric_text"),
+            ("group:x ~ x", "group"),
+            ("y ~ x + [group ~ x]", "group"),
             ("y ~ flag", "flag"),
             ("flag ~ x", "flag"),
             ("y ~ flag:x", "flag"),
             ("y ~ x:flag", "flag"),
+            ("y ~ group:flag", "flag"),
         ] {
             let specification = crate::parse(source).unwrap();
             let Err(ModelError::Transform(TransformError::NonNumericInput { name, actual })) =
@@ -2302,8 +2507,8 @@ mod tests {
             (
                 "C(flag)",
                 polars::df!(
-                    "C(flag)[True]" => [false, true, false],
                     "C(flag)[False]" => [true, false, true],
+                    "C(flag)[True]" => [false, true, false],
                 )
                 .unwrap(),
             ),
@@ -3470,6 +3675,321 @@ mod tests {
             let summed = inner.transform(&inputs).unwrap();
             let expected = outer.transform(&[summed.frame()[0].clone()]).unwrap();
             assert!(design.frame().equals_missing(expected.frame()));
+        }
+    }
+
+    mod bare_categoricals {
+        use super::*;
+        use crate::transform::TRANSFORM_CALLS;
+        use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+
+        fn training(dtype: &DataType) -> DataFrame {
+            DataFrame::new(
+                4,
+                vec![
+                    Column::new("y".into(), [1.0, 2.0, 3.0, 4.0]),
+                    Column::new("x".into(), [5.0, 6.0, 7.0, 8.0]),
+                    Column::new("a".into(), ["q", "p", "r", "p"])
+                        .cast(dtype)
+                        .unwrap(),
+                    Column::new("b".into(), ["v", "u", "u", "v"]),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn categorical_dtypes() -> [DataType; 3] {
+            [
+                DataType::String,
+                DataType::from_categories(Categories::random(
+                    "formula-tests".into(),
+                    CategoricalPhysical::U32,
+                )),
+                DataType::from_frozen_categories(FrozenCategories::new(["p", "q", "r"]).unwrap()),
+            ]
+        }
+
+        fn names(model: &FittedFormula, role: Role) -> Vec<String> {
+            model
+                .expression(role)
+                .unwrap()
+                .frame()
+                .get_column_names()
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        }
+
+        fn values(model: &FittedFormula, name: &str) -> Vec<Option<f64>> {
+            let frame = model.expression(Role::Independent).unwrap().frame();
+            let column = frame
+                .column(name)
+                .unwrap()
+                .cast(&DataType::Float64)
+                .unwrap();
+            column.f64().unwrap().iter().collect()
+        }
+
+        #[test]
+        fn string_categorical_and_enum_columns_encode_like_c() {
+            for dtype in categorical_dtypes() {
+                let data = training(&dtype);
+                let bare = fit("y ~ a", &data);
+                let explicit = fit("y ~ C(a)", &data);
+
+                assert_eq!(
+                    names(&bare, Role::Independent),
+                    ["Intercept", "a[p]", "a[q]", "a[r]"]
+                );
+                assert_eq!(
+                    names(&explicit, Role::Independent),
+                    ["Intercept", "C(a)[p]", "C(a)[q]", "C(a)[r]"]
+                );
+                for level in ["p", "q", "r"] {
+                    assert_eq!(
+                        values(&bare, &format!("a[{level}]")),
+                        values(&explicit, &format!("C(a)[{level}]")),
+                    );
+                }
+                assert_eq!(
+                    values(&bare, "a[p]"),
+                    [Some(0.0), Some(1.0), Some(0.0), Some(1.0)]
+                );
+                assert_eq!(
+                    names(&fit("y ~ a - 1", &data), Role::Independent),
+                    ["a[p]", "a[q]", "a[r]"]
+                );
+
+                // Columns are attributed to the factor as written, keyed by level.
+                let columns = bare.columns(Role::Independent).unwrap().collect::<Vec<_>>();
+                let contributions = columns[1].contributions().collect::<Vec<_>>();
+                let [(factor, ComponentKey::Scalar(level))] = contributions.as_slice() else {
+                    panic!("expected one keyed contribution");
+                };
+                assert_eq!(factor.name(), Some("a"));
+                assert_eq!(level.as_any_value().str_value(), "p");
+            }
+        }
+
+        #[test]
+        fn bare_and_explicit_categoricals_share_one_encoding() {
+            let data = training(&DataType::String);
+            let specification = crate::parse("y ~ a + C(a) + sw0(a:x)").unwrap();
+            TRANSFORM_CALLS.set((0, 0));
+            let models = specification.fit(&data).unwrap();
+            // C(a) is fitted and materialised once for every occurrence of `a`.
+            assert_eq!(TRANSFORM_CALLS.get(), (1, 1));
+            TRANSFORM_CALLS.set((0, 0));
+            models.transform(&data).unwrap();
+            assert_eq!(TRANSFORM_CALLS.get(), (0, 1));
+
+            let model = models.iter().nth(1).unwrap();
+            let identities = model
+                .terms(Role::Independent)
+                .unwrap()
+                .iter()
+                .map(|term| {
+                    term.categorical_factors()
+                        .map(|(factor, encoding)| (factor.render(), encoding.render()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let encoding = || "C(a)".to_owned();
+            assert_eq!(
+                identities,
+                [
+                    vec![],
+                    vec![("a".to_owned(), encoding())],
+                    vec![("C(a)".to_owned(), encoding())],
+                    vec![("a".to_owned(), encoding())],
+                ],
+            );
+            assert_eq!(
+                names(model, Role::Independent),
+                [
+                    "Intercept",
+                    "a[p]",
+                    "a[q]",
+                    "a[r]",
+                    "C(a)[p]",
+                    "C(a)[q]",
+                    "C(a)[r]",
+                    "a[p]:x",
+                    "a[q]:x",
+                    "a[r]:x",
+                ],
+            );
+        }
+
+        #[test]
+        fn interactions_encode_each_bare_categorical() {
+            let data = training(&DataType::String);
+            for (source, expected) in [
+                ("y ~ a:x - 1", vec!["a[p]:x", "a[q]:x", "a[r]:x"]),
+                ("y ~ x:a - 1", vec!["x:a[p]", "x:a[q]", "x:a[r]"]),
+                (
+                    "y ~ a*x - 1",
+                    vec!["a[p]", "a[q]", "a[r]", "x", "a[p]:x", "a[q]:x", "a[r]:x"],
+                ),
+                (
+                    "y ~ a:b - 1",
+                    vec![
+                        "a[p]:b[u]",
+                        "a[p]:b[v]",
+                        "a[q]:b[u]",
+                        "a[q]:b[v]",
+                        "a[r]:b[u]",
+                        "a[r]:b[v]",
+                    ],
+                ),
+                (
+                    "y ~ a:C(b) - 1",
+                    vec![
+                        "a[p]:C(b)[u]",
+                        "a[p]:C(b)[v]",
+                        "a[q]:C(b)[u]",
+                        "a[q]:C(b)[v]",
+                        "a[r]:C(b)[u]",
+                        "a[r]:C(b)[v]",
+                    ],
+                ),
+            ] {
+                let model = fit(source, &data);
+                assert_eq!(names(&model, Role::Independent), expected, "{source}");
+            }
+
+            let model = fit("y ~ a:x + a:b - 1", &data);
+            assert_eq!(
+                values(&model, "a[p]:x"),
+                [Some(0.0), Some(6.0), Some(0.0), Some(8.0)]
+            );
+            assert_eq!(
+                values(&model, "a[p]:b[v]"),
+                [Some(0.0), Some(0.0), Some(0.0), Some(1.0)]
+            );
+        }
+
+        #[test]
+        fn call_arguments_and_fixed_effects_receive_the_raw_column() {
+            let data = training(&DataType::String);
+            let model = fit("y ~ a + C(a, omit='p') + C(b):a | a", &data);
+            assert_eq!(
+                names(&model, Role::Independent),
+                [
+                    "a[p]",
+                    "a[q]",
+                    "a[r]",
+                    "C(a, omit='p')[q]",
+                    "C(a, omit='p')[r]",
+                    "C(b)[u]:a[p]",
+                    "C(b)[u]:a[q]",
+                    "C(b)[u]:a[r]",
+                    "C(b)[v]:a[p]",
+                    "C(b)[v]:a[q]",
+                    "C(b)[v]:a[r]",
+                ],
+            );
+            let fixed_effects = model.expression(Role::FixedEffect).unwrap().frame();
+            assert_eq!(fixed_effects.width(), 1);
+            assert_eq!(fixed_effects[0].dtype(), &DataType::UInt32);
+            assert_eq!(
+                fixed_effects[0].u32().unwrap().iter().collect::<Vec<_>>(),
+                [Some(0), Some(1), Some(2), Some(1)]
+            );
+
+            // An explicit C() on the dependent side shares the encoding with a bare predictor.
+            let model = fit("C(a) ~ a - 1", &data);
+            assert_eq!(
+                names(&model, Role::Dependent),
+                ["C(a)[p]", "C(a)[q]", "C(a)[r]"]
+            );
+            assert_eq!(names(&model, Role::Independent), ["a[p]", "a[q]", "a[r]"]);
+        }
+
+        #[test]
+        fn transformation_reuses_the_fitted_coding_and_levels() {
+            let model = fit("y ~ a + a:x - 1", &training(&DataType::String));
+            let input = polars::df!(
+                "y" => [1.0, 2.0, 3.0],
+                "x" => [1.0, 2.0, 3.0],
+                "a" => [Some("r"), Some("new"), None],
+            )
+            .unwrap();
+            let transformed = model.transform(&input).unwrap();
+            assert_eq!(
+                names(&transformed, Role::Independent),
+                names(&model, Role::Independent)
+            );
+            assert_eq!(values(&transformed, "a[r]"), [Some(1.0), None, None]);
+            assert_eq!(values(&transformed, "a[p]"), [Some(0.0), None, None]);
+            assert_eq!(values(&transformed, "a[r]:x"), [Some(1.0), None, None]);
+
+            // Changed dtypes fail exactly as they do for C().
+            let explicit = fit("y ~ C(a) + C(a):x - 1", &training(&DataType::String));
+            for dtype in [
+                DataType::Int64,
+                DataType::from_categories(Categories::random(
+                    "formula-tests".into(),
+                    CategoricalPhysical::U32,
+                )),
+            ] {
+                let mut input = input.clone();
+                let a = Column::new("a".into(), [1_i64, 2, 3])
+                    .cast(&DataType::String)
+                    .unwrap()
+                    .cast(&dtype)
+                    .unwrap();
+                input.replace("a", a).unwrap();
+                let bare = model.transform(&input).err().unwrap();
+                let explicit = explicit.transform(&input).err().unwrap();
+                assert!(matches!(
+                    bare,
+                    ModelError::Fit(crate::FitError::Transform(
+                        TransformError::InputTypeMismatch { .. }
+                    ))
+                ));
+                assert_eq!(bare.to_string(), explicit.to_string());
+            }
+
+            // Numeric at fit time stays numeric; strings at transform time do not recode it.
+            let numeric = polars::df!("y" => [1.0, 2.0], "a" => [1.0, 2.0]).unwrap();
+            let model = fit("y ~ a - 1", &numeric);
+            let strings = polars::df!("y" => [1.0, 2.0], "a" => ["p", "q"]).unwrap();
+            assert!(matches!(
+                model.transform(&strings),
+                Err(ModelError::Fit(crate::FitError::Transform(
+                    TransformError::InputTypeMismatch { .. }
+                )))
+            ));
+        }
+
+        #[test]
+        fn lookup_and_selection_use_the_bare_spelling() {
+            let data = training(&DataType::String);
+            let models = crate::parse("y ~ a + sw0(x)").unwrap().fit(&data).unwrap();
+            let model = models.get_by_str("y ~ a").unwrap().unwrap();
+            assert_eq!(
+                names(model, Role::Independent),
+                ["Intercept", "a[p]", "a[q]", "a[r]"]
+            );
+
+            let selected = models
+                .get_by_str("y ~ a + x")
+                .unwrap()
+                .unwrap()
+                .select_terms("a", Role::Independent)
+                .unwrap();
+            assert_eq!(
+                names(&selected, Role::Independent),
+                ["a[p]", "a[q]", "a[r]"]
+            );
+            let input = polars::df!("a" => ["r", "p"]).unwrap();
+            let transformed = selected.transform(&input).unwrap();
+            assert_eq!(values(&transformed, "a[r]"), [Some(1.0), Some(0.0)]);
+            assert!(matches!(
+                model.select_terms("C(a)", Role::Independent),
+                Err(SelectionError::MissingTerm(_))
+            ));
         }
     }
 }

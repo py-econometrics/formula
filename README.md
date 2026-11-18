@@ -178,6 +178,32 @@ expands to `y ~ x` and `y ~ z`, both with an intercept.
 Use backticks `` ` `` to escape column names containing spaces, punctuation or special
 characters, for example ``y ~ `household income` ``.
 
+### Categorical variables
+
+String, categorical, and enum columns used directly as predictors are encoded as if
+wrapped in `C()`: one indicator column per level, named after the column.
+
+```text
+y ~ state                     # state[CA], state[NY], state[TX]
+y ~ C(state)                  # C(state)[CA], C(state)[NY], C(state)[TX]
+y ~ C(state, omit='CA')  # C(state, omit='CA')[NY], C(state, omit='CA')[TX]
+y ~ state:x                   # state[CA]:x, state[NY]:x, state[TX]:x
+```
+
+Levels are sorted: numbers by value, strings and categoricals by label, and enums in
+category order. Every level is kept unless `omit=` specifies levels to omit, so `y ~ x + state`
+contains both an intercept and an indicator for every state.
+
+Whether a column is categorical is decided from its dtype when fitting. `transform()`
+reuses the fitted levels and requires the same dtype; unseen levels and nulls give
+null indicators. Only predictors written as a bare column are converted. Boolean
+columns are not converted (use `C(flag)`), a string response remains an error, and
+call arguments such as `C(state)` or the fixed effect in `| state` receive the
+original column.
+
+A numeric column read as strings, for example from a CSV file, therefore becomes a
+categorical predictor instead of raising an error. Cast such columns before fitting.
+
 ### Multistage formulas
 
 Square brackets attach child formulas to the containing expression. Using the
