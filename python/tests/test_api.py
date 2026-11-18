@@ -442,7 +442,10 @@ def fixed_effect(request):
 
 def test_fixed_effects_preserve_order_and_support_name_lookup(data):
     data = data.with_columns(polars.Series("year", [2020, 2021, 2020]))
-    model = formula.parse("y ~ x | firm + year[x]").fit(data)[0]
+    # Year-specific slopes on `x` span `x` itself, which so has no columns.
+    with pytest.warns(formula.RankDeficiencyWarning, match="term x is fully spanned"):
+        model = formula.parse("y ~ x | firm + year[x]").fit(data)[0]
+    assert model.select(formula.Role.Independent).frame().width == 0
     effects = model.fixed_effects
     assert len(effects) == 2
     assert [effect.encoding.levels.columns for effect in effects] == [

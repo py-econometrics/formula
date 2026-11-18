@@ -44,7 +44,7 @@ def test_bare_categorical_columns_are_attributed_to_the_bare_factor(data):
     terms = model.terms(Independent)
     assert [factor.name for factor in terms[1].factors] == ["a"]
     columns = model.columns(Independent)[1:]
-    for column, level in zip(columns, ["p", "q", "r"], strict=True):
+    for column, level in zip(columns, ["q", "r"], strict=True):
         (contribution,) = column.contributions
         assert contribution.factor.name == "a"
         assert contribution.factor.transform is None
@@ -100,7 +100,7 @@ def test_bare_booleans_and_dependent_strings_are_rejected(data, source, column):
         ("y ~ x:a - 1", ["x:a[p]", "x:a[q]", "x:a[r]"]),
         (
             "y ~ a*x - 1",
-            ["a[p]", "a[q]", "a[r]", "x", "a[p]:x", "a[q]:x", "a[r]:x"],
+            ["a[p]", "a[q]", "a[r]", "x", "a[T.q]:x", "a[T.r]:x"],
         ),
         (
             "y ~ a:b - 1",
@@ -123,13 +123,13 @@ def test_bare_categorical_interaction_values(data):
 
 
 def test_fixed_effects_and_call_arguments_use_the_raw_column(data):
-    model = formula.parse("y ~ a + C(a, omit='p') | a").fit(data)[0]
-    assert independent(model).columns == [
-        "a[p]",
-        "a[q]",
-        "a[r]",
-        "C(a, omit='p')[q]",
-        "C(a, omit='p')[r]",
+    # The fixed effect `a` spans both main effects of `a`, so they have no columns.
+    with pytest.warns(formula.RankDeficiencyWarning, match=r"terms a, C\(a"):
+        model = formula.parse("y ~ a + C(a, omit='p') | a").fit(data)[0]
+    assert independent(model).columns == []
+    assert [len(term.columns) for term in model.terms(formula.Role.Independent)] == [
+        0,
+        0,
     ]
     (fixed_effect,) = model.fixed_effects
     assert fixed_effect.codes.dtype == polars.UInt32
@@ -157,11 +157,11 @@ def test_transform_reuses_fitted_levels_and_coding(data):
 
 def test_lookup_and_selection_use_the_bare_spelling(data):
     fits = formula.parse("y ~ a + sw0(x)").fit(data)
-    assert independent(fits["y ~ a"]).columns == ["Intercept", "a[p]", "a[q]", "a[r]"]
+    assert independent(fits["y ~ a"]).columns == ["Intercept", "a[T.q]", "a[T.r]"]
 
     selected = fits["y ~ a + x"].select_terms("a", Independent)
-    assert selected.frame().columns == ["a[p]", "a[q]", "a[r]"]
+    assert selected.frame().columns == ["a[T.q]", "a[T.r]"]
     prediction = selected.transform(polars.DataFrame({"a": ["r", "p"]})).frame()
-    assert prediction["a[r]"].to_list() == [True, False]
+    assert prediction["a[T.r]"].to_list() == [True, False]
     with pytest.raises(KeyError, match=r"C\(a\)"):
         fits["y ~ a"].select_terms("C(a)", Independent)

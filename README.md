@@ -36,6 +36,7 @@ A `Formula` object can "materialize" data according to the instructions encoded 
 
 ```python
 fits = formulas.fit(data)  # Construct columns and learn transformation state
+# fits = formulas.fit(data, ensure_full_rank=False)  # Keep every categorical level
 fit = fits[0]  # Integer indexing follows expansion order
 same_fit = fits[fit.formula]  # Look up a fitted formula by its formula string
 ```
@@ -97,6 +98,12 @@ for term in categorical_terms.terms(role=formula.Role.Independent):
         for contribution in column.contributions:
             print(contribution.key, column.data)
 ```
+
+`column.term` lists every factor of the column's term, and `column.contributions`
+the factors the column includes, each with its key (such as a level). The two differ
+when full-rank coding leaves a factor out of a column: in `y ~ a:b`, the column
+`b[T.v]` belongs to the term `a:b` but has a contribution for `b` only. The intercept
+column has no contributions.
 
 ## Rust API
 
@@ -181,18 +188,64 @@ characters, for example ``y ~ `household income` ``.
 ### Categorical variables
 
 String, categorical, and enum columns used directly as predictors are encoded as if
-wrapped in `C()`: one indicator column per level, named after the column.
+wrapped in `C()`, with indicator columns named after the column.
+
+Structural coding for ordinary predictors follows the column space of Formulaic.
+An unrestricted categorical factor is
+either *reduced* (its reference level is dropped, and columns are named
+`[T.level]`) or *full* (one column per level, named `[level]`). Terms are considered
+from lowest to highest order, and each term adds only the columns that the
+intercept, fixed effects, and earlier terms do not already span. A term can
+therefore emit several groups of columns, some of which leave out one of its
+factors: with an intercept, `y ~ a:b` gives `b[T.v]` and `a[T.q]:b[u]`, `a[T.q]:b[v]`,
+`a[T.r]:b[u]`, `a[T.r]:b[v]`, all of which belong to the term `a:b`. Columns keep the
+order in which terms are written.
 
 ```text
-y ~ state                     # state[CA], state[NY], state[TX]
-y ~ C(state)                  # C(state)[CA], C(state)[NY], C(state)[TX]
-y ~ C(state, omit='CA')  # C(state, omit='CA')[NY], C(state, omit='CA')[TX]
-y ~ state:x                   # state[CA]:x, state[NY]:x, state[TX]:x
+y ~ state                       # Intercept, state[T.NY], state[T.TX]
+y ~ state - 1                   # state[CA], state[NY], state[TX]
+y ~ C(state)                    # Intercept, C(state)[T.NY], C(state)[T.TX]
+y ~ C(state, omit='NY')         # Intercept, C(state, omit='NY')[CA], C(state, omit='NY')[TX]
+y ~ C(state, omit='NY') - 1     # C(state, omit='NY')[CA], C(state, omit='NY')[TX]
+y ~ state:x                     # Intercept, state[CA]:x, state[NY]:x, state[TX]:x
+y ~ x + state:x                 # Intercept, x, state[T.NY]:x, state[T.TX]:x
+y ~ state*group                 # main effects and their interaction, all reduced
+y ~ state:group                 # Intercept, group[T.b], state[T.NY]:group[a], ...: two groups of columns
+y ~ state | firm                # state[T.NY], state[T.TX]: the fixed effect spans the constant
+y ~ state:C(firm) | firm        # state[T.NY]:C(firm)[firm_a], ...: state reduced within each firm
 ```
 
-Levels are sorted: numbers by value, strings and categoricals by label, and enums in
-category order. Every level is kept unless `omit=` specifies levels to omit, so `y ~ x + state`
-contains both an intercept and an indicator for every state.
+Observed levels are sorted by numeric value, string or categorical label, or enum
+declaration order. Automatic reduction drops the first fitted level. Use
+`omit=` with a scalar or list to exclude specific levels in any coding mode,
+including for an explicit categorical response. Structural coding accounts for the
+space spanned by the retained levels. Known omitted levels give zeros in retained
+indicators. The coding is decided once per term in each formula when fitting, so
+`y ~ C(a)` and `y ~ C(a) - 1` fitted together can code the same term differently.
+`transform()` and `select_terms()` keep the fitted coding.
+
+A bare categorical predictor and `C()` on the same input share a level space. The
+structural coding of `a:C(a)` uses the first written factor to name its indicators
+and records both factors in the term. Repeated factors with explicit omissions keep
+only the levels retained by every occurrence. A numeric slope `x` and `C(x)` have
+distinct structural identities. Numerical redundancy between their columns is
+left to the estimator.
+
+A fixed-effect group intercept spans the constant and functions of its grouping
+inputs. A loading spans its numeric slope within and across groups, so
+`| firm[[x]]` can absorb `x`, and `| x` can absorb both `x` and `C(x)`.
+
+A term that is already spanned entirely has no columns, for example `C(state)` in
+`y ~ state + C(state)`, `C(firm)` in `y ~ C(firm) | firm`, or `x` in
+`y ~ x | firm[[x]]`. The term is kept, so `select_terms()` still finds it, and fitting
+emits a `formula.RankDeficiencyWarning` naming the formula and terms (in Rust,
+`FittedFormula::rank_deficiencies()`). Redundancy that depends on the data, such as
+`x + mul(2, x)` or empty interaction cells, is not detected.
+
+To disable structural coding, fit with `ensure_full_rank=False`
+(`FitOptions { ensure_full_rank: false }` with `Formulas::fit_with_options` in Rust).
+Each term emits the Cartesian product of its factors' columns, subject to explicit
+omissions. This mode emits no rank deficiency warnings.
 
 Whether a column is categorical is decided from its dtype when fitting. `transform()`
 reuses the fitted levels and requires the same dtype; unseen levels and nulls give
@@ -254,7 +307,7 @@ or `transform()`:
 |------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
 | `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.     |
 | `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                           |
-| `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`; the optional `omit` argument specifies the levels to omit. |
+| `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`, optionally excluding the levels specified by `omit`. |
 | `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
 
 Numeric arguments are supported inside transformation calls:
