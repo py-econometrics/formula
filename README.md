@@ -228,6 +228,8 @@ or `transform()`:
 |------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
 | `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.     |
 | `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                           |
+| `pow(x, k)`                                                                   | Raise a numeric column to the power `k`, a scalar or another column.                                          |
+| `center(x)`<br>`scale(x)`                                                    | Subtract the fitted mean of `x`, and for `scale` divide by its fitted sample standard deviation. `transform()` reuses both. |
 | `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`; the optional `omit` argument specifies the levels to omit. |
 | `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
 
