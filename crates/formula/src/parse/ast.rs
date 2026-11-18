@@ -105,6 +105,13 @@ pub(super) enum ExpressionAst<L: Layer> {
     Interact(<L::Operators as Operations>::Interaction, Binary<Self>),
     InteractFully(<L::Operators as Operations>::FullInteraction, Binary<Self>),
     Nesting(<L::Operators as Operations>::Nesting, Binary<Self>),
+    /// `(a + b)^n`: the full interaction of `n` copies, so every interaction of
+    /// up to `n` distinct factors. Permitted wherever `*` is.
+    Power(
+        <L::Operators as Operations>::FullInteraction,
+        Box<Self>,
+        u32,
+    ),
 
     Parenthesized(Box<Self>),
     /// A stepwise call over a nonempty sequence of arguments.
@@ -115,6 +122,7 @@ pub(super) enum ExpressionAst<L: Layer> {
 pub(super) trait Compose: Sized {
     fn parenthesized(self) -> Self;
     fn negate(self) -> Result<Self, Self>;
+    fn power(self, exponent: u32) -> Result<Self, Self>;
     fn binary(operator: BinaryOperator, left: Self, right: Self) -> Result<Self, (Self, Self)>;
     fn stepwise(
         operator: StepwiseOperator,
@@ -128,6 +136,9 @@ impl Compose for Forbidden {
         match self {}
     }
     fn negate(self) -> Result<Self, Self> {
+        match self {}
+    }
+    fn power(self, _: u32) -> Result<Self, Self> {
         match self {}
     }
     fn binary(_: BinaryOperator, left: Self, _: Self) -> Result<Self, (Self, Self)> {
@@ -308,6 +319,20 @@ impl<L: Layer> Compose for ExpressionAst<L> {
             Err(outer) => outer,
         };
         permitted(Box::new(operand), Self::Negate).map_err(|operand| *operand)
+    }
+
+    fn power(self, exponent: u32) -> Result<Self, Self> {
+        let base = match self.into_inner() {
+            Ok(inner) => match inner.power(exponent) {
+                Ok(inner) => return Ok(Self::embed(inner)),
+                Err(inner) => Self::embed(inner),
+            },
+            Err(outer) => outer,
+        };
+        permitted(Box::new(base), |permission, base| {
+            Self::Power(permission, base, exponent)
+        })
+        .map_err(|base| *base)
     }
 
     fn binary(operator: BinaryOperator, left: Self, right: Self) -> Result<Self, (Self, Self)> {
