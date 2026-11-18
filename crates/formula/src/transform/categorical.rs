@@ -5,8 +5,8 @@ use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar, col,
-    lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar,
+    SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -31,8 +31,12 @@ impl CategoricalDefinition {
     }
 
     fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
-        let call = self.call_name(&[input_name]);
-        format!("{call}[{}]", Self::level_name(level)).into()
+        self.column_name(&self.call_name(&[input_name]), level)
+    }
+
+    /// Names the indicator column of `level` after `prefix`, such as `C(a)` or a bare `a`.
+    pub(crate) fn column_name(&self, prefix: &str, level: &Scalar) -> PlSmallStr {
+        format!("{prefix}[{}]", Self::level_name(level)).into()
     }
 
     fn level_name(level: &Scalar) -> String {
@@ -177,13 +181,16 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 
     fn fit(&self, inputs: &PreparedInput) -> Result<CategoricalState, TransformError> {
         let (_, input) = inputs.single()?;
-        let levels = input.drop_nulls().unique_stable()?;
+        let levels = input.drop_nulls().unique()?;
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
             levels.filter(&levels.is_finite()?)?
         } else {
             levels
         };
+        // Sort for a deterministic order: numbers by value, strings and categoricals
+        // by label, and enums by category order.
+        let levels = levels.sort(SortOptions::default())?;
 
         let references: &[Scalar] = match &self.reference {
             None => &[],
@@ -316,26 +323,92 @@ mod tests {
     }
 
     #[test]
-    fn native_levels_preserve_observed_order_and_label_names() -> Result<(), TransformError> {
+    fn native_levels_are_sorted_and_keep_label_names() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
             let training = [Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?];
             let prepared_training = prepare(&training);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared_training)?;
             let output = fitted.transform(&prepared_training)?;
 
-            assert_eq!(output.frame().get_column_names(), ["C(x)[d]", "C(x)[b]"]);
+            assert_eq!(output.frame().get_column_names(), ["C(x)[b]", "C(x)[d]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &training,
                 output.frame(),
                 &[
-                    &[Some(true), Some(false), Some(true)],
                     &[Some(false), Some(true), Some(false)],
+                    &[Some(true), Some(false), Some(true)],
                 ],
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn levels_sort_by_value_label_or_enum_category_order() -> Result<(), TransformError> {
+        let categorical = DataType::from_categories(Categories::random(
+            "formula-tests".into(),
+            CategoricalPhysical::U32,
+        ));
+        // Dictionary order differs from label order.
+        for label in ["b", "c", "a"] {
+            categorical
+                .cat_mapping()
+                .unwrap()
+                .insert_cat(label)
+                .unwrap();
+        }
+        let enumeration =
+            DataType::from_frozen_categories(FrozenCategories::new(["c", "a", "b"]).unwrap());
+        let labels = Column::new("x".into(), ["b", "a", "c", "a"]);
+
+        for (input, expected) in [
+            (
+                Column::new("x".into(), [10_i64, 9, 2, 9]),
+                ["C(x)[2]", "C(x)[9]", "C(x)[10]"],
+            ),
+            (
+                Column::new("x".into(), [10.5_f64, 9.0, 2.0]),
+                ["C(x)[2.0]", "C(x)[9.0]", "C(x)[10.5]"],
+            ),
+            (
+                Column::new("x".into(), ["b", "B", "a"]),
+                ["C(x)[B]", "C(x)[a]", "C(x)[b]"],
+            ),
+            (labels.clone(), ["C(x)[a]", "C(x)[b]", "C(x)[c]"]),
+            (
+                labels.cast(&categorical)?,
+                ["C(x)[a]", "C(x)[b]", "C(x)[c]"],
+            ),
+            (
+                labels.cast(&enumeration)?,
+                ["C(x)[c]", "C(x)[a]", "C(x)[b]"],
+            ),
+        ] {
+            let prepared = prepare(&[input]);
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared)?;
+            assert_eq!(
+                fitted.transform(&prepared)?.frame().get_column_names(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn column_names_follow_level_with_any_prefix() {
+        let level = Scalar::from(PlSmallStr::from_static("q"));
+        let reference = Scalar::from(PlSmallStr::from_static("p"));
+        assert_eq!(
+            CategoricalDefinition::new(None).column_name("a", &level),
+            "a[q]"
+        );
+        assert_eq!(
+            CategoricalDefinition::new(Some(ParameterValue::Scalar(reference)))
+                .column_name("a", &level),
+            "a[q]"
+        );
     }
 
     #[test]
@@ -355,8 +428,8 @@ mod tests {
                 &input,
                 fitted.transform(&prepared_input)?.frame(),
                 &[
-                    &[Some(false), None, None, Some(true), None],
                     &[Some(true), None, None, Some(false), None],
+                    &[Some(false), None, None, Some(true), None],
                 ],
             );
         }
@@ -448,7 +521,7 @@ mod tests {
                 &fitted.state,
                 &input,
                 output.frame(),
-                &[&[None, Some(false), None], &[None, Some(true), None]],
+                &[&[None, Some(true), None], &[None, Some(false), None]],
             );
             assert!(
                 fitted
@@ -591,7 +664,7 @@ mod tests {
             let levels = state.levels.cast(&DataType::Float64)?;
             assert_eq!(
                 levels.f64()?.iter().collect::<Vec<_>>(),
-                vec![Some(2.0), Some(1.0)]
+                vec![Some(1.0), Some(2.0)]
             );
             assert_eq!(state.levels.dtype(), &dtype);
             assert_output(
@@ -600,8 +673,8 @@ mod tests {
                 &inputs,
                 definition.transform(&state, &prepared_inputs)?.frame(),
                 &[
-                    &[Some(true), None, None, Some(false), None, Some(true), None],
                     &[Some(false), None, None, Some(true), None, Some(false), None],
+                    &[Some(true), None, None, Some(false), None, Some(true), None],
                 ],
             );
         }
@@ -754,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn categorical_preserves_fitted_order_and_schema() -> Result<(), TransformError> {
+    fn categorical_sorts_levels_and_preserves_fitted_schema() -> Result<(), TransformError> {
         // Exercise small sets and both sides of the eight-level lookup boundary.
         let levels = ["b", "a", "c", "d", "e", "f", "g", "h", "i"];
         for count in [3, 8, 9] {
@@ -771,8 +844,8 @@ mod tests {
             let fitted = Fitted::fit(definition, &training)?;
             let output = fitted.transform(&prepared_input)?;
             let mut expected = vec![
-                [Some(false), Some(true), None, None],
                 [Some(true), Some(false), None, None],
+                [Some(false), Some(true), None, None],
             ];
             expected.extend((2..count).map(|_| [Some(false), Some(false), None, None]));
             let expected = expected
@@ -786,7 +859,9 @@ mod tests {
                 output.frame(),
                 &expected,
             );
-            let names = levels[..count]
+            let mut sorted = levels[..count].to_vec();
+            sorted.sort_unstable();
+            let names = sorted
                 .iter()
                 .map(|level| format!("C(group)[{level}]"))
                 .collect::<Vec<_>>();
