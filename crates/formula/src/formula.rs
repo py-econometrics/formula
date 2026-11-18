@@ -804,35 +804,33 @@ impl Formula {
         let expressions = self
             .expressions
             .iter()
-            .map(|(&role, expression)| {
-                let transformed = expression.assemble(height, terms)?;
-                if role == Role::Dependent {
-                    // Bare non-numeric variables are categorical only as predictors.
-                    for term in transformed.terms() {
-                        term.reject_bare_categoricals()?;
-                    }
-                }
-                Ok((role, transformed))
-            })
+            .map(|(&role, expression)| Ok((role, expression.assemble(height, terms)?)))
             .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
         Ok(FittedFormula::new(self.clone(), expressions, height))
     }
 
-    fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
-        for expression in self.expressions.values() {
+    fn collect_fit_expressions<'a>(
+        &'a self,
+        data: &DataFrame,
+        output: &mut Vec<&'a Expression>,
+    ) -> Result<(), TransformError> {
+        for (&role, expression) in &self.expressions {
+            if role == Role::Dependent {
+                // Only bare predictors can acquire an implicit categorical encoding.
+                for factor in expression.terms.iter().flat_map(Term::factors) {
+                    if let FactorKind::Variable(variable) = &factor.kind {
+                        let column = data.column(variable.definition().name())?;
+                        validate_numeric_field(&column.field())?;
+                    }
+                }
+            }
             output.push(expression);
-
             for child in &expression.children {
-                child.collect_expressions(output);
+                child.collect_fit_expressions(data, output)?;
             }
         }
-    }
-
-    fn all_expressions(&self) -> Vec<&Expression> {
-        let mut expressions = Vec::new();
-        self.collect_expressions(&mut expressions);
-        expressions
+        Ok(())
     }
 }
 
@@ -899,14 +897,11 @@ impl Formulas {
     }
 
     pub fn fit(&self, data: &DataFrame) -> Result<FittedFormulas, ModelError> {
+        let mut expressions = Vec::new();
         for formula in &self.formulas {
             formula.validate()?;
+            formula.collect_fit_expressions(data, &mut expressions)?;
         }
-        let expressions = self
-            .formulas
-            .iter()
-            .flat_map(Formula::all_expressions)
-            .collect::<Vec<_>>();
 
         // Fit factors and assemble terms once across every formula
         let terms = fit_and_transform_terms(&expressions, data)?;
@@ -1035,7 +1030,8 @@ impl FittedTerm {
     /// The categorical factors of this term, as written and with their encoding.
     ///
     /// The encoding identifies the factor: bare `a` and `C(a)` both have `C(a)`.
-    pub(crate) fn categorical_factors(&self) -> impl Iterator<Item = (&Factor, &Factor)> {
+    #[cfg(test)]
+    fn categorical_factors(&self) -> impl Iterator<Item = (&Factor, &Factor)> {
         self.term
             .factors()
             .zip(&self.codings)
@@ -1055,22 +1051,6 @@ impl FittedTerm {
                 Coding::Categorical(encoding) => encoding,
                 Coding::Direct => factor,
             })
-    }
-
-    /// Rejects bare variables coded as categorical, which only predictors allow.
-    fn reject_bare_categoricals(&self) -> Result<(), TransformError> {
-        for (factor, _) in self.categorical_factors() {
-            if let FactorKind::Variable(variable) = &factor.kind {
-                let state = variable
-                    .state()
-                    .expect("fitted terms hold fitted variables");
-                return Err(TransformError::NonNumericInput {
-                    name: variable.definition().name().into(),
-                    actual: state.dtype.to_string(),
-                });
-            }
-        }
-        Ok(())
     }
 
     pub fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
@@ -2356,6 +2336,8 @@ mod tests {
 
     #[test]
     fn bare_boolean_and_dependent_string_columns_are_rejected_before_interaction_casting() {
+        use crate::transform::TRANSFORM_CALLS;
+
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "x" => [2.0, 3.0, 4.0],
@@ -2375,12 +2357,16 @@ mod tests {
             ("y ~ group:flag", "flag"),
         ] {
             let specification = crate::parse(source).unwrap();
+            TRANSFORM_CALLS.set((0, 0));
             let Err(ModelError::Transform(TransformError::NonNumericInput { name, actual })) =
                 specification.fit(&data)
             else {
                 panic!("expected NonNumericInput for `{source}`");
             };
 
+            if column == "group" {
+                assert_eq!(TRANSFORM_CALLS.get(), (0, 0), "{source}");
+            }
             assert_eq!(name.as_str(), column);
             assert_eq!(actual, data.column(column).unwrap().dtype().to_string());
         }
