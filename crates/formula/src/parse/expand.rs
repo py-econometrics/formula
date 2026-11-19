@@ -204,6 +204,15 @@ where
                 |left, right| left.nest(right),
             ),
 
+            Self::Power(_, power) => power
+                .0
+                .expand()
+                .into_iter()
+                .map(|base| {
+                    (1..power.1).fold(base.clone(), |power, _| power.interact_fully(base.clone()))
+                })
+                .collect(),
+
             Self::Parenthesized(expression) => expression.expand(),
 
             Self::Stepwise(_, call) => call.operator.expand(

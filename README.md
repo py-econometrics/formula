@@ -168,14 +168,15 @@ is included by default; use `-1` or `0` to omit it. Adding `1` or subtracting `0
 restores a removed intercept.
 
 ```text
-y ~ x + z       # response y, predictors x and z, with an intercept
-y ~ x:z         # interaction between x and z
-y ~ x*z         # equivalent to x + z + x:z
-y ~ x/z         # equivalent to x + x:z
-y ~ log(x) - 1  # transform x and omit the intercept
-y ~ 0 + x       # omit the intercept
-y ~ x - 1 - 0   # restore the intercept
-y ~ (0 + x)     # retain the outer default intercept
+y ~ x + z          # response y, predictors x and z, with an intercept
+y ~ x:z            # interaction between x and z
+y ~ x*z            # equivalent to x + z + x:z
+y ~ x/z            # equivalent to x + x:z
+y ~ (x + z + w)^2  # main effects and every two-way interaction
+y ~ log(x) - 1     # transform x and omit the intercept
+y ~ 0 + x          # omit the intercept
+y ~ x - 1 - 0      # restore the intercept
+y ~ (0 + x)        # retain the outer default intercept
 ```
 
 Parentheses and stepwise arguments are evaluated locally. For example,

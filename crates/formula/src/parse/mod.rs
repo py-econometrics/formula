@@ -31,6 +31,7 @@ const SUM_PRECEDENCE: i64 = 10;
 const PRODUCT_PRECEDENCE: i64 = 20;
 const GROUPED_PRECEDENCE: i64 = 25;
 const INTERACTION_PRECEDENCE: i64 = 30;
+const POWER_PRECEDENCE: i64 = 35;
 const PREFIX_PRECEDENCE: i64 = 40;
 
 #[derive(Debug)]
@@ -402,6 +403,15 @@ fn parse_node<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::Parse
             })),
         )))
         .postfix(alt((
+            '^'.value(Postfix(
+                POWER_PRECEDENCE,
+                |cursor, base: ast::ParsedNode<K>| {
+                    let exponent =
+                        cut_err(preceded(multispace0, parse_exponent)).parse_next(cursor)?;
+                    multispace0.parse_next(cursor)?;
+                    construction_result(cursor, base.power(exponent))
+                },
+            )),
             "[[".value(Postfix(
                 GROUPED_PRECEDENCE,
                 |cursor, group: ast::ParsedNode<K>| {
@@ -418,6 +428,17 @@ fn parse_node<K: ast::ParseGrammar>(cursor: &mut &str) -> ModalResult<ast::Parse
                     construction_result(cursor, group.grouped(true, first, rest))
                 },
             )),
+        )))
+        .parse_next(cursor)
+}
+
+/// A positive integer exponent of `^`.
+fn parse_exponent(cursor: &mut &str) -> ModalResult<u32> {
+    take_while(1.., |c: char| c.is_ascii_digit())
+        .try_map(str::parse::<u32>)
+        .verify(|exponent| *exponent >= 1)
+        .context(StrContext::Expected(StrContextValue::Description(
+            "a positive integer exponent",
         )))
         .parse_next(cursor)
 }
@@ -756,6 +777,40 @@ mod tests {
         );
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn powers_expand_to_interactions_up_to_their_degree() {
+        for (source, expected) in [
+            ("y ~ (a + b)^2", "y ~ a + b + a:b"),
+            ("y ~ (a + b + c)^2", "y ~ a + b + c + a:b + a:c + b:c"),
+            (
+                "y ~ (a + b + c)^3",
+                "y ~ (a + b + c)*(a + b + c)*(a + b + c)",
+            ),
+            ("y ~ (a + b)^1", "y ~ a + b"),
+            ("y ~ (a + b) ^ 2 + x", "y ~ a + b + a:b + x"),
+            ("y ~ a^2", "y ~ a"),
+            // `^` binds more tightly than `:` and `*`.
+            ("y ~ x:(a + b)^2", "y ~ x:a + x:b + x:a:b"),
+            ("y ~ x*(a + b)^2", "y ~ x*(a + b + a:b)"),
+            ("y ~ (a + b)^2 - a:b", "y ~ a + b"),
+            ("y ~ sw(a, b)^2", "y ~ sw(a, b)"),
+            ("y ~ 0 + (a + b)^2", "y ~ 0 + a + b + a:b"),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(expected).unwrap(), "{source}");
+        }
+        for source in [
+            "y ~ (a + b)^0",
+            "y ~ (a + b)^x",
+            "y ~ (a + b)^-1",
+            "y ~ (a + b)^2.5",
+            "y ~ (a + b)^",
+            "y ~ x | (f + g)^2",
+            "y ~ (x + [z ~ w])^2",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
         }
     }
 

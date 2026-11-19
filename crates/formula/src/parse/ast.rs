@@ -146,6 +146,9 @@ pub(super) enum ExpressionAst<K: ExpressionKind> {
     Interact(K::Interaction, Binary<Self>),
     InteractFully(K::FullInteraction, Binary<Self>),
     Nesting(K::Nesting, Binary<Self>),
+    /// `(a + b)^n`: the full interaction of `n` copies, so every interaction of
+    /// up to `n` distinct factors. Permitted wherever `*` is.
+    Power(K::FullInteraction, Box<(Self, u32)>),
 
     Parenthesized(Box<Self>),
     Stepwise(K::Stepwise, Box<Stepwise<Self>>),
@@ -361,6 +364,20 @@ impl<K: ParseGrammar> ParsedNode<K> {
                 permitted(Box::new(expression), ExpressionAst::<K::Embedded>::Negate)
                     .map(Self::Embedded)
             }
+        }
+    }
+
+    pub(super) fn power(self, exponent: u32) -> Result<Self, ConstructionError> {
+        match self {
+            Self::Flat(expression) => {
+                permitted(Box::new((expression, exponent)), ExpressionAst::<K>::Power)
+                    .map(Self::Flat)
+            }
+            Self::Embedded(expression) => permitted(
+                Box::new((expression, exponent)),
+                ExpressionAst::<K::Embedded>::Power,
+            )
+            .map(Self::Embedded),
         }
     }
 
