@@ -725,7 +725,20 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::I(Box::new(definition))
             }
             "poly" => {
-                let degree = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
+                let mut degree = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
+                // `poly(x, 2)`: a literal second argument is the degree, as in R.
+                if let [_, second] = arguments.as_slice()
+                    && let Some(value) = second.value()
+                {
+                    if degree.is_some() {
+                        return Err(TransformCallError::InvalidParameter {
+                            transform: "poly",
+                            message: "the degree is given both by position and as `degree`".into(),
+                        });
+                    }
+                    degree = Some(ParameterValue::Scalar(value.clone()));
+                    arguments.pop();
+                }
                 let raw = keywords.remove(PolynomialDefinition::RAW_PARAMETER);
                 reject_keywords("poly", keywords)?;
 
@@ -789,6 +802,39 @@ mod tests {
         );
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn polynomial_degree_may_be_positional() {
+        for (source, expected) in [
+            ("y ~ poly(x, 2)", "y ~ poly(x, degree=2)"),
+            (
+                "y ~ poly(x, 3, raw=true)",
+                "y ~ poly(x, degree=3, raw=true)",
+            ),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(expected).unwrap(), "{source}");
+        }
+        for (source, message) in [
+            (
+                "y ~ poly(x, 2, degree=2)",
+                "both by position and as `degree`",
+            ),
+            ("y ~ poly(x, 2.5)", "`degree` must be a positive integer"),
+            ("y ~ poly(x, z)", "expected exactly 1"),
+        ] {
+            let error = match parse(source) {
+                Err(error) => error.to_string(),
+                Ok(formulas) => formulas
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .validate()
+                    .unwrap_err()
+                    .to_string(),
+            };
+            assert!(error.contains(message), "{source}: {error}");
         }
     }
 
