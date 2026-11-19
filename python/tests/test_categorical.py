@@ -80,15 +80,36 @@ def test_categorical_levels_sort_categoricals_by_label_and_enums_by_category():
 
 
 @pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("y ~ flag - 1", {"flag": "flag"}),
+        ("y ~ flag:x - 1", {"flag:x": "flag * x"}),
+        ("flag ~ x", None),
+    ],
+)
+def test_bare_booleans_are_numeric_zero_one(data, source, expected):
+    model = formula.parse(source).fit(data)[0]
+    flag = data["flag"].cast(polars.Float64)
+    if expected is None:
+        actual = model.select(formula.Role.Dependent).frame()
+        assert actual.to_series().to_list() == flag.to_list()
+        return
+    for name, expression in expected.items():
+        values = flag * data["x"] if "x" in expression else flag
+        assert independent(model)[name].to_list() == values.to_list()
+    # C() still treats a boolean as categorical.
+    columns = independent(formula.parse("y ~ C(flag)").fit(data)[0]).columns
+    assert columns == ["Intercept", "C(flag)[T.True]"]
+
+
+@pytest.mark.parametrize(
     ("source", "column"),
     [
-        ("y ~ flag", "flag"),
-        ("y ~ flag:x", "flag"),
         ("a ~ x", "a"),
         ("y ~ x + [a ~ x]", "a"),
     ],
 )
-def test_bare_booleans_and_dependent_strings_are_rejected(data, source, column):
+def test_dependent_strings_are_rejected(data, source, column):
     with pytest.raises(ValueError, match=f"column `{column}`: expected a primitive"):
         formula.parse(source).fit(data)
 

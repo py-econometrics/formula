@@ -553,7 +553,7 @@ impl Term {
                 let [column] = result.columns.frame.columns() else {
                     unreachable!("a variable transforms to exactly one column");
                 };
-                validate_numeric_field(&column.field())?;
+                validate_direct_field(&column.field())?;
             }
             factors.push(Arc::clone(&result.factor));
         }
@@ -571,7 +571,7 @@ impl Term {
                     Encoding::Categorical(encoding) => {
                         code_categorical(input, encoding, scope, transformed)
                     }
-                    Encoding::Direct => Ok(lookup_factor(transformed, input).columns.clone()),
+                    Encoding::Direct => Ok(direct_columns(input, transformed)?),
                     Encoding::Interaction(_) => unreachable!("axes are not interactions"),
                 };
                 let Encoding::Interaction(axes) = encoding else {
@@ -854,6 +854,30 @@ fn interaction_axes(
         axes.push(axis);
     }
     Some(axes)
+}
+
+/// A bare column used directly must be numeric or boolean.
+fn validate_direct_field(field: &polars::prelude::Field) -> Result<(), TransformError> {
+    if *field.dtype() == DataType::Boolean {
+        return Ok(());
+    }
+    validate_numeric_field(field)
+}
+
+/// The columns of a factor used directly. A bare boolean column is coded 0/1.
+fn direct_columns(
+    factor: &Arc<Factor>,
+    transformed: &[FittedFactor],
+) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+    let columns = lookup_factor(transformed, factor).columns.clone();
+    let boolean = matches!(factor.kind, FactorKind::Variable(_))
+        && columns.frame().columns()[0].dtype() == &DataType::Boolean;
+    if !boolean {
+        return Ok(columns);
+    }
+    let (frame, metadata) = columns.into_parts();
+    let column = frame.columns()[0].cast(&DataType::Float64)?;
+    Ok(MaterializedColumns::new(column.into_frame(), metadata))
 }
 
 /// Codes the indicator columns of `encoding` for `factor` as written in a term.
@@ -1183,7 +1207,7 @@ impl Formula {
                 for factor in expression.terms.iter().flat_map(Term::factors) {
                     if let FactorKind::Variable(variable) = &factor.kind {
                         let column = data.column(variable.definition().name())?;
-                        validate_numeric_field(&column.field())?;
+                        validate_direct_field(&column.field())?;
                     }
                 }
             }
@@ -2827,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_boolean_and_dependent_string_columns_are_rejected_before_interaction_casting() {
+    fn dependent_string_columns_are_rejected_before_interaction_casting() {
         use crate::transform::TRANSFORM_CALLS;
 
         let data = polars::df!(
@@ -2842,11 +2866,6 @@ mod tests {
             ("group ~ x", "group"),
             ("group:x ~ x", "group"),
             ("y ~ x + [group ~ x]", "group"),
-            ("y ~ flag", "flag"),
-            ("flag ~ x", "flag"),
-            ("y ~ flag:x", "flag"),
-            ("y ~ x:flag", "flag"),
-            ("y ~ group:flag", "flag"),
         ] {
             let specification = crate::parse(source).unwrap();
             TRANSFORM_CALLS.set((0, 0));
@@ -2861,6 +2880,51 @@ mod tests {
             }
             assert_eq!(name.as_str(), column);
             assert_eq!(actual, data.column(column).unwrap().dtype().to_string());
+        }
+    }
+
+    #[test]
+    fn bare_boolean_columns_are_coded_zero_one() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0],
+            "x" => [2.0, 3.0, 4.0],
+            "group" => ["a", "b", "a"],
+            "flag" => [true, false, true],
+        )
+        .unwrap();
+        let ones = [1.0, 0.0, 1.0];
+        for (source, role, name, expected) in [
+            ("y ~ flag - 1", Role::Independent, "flag", ones.to_vec()),
+            ("flag ~ x", Role::Dependent, "flag", ones.to_vec()),
+            (
+                "y ~ flag:x - 1",
+                Role::Independent,
+                "flag:x",
+                vec![2.0, 0.0, 4.0],
+            ),
+            (
+                "y ~ x:flag - 1",
+                Role::Independent,
+                "x:flag",
+                vec![2.0, 0.0, 4.0],
+            ),
+            (
+                "y ~ group:flag - 1",
+                Role::Independent,
+                "group[a]:flag",
+                ones.to_vec(),
+            ),
+        ] {
+            let model = fit(source, &data);
+            let frame = model.expression(role).unwrap().frame();
+            let column = frame.column(name).unwrap();
+            assert_eq!(column.dtype(), &DataType::Float64, "{source}");
+            let values = column
+                .f64()
+                .unwrap()
+                .into_no_null_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(values, expected, "{source}");
         }
     }
 

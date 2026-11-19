@@ -251,10 +251,10 @@ omissions. This mode emits no rank deficiency warnings.
 
 Whether a column is categorical is decided from its dtype when fitting. `transform()`
 reuses the fitted levels and requires the same dtype; unseen levels and nulls give
-null indicators. Only predictors written as a bare column are converted. Boolean
-columns are not converted (use `C(flag)`), a string response remains an error, and
-call arguments such as `C(state)` or the fixed effect in `| state` receive the
-original column.
+null indicators. Only predictors written as a bare column are converted. A bare
+boolean column is numeric, coded 0/1 (use `C(flag)` for indicators), a string
+response remains an error, and call arguments such as `C(state)` or the fixed
+effect in `| state` receive the original column.
 
 A numeric column read as strings, for example from a CSV file, therefore becomes a
 categorical predictor instead of raising an error. Cast such columns before fitting.
