@@ -198,9 +198,16 @@ mod tests {
     use winnow::Parser;
 
     fn fit(source: &str, data: &DataFrame) -> crate::FittedFormula {
+        // These tests check how transforms treat missing values.
         let models = crate::parse(&format!("x ~ {source} - 1"))
             .unwrap()
-            .fit(data)
+            .fit_with_options(
+                data,
+                crate::FitOptions {
+                    missing: crate::Missing::Keep,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         models.iter().next().unwrap().clone()
     }

@@ -86,14 +86,28 @@ impl Formulas {
         })
     }
 
-    #[pyo3(signature = (data, *, ensure_full_rank = true))]
+    #[pyo3(signature = (data, *, ensure_full_rank = true, missing = "drop"))]
     fn fit(
         &self,
         py: Python<'_>,
         data: PyDataFrame,
         ensure_full_rank: bool,
+        missing: &str,
     ) -> PyResult<FittedFormulas> {
-        let options = formula::FitOptions { ensure_full_rank };
+        let missing = match missing {
+            "drop" => formula::Missing::Drop,
+            "keep" => formula::Missing::Keep,
+            "raise" => formula::Missing::Raise,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "missing must be 'drop', 'keep' or 'raise', not {missing:?}"
+                )));
+            }
+        };
+        let options = formula::FitOptions {
+            ensure_full_rank,
+            missing,
+        };
         let inner = py
             .detach(|| self.inner.fit_with_options(&data.0, options))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -189,6 +203,12 @@ impl FittedFormula {
     #[getter]
     fn formula(&self) -> String {
         self.inner.formula().to_string()
+    }
+
+    /// Positions, in the data passed to `fit()`, of the rows left out of the fit.
+    #[getter]
+    fn dropped_rows(&self) -> Vec<usize> {
+        self.inner.dropped_rows().to_vec()
     }
 
     fn frame(&self) -> PyResult<PyDataFrame> {

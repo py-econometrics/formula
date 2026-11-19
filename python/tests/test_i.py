@@ -198,11 +198,18 @@ def test_missing_and_unknown_levels_propagate_to_every_indicator(data, source):
         assert all(value is None for value in frame.row(2))
 
 
-def test_levels_are_learned_before_missing_response_rows_are_removed(data):
+def test_levels_are_learned_on_the_rows_the_fit_keeps(data):
+    # `a` is only observed where the response is missing.
     data = data.with_columns(
         pl.when(pl.col("a") == "a").then(None).otherwise(pl.col("y")).alias("y")
     )
-    model = formula.parse("y ~ i(a, ref='a') - 1").fit(data)[0]
+    model = formula.parse("y ~ i(a) - 1").fit(data)[0]
+    assert model.dropped_rows == [1, 3]
+    assert model.select(formula.Role.Independent).frame().columns == ["a::b", "a::c"]
+    with pytest.raises(ValueError, match="`ref` value 'a' is not among the fitted"):
+        formula.parse("y ~ i(a, ref='a') - 1").fit(data)
+    # Keeping every row keeps every level, as fixest does.
+    model = formula.parse("y ~ i(a, ref='a') - 1").fit(data, missing="keep")[0]
     assert model.frame().height == data.height
     assert model.select(formula.Role.Independent).frame().columns == ["a::b", "a::c"]
 
@@ -292,9 +299,12 @@ def test_formulas_render_to_equivalent_syntax(data):
 
 def test_nan_is_missing_and_large_integer_references_are_exact(data):
     data = data.with_columns(pl.Series("t", [float("nan"), -1.0, 0.0, 1.0, 0.0, 1.0]))
-    frame = design("y ~ 0 + i(t, ref=-1)", data).frame()
+    model = formula.parse("y ~ 0 + i(t, ref=-1)").fit(data)[0]
+    assert model.dropped_rows == [0]
+    frame = model.select(formula.Role.Independent).frame()
     assert frame.columns == ["t::0.0", "t::1.0"]
-    assert frame.row(0) == (None, None)
+    kept = formula.parse("y ~ 0 + i(t, ref=-1)").fit(data, missing="keep")[0]
+    assert kept.select(formula.Role.Independent).frame().row(0) == (None, None)
     data = data.with_columns(pl.Series("t", [2**53, 2**53 + 1] * 3))
     frame = design(f"y ~ 0 + i(t, ref={2**53})", data).frame()
     assert frame.to_dict(as_series=False) == {f"t::{2**53 + 1}": [False, True] * 3}
@@ -318,7 +328,8 @@ def test_empty_predictions_and_empty_fits_keep_row_counts(data, source):
 def test_all_missing_fit_keeps_height_and_has_no_indicators(data):
     for source in ["y ~ i(a)", "y ~ i(a, x)", "y ~ i(a, b)"]:
         missing = data.with_columns(pl.lit(None, dtype=pl.String).alias("a"))
-        frame = design(source, missing).frame()
+        model = formula.parse(source).fit(missing, missing="keep")[0]
+        frame = model.select(formula.Role.Independent).frame()
         assert frame.shape == (data.height, 1)
         assert frame.columns == ["Intercept"]
 
@@ -359,9 +370,11 @@ def test_float_event_time_with_missing_values(data, reference):
     data = data.with_columns(
         pl.Series("t", [1.0, -1.0, None, -1.0, 0.0, 1.0]), pl.lit(1.0).alias("one")
     )
-    frame = design(f"y ~ i(t, one, ref={reference}) | a", data).frame()
+    model = formula.parse(f"y ~ i(t, one, ref={reference}) | a").fit(data)[0]
+    assert model.dropped_rows == [2]
+    frame = model.select(formula.Role.Independent).frame()
     assert frame.columns == ["t::0.0:one", "t::1.0:one"]
-    assert frame["t::1.0:one"].to_list() == [1.0, 0.0, None, 0.0, 0.0, 1.0]
+    assert frame["t::1.0:one"].to_list() == [1.0, 0.0, 0.0, 0.0, 1.0]
 
 
 def test_inexact_references_name_no_level(data):

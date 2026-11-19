@@ -31,7 +31,7 @@ def data() -> polars.DataFrame:
 )
 def test_parse_and_fit(formulas, expected_columns, data):
     specification = formula.parse(formulas)
-    models = specification.fit(data)
+    models = specification.fit(data, missing="keep")
 
     assert len(models) == len(expected_columns)
     for index, column in enumerate(expected_columns):
@@ -86,7 +86,7 @@ def test_empty_unfitted_formulas_are_an_empty_collection():
 
 
 def test_role_frames_preserve_rows_and_nulls(data):
-    model = formula.parse("y ~ x | firm").fit(data)[0]
+    model = formula.parse("y ~ x | firm").fit(data, missing="keep")[0]
 
     dependent = model.select(formula.Role.Dependent).frame()
     independent = model.select(formula.Role.Independent).frame()
@@ -115,16 +115,16 @@ def test_combined_frame_preserves_input_height_on_fitting_and_transformation(
 ):
     specification = formula.parse("y ~ x - 1")
     input_data = data.head(height)
-    fitted = specification.fit(data)[0]
+    fitted = specification.fit(data, missing="keep")[0]
     for model in (
-        specification.fit(input_data)[0],
+        specification.fit(input_data, missing="keep")[0],
         fitted.transform(input_data),
     ):
         assert_frame_equal(model.frame(), input_data.select("y", "x"))
 
 
 def test_model_indexing(data):
-    models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).fit(data)
+    models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).fit(data, missing="keep")
 
     by_formula = models["y ~ x - 1"]
     assert by_formula.formula == models[0].formula == "y ~ x - 1"
@@ -158,7 +158,7 @@ def test_model_indexing(data):
     ],
 )
 def test_expanded_models_can_be_looked_up_by_their_formula(source, data):
-    models = formula.parse(source).fit(data)
+    models = formula.parse(source).fit(data, missing="keep")
     assert len({models[index].formula for index in range(len(models))}) == len(models)
 
     for index in range(len(models)):
@@ -170,7 +170,7 @@ def test_expanded_models_can_be_looked_up_by_their_formula(source, data):
 
 
 def test_model_owns_its_data_and_returns_independent_frames(data):
-    model = formula.parse("y ~ x - 1").fit(data)[0]
+    model = formula.parse("y ~ x - 1").fit(data, missing="keep")[0]
     frame = model.frame()
     frame.replace_column(1, polars.Series("x", [99.0, 99.0, 99.0]))
 
@@ -184,7 +184,7 @@ def test_model_transform_reuses_fitted_categories(data, as_child):
     source = "y ~ C(firm) - 1"
     if as_child:
         source = f"y ~ x + [{source}]"
-    models = formula.parse(source).fit(data)
+    models = formula.parse(source).fit(data, missing="keep")
     parent = models[0]
     model = parent.children(formula.Role.Independent)[0] if as_child else parent
     del parent, models
@@ -210,7 +210,7 @@ def test_model_transform_reuses_fitted_categories(data, as_child):
 def test_children_preserve_role_attachment_order_and_navigation(data):
     models = formula.parse(
         "[z ~ x - 1] ~ x + [x ~ z + [z ~ x - 1] - 1] + [z ~ x - 1] - 1"
-    ).fit(data)
+    ).fit(data, missing="keep")
     model = models[0]
     children = model.children(formula.Role.Independent)
     assert len(children) == 2
@@ -275,7 +275,7 @@ def test_children_preserve_role_attachment_order_and_navigation(data):
 
 
 def test_models_transform_preserves_model_order_and_fitted_state(data):
-    models = formula.parse(["y ~ C(firm) - 1", "y ~ x - 1"]).fit(data)
+    models = formula.parse(["y ~ C(firm) - 1", "y ~ x - 1"]).fit(data, missing="keep")
     transformed = models.transform(data.slice(1, 1))
 
     assert len(transformed) == len(models) == 2
@@ -291,7 +291,7 @@ def test_models_transform_preserves_model_order_and_fitted_state(data):
     [formula.Role.Independent, [formula.Role.Independent], (formula.Role.Independent,)],
 )
 def test_select_accepts_single_roles_and_sequences(data, roles):
-    models = formula.parse("y ~ x - 1").fit(data)
+    models = formula.parse("y ~ x - 1").fit(data, missing="keep")
     selected_model = models[0].select(roles)
     selected_models = models.select(roles)
 
@@ -302,7 +302,7 @@ def test_select_accepts_single_roles_and_sequences(data, roles):
 
 
 def test_select_rejects_missing_roles_and_empty_selections(data):
-    models = formula.parse("y ~ x").fit(data)
+    models = formula.parse("y ~ x").fit(data, missing="keep")
     for target in (models, models[0]):
         for roles in (formula.Role.FixedEffect, [formula.Role.FixedEffect]):
             with pytest.raises(KeyError, match="FixedEffect"):
@@ -322,9 +322,9 @@ def test_rust_errors_become_python_exceptions(data):
         formula.parse("y ~")
 
     with pytest.raises(ValueError, match="missing"):
-        formula.parse("y ~ missing").fit(data)
+        formula.parse("y ~ missing").fit(data, missing="keep")
 
-    models = formula.parse("y ~ x").fit(data)
+    models = formula.parse("y ~ x").fit(data, missing="keep")
     prediction = data.drop("x")
     with pytest.raises(ValueError, match="x"):
         models.transform(prediction)
@@ -334,7 +334,7 @@ def test_rust_errors_become_python_exceptions(data):
 
 @pytest.mark.parametrize("keyword_role", [False, True])
 def test_select_terms_returns_an_independent_fitted_formula(data, keyword_role):
-    model = formula.parse("y ~ x + z").fit(data)[0]
+    model = formula.parse("y ~ x + z").fit(data, missing="keep")[0]
     if keyword_role:
         selected = model.select_terms("z", role=formula.Role.Independent)
     else:
@@ -360,14 +360,14 @@ def test_select_terms_returns_an_independent_fitted_formula(data, keyword_role):
     ],
 )
 def test_select_terms_translates_rust_errors(data, query, role, exception, message):
-    model = formula.parse("y ~ x + z").fit(data)[0]
+    model = formula.parse("y ~ x + z").fit(data, missing="keep")[0]
     with pytest.raises(exception, match=message):
         model.select_terms(query, role)
 
 
 @pytest.mark.parametrize("roles", [(), ("Independent",)])
 def test_select_terms_requires_a_valid_role(data, roles):
-    model = formula.parse("y ~ x").fit(data)[0]
+    model = formula.parse("y ~ x").fit(data, missing="keep")[0]
     with pytest.raises(TypeError):
         model.select_terms("x", *roles)
 
@@ -377,7 +377,9 @@ def test_varying_slope_selection_exports_typed_prediction_columns(data):
         polars.Series("time", [1, 2, 3], dtype=polars.Int32),
         polars.Series("exposure", [0.5, 1.0, 1.5]),
     )
-    model = formula.parse("y ~ x | firm[[time, exposure]]").fit(training)[0]
+    model = formula.parse("y ~ x | firm[[time, exposure]]").fit(
+        training, missing="keep"
+    )[0]
     selected = model.select_terms(
         "firm[[time, exposure]]", role=formula.Role.FixedEffect
     )
@@ -410,9 +412,9 @@ def test_varying_slope_selection_exports_typed_prediction_columns(data):
 
 def test_varying_slope_fit_errors_are_value_errors(data):
     with pytest.raises(ValueError, match="expected a primitive numeric dtype"):
-        formula.parse("y ~ x | firm[[firm]]").fit(data)
+        formula.parse("y ~ x | firm[[firm]]").fit(data, missing="keep")
     with pytest.raises(ValueError, match="expanding transform"):
-        formula.parse("y ~ x | firm[[C(firm)]]").fit(data)
+        formula.parse("y ~ x | firm[[C(firm)]]").fit(data, missing="keep")
 
 
 def test_varying_slope_syntax_errors_are_syntax_errors():
@@ -425,7 +427,7 @@ def fixed_effect(request):
     data = polars.DataFrame(
         {"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"], "x": [1.0, 2.0, 3.0]}
     )
-    model = formula.parse(f"y ~ 1 | {request.param}").fit(data)[0]
+    model = formula.parse(f"y ~ 1 | {request.param}").fit(data, missing="keep")[0]
     (effect,) = model.fixed_effects
     assert effect.codes.to_list() == [0, 1, 0]
     assert effect.codes.dtype == polars.UInt32
@@ -444,7 +446,7 @@ def test_fixed_effects_preserve_order_and_support_name_lookup(data):
     data = data.with_columns(polars.Series("year", [2020, 2021, 2020]))
     # Year-specific slopes on `x` span `x` itself, which so has no columns.
     with pytest.warns(formula.RankDeficiencyWarning, match="term x is fully spanned"):
-        model = formula.parse("y ~ x | firm + year[x]").fit(data)[0]
+        model = formula.parse("y ~ x | firm + year[x]").fit(data, missing="keep")[0]
     assert model.select(formula.Role.Independent).frame().width == 0
     effects = model.fixed_effects
     assert len(effects) == 2
@@ -468,7 +470,7 @@ def test_fixed_effects_preserve_order_and_support_name_lookup(data):
 
 
 def test_model_without_fixed_effects_returns_an_empty_collection(data):
-    model = formula.parse("y ~ x").fit(data)[0]
+    model = formula.parse("y ~ x").fit(data, missing="keep")[0]
     assert model.fixed_effects == []
     with pytest.raises(KeyError):
         model.fixed_effect("firm")
@@ -486,7 +488,7 @@ def test_fixed_effect_encoding_exposes_codes_and_levels(fixed_effect):
 @pytest.mark.parametrize("specification", ["group", "group[x]", "group[[x]]"])
 def test_fixed_effect_data_tracks_prediction_rows(specification):
     training = polars.DataFrame({"y": [1.0, 2.0], "group": ["a", "b"], "x": [1.0, 2.0]})
-    model = formula.parse(f"y ~ 1 | {specification}").fit(training)[0]
+    model = formula.parse(f"y ~ 1 | {specification}").fit(training, missing="keep")[0]
     prediction = polars.DataFrame(
         {"y": [3.0, 4.0, 5.0], "group": ["b", "new", "a"], "x": [10.0, 20.0, None]}
     )
@@ -508,7 +510,7 @@ def test_fixed_effect_data_tracks_prediction_rows(specification):
 
 def test_transform_state_mapping_interface():
     data = polars.DataFrame({"y": [1.0, 2.0, 3.0], "group": ["a", "b", "a"]})
-    model = formula.parse("y ~ 1 | group").fit(data)[0]
+    model = formula.parse("y ~ 1 | group").fit(data, missing="keep")[0]
     (term,) = model.terms(formula.Role.FixedEffect)
     (factor,) = term.factors
     assert factor.transform is not None
@@ -543,7 +545,7 @@ def test_fixed_effect_encoding_values_are_independent_snapshots(fixed_effect):
 
 def test_stateless_transform_has_an_empty_state():
     data = polars.DataFrame({"y": [1.0, 2.0], "x": [2.0, 3.0]})
-    model = formula.parse("y ~ log(x) - 1").fit(data)[0]
+    model = formula.parse("y ~ log(x) - 1").fit(data, missing="keep")[0]
     (term,) = model.terms(formula.Role.Independent)
     assert term.fixed_effect is None
     (factor,) = term.factors
@@ -555,3 +557,25 @@ def test_stateless_transform_has_an_empty_state():
     assert list(state) == []
     with pytest.raises(KeyError):
         _ = state["codes"]
+
+
+def test_fit_drops_incomplete_rows_by_default_and_reports_them(data):
+    data = data.with_columns(polars.Series("z", [7.0, 8.0, math.inf]))
+    model = formula.parse("y ~ x + z").fit(data)[0]
+    assert model.dropped_rows == [1, 2]
+    assert model.frame().height == 1
+    assert model.select(formula.Role.Independent).dropped_rows == [1, 2]
+    # Transformation keeps every row.
+    transformed = model.transform(data)
+    assert transformed.dropped_rows == []
+    assert transformed.frame().height == data.height
+
+
+def test_missing_policy_options(data):
+    model = formula.parse("y ~ x").fit(data, missing="keep")[0]
+    assert model.dropped_rows == []
+    assert model.frame().height == data.height
+    with pytest.raises(ValueError, match=r"1 rows have missing .* positions \[1\]"):
+        formula.parse("y ~ x").fit(data, missing="raise")
+    with pytest.raises(ValueError, match="missing must be 'drop', 'keep' or 'raise'"):
+        formula.parse("y ~ x").fit(data, missing="ignore")  # ty: ignore[invalid-argument-type]

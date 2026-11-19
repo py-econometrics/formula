@@ -201,6 +201,7 @@ fn repeated_categorical_dimension_intersects_hard_omissions() {
         &data,
         FitOptions {
             ensure_full_rank: false,
+            ..FitOptions::default()
         },
     )
     .try_into()
@@ -446,6 +447,7 @@ fn interactions_span_their_categorical_spellings() {
     .unwrap();
     let opt_out = FitOptions {
         ensure_full_rank: false,
+        ..FitOptions::default()
     };
     for (source, spelling) in [
         ("i(a)", "C(a)"),

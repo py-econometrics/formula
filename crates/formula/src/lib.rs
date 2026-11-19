@@ -7,7 +7,7 @@ mod transform;
 
 pub use self::formula::{
     ComponentKey, Factor, FitOptions, FittedFixedEffect, FittedTerm, Formula, FormulaColumn,
-    Formulas, RankDeficiency, Role, Term, TransformCall, ValidationError,
+    Formulas, Missing, RankDeficiency, Role, Term, TransformCall, ValidationError,
 };
 pub use fit::FitError;
 pub use model::{FittedFormula, FittedFormulas, ModelError, SelectionError};

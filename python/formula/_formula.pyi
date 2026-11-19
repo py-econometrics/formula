@@ -1,7 +1,7 @@
 """Type declarations for the native extension."""
 
 from collections.abc import Iterator, Sequence
-from typing import ClassVar, TypeAlias
+from typing import ClassVar, Literal, TypeAlias
 
 import polars
 
@@ -20,12 +20,18 @@ class Formulas:
     def __len__(self) -> int: ...
     def __getitem__(self, index: int | str) -> Formula: ...
     def fit(
-        self, data: polars.DataFrame, *, ensure_full_rank: bool = True
+        self,
+        data: polars.DataFrame,
+        *,
+        ensure_full_rank: bool = True,
+        missing: Literal["drop", "keep", "raise"] = "drop",
     ) -> FittedFormulas: ...
 
 class FittedFormula:
     @property
     def formula(self) -> str: ...
+    @property
+    def dropped_rows(self) -> list[int]: ...
     def transform(self, data: polars.DataFrame) -> FittedFormula: ...
     def frame(self) -> polars.DataFrame: ...
     def select(self, roles: Role | Sequence[Role]) -> FittedFormula: ...
