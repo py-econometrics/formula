@@ -5,8 +5,8 @@ use crate::parse::{
 };
 use crate::rank::{self, ColumnGroup, RankFactor, Scope};
 use crate::transform::{
-    ArgumentCount, CategoricalDefinition, CategoricalState, GroupedTransform,
-    IntegerEncodingDefinition, IntegerEncodingState, ParameterValue, Transform,
+    ArgumentCount, Bins, CategoricalDefinition, CategoricalState, CategoricalStyle,
+    GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState, ParameterValue, Transform,
     TransformDefinition, TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
@@ -186,6 +186,8 @@ pub struct Factor {
     pub(crate) kind: FactorKind,
 }
 
+// Factors are shared behind `Arc`, so the size of a fitted call matters little.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum FactorKind {
     Literal(Scalar),
@@ -253,8 +255,14 @@ impl Factor {
 
                 for argument in arguments {
                     argument.validate()?;
-                    if let FactorKind::Call { transform, .. } = &argument.kind
-                        && transform.expands()
+                    if let FactorKind::Call {
+                        transform: argument_transform,
+                        ..
+                    } = &argument.kind
+                        && argument_transform.expands()
+                        // `i(f, C(g))` marks `g` as categorical.
+                        && !(matches!(transform, Transform::I(_))
+                            && matches!(argument_transform, Transform::C(_)))
                     {
                         return Err(ValidationError::InvalidTransformComposition);
                     }
@@ -507,13 +515,26 @@ impl Term {
     ///
     /// This is where a term's categorical factors are known at fit time.
     fn encodings(&self, transformed: &[FittedFactor]) -> Vec<Encoding> {
+        let fitted = |encoding: &Arc<Factor>| {
+            Encoding::Categorical(Arc::clone(&lookup_factor(transformed, encoding).factor))
+        };
         self.factors
             .iter()
-            .map(|factor| match categorical_encoding(factor, transformed) {
-                Some(encoding) => {
-                    Encoding::Categorical(Arc::clone(&lookup_factor(transformed, &encoding).factor))
+            .map(|factor| {
+                if let Some(axes) = interaction_axes(factor, transformed) {
+                    return Encoding::Interaction(
+                        axes.into_iter()
+                            .map(|(input, encoding)| match encoding {
+                                Some(encoding) => (input, fitted(&encoding)),
+                                None => (input, Encoding::Direct),
+                            })
+                            .collect(),
+                    );
                 }
-                None => Encoding::Direct,
+                match categorical_encoding(factor, transformed) {
+                    Some(encoding) => fitted(&encoding),
+                    None => Encoding::Direct,
+                }
             })
             .collect()
     }
@@ -540,24 +561,69 @@ impl Term {
         let mut columns = Vec::new();
         let mut metadata = Vec::new();
         for group in &coding.groups {
-            let mut factor_columns = Vec::with_capacity(self.factors.len());
-            for (((factor, fitted), encoding), scope) in self
-                .factors
-                .iter()
-                .zip(&factors)
-                .zip(&coding.encodings)
-                .zip(group)
+            let mut scopes = group.iter();
+            let mut factor_columns = Vec::with_capacity(group.len());
+            for ((factor, fitted), encoding) in
+                self.factors.iter().zip(&factors).zip(&coding.encodings)
             {
-                if *scope == Scope::Omitted {
+                let code = |input: &Arc<Factor>, encoding: &Encoding, scope: &Scope| match encoding
+                {
+                    Encoding::Categorical(encoding) => {
+                        code_categorical(input, encoding, scope, transformed)
+                    }
+                    Encoding::Direct => Ok(lookup_factor(transformed, input).columns.clone()),
+                    Encoding::Interaction(_) => unreachable!("axes are not interactions"),
+                };
+                let Encoding::Interaction(axes) = encoding else {
+                    let scope = scopes.next().expect("one scope per axis");
+                    if *scope != Scope::Omitted {
+                        let output = code(factor, encoding, scope)?;
+                        factor_columns.push(output.with_factor(Arc::clone(fitted)));
+                    }
+                    continue;
+                };
+                // The axes of `i()` interact into columns of the call, keyed by the
+                // level of each axis: `None` for a slope or an omitted axis.
+                let mut included = Vec::with_capacity(axes.len());
+                let mut axis_columns = Vec::with_capacity(axes.len());
+                for (input, encoding) in axes {
+                    let scope = scopes.next().expect("one scope per axis");
+                    included.push(*scope != Scope::Omitted);
+                    if *scope != Scope::Omitted {
+                        axis_columns
+                            .push(code(input, encoding, scope)?.with_factor(Arc::clone(fitted)));
+                    }
+                }
+                if axis_columns.is_empty() {
                     continue;
                 }
-                let factor_output = match encoding {
-                    Encoding::Categorical(encoding) => {
-                        code_categorical(factor, encoding, scope, transformed)?
-                    }
-                    Encoding::Direct => lookup_factor(transformed, factor).columns.clone(),
-                };
-                factor_columns.push(factor_output.with_factor(Arc::clone(fitted)));
+                let (frame, axis_metadata) =
+                    Self::assemble_columns(height, axis_columns)?.into_parts();
+                let metadata = axis_metadata
+                    .into_iter()
+                    .map(|metadata| {
+                        let mut keys = metadata.contributions.into_iter().map(|(_, key)| key);
+                        let mut keys = included
+                            .iter()
+                            .map(|&included| {
+                                if included {
+                                    keys.next().expect("one key per included axis")
+                                } else {
+                                    ComponentKey::None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let key = if keys.len() == 1 {
+                            keys.pop().expect("one axis")
+                        } else {
+                            ComponentKey::Tuple(keys)
+                        };
+                        ColumnMetadata {
+                            contributions: vec![(Arc::clone(fitted), key)],
+                        }
+                    })
+                    .collect();
+                factor_columns.push(MaterializedColumns::new(frame, metadata));
             }
             let (frame, group_metadata) =
                 Self::assemble_columns(height, factor_columns)?.into_parts();
@@ -583,13 +649,15 @@ impl Term {
 struct Coding {
     // One encoding per factor of the term, in the same order
     encodings: Vec<Encoding>,
-    // Column groups in output order; none for a fully spanned term
+    // Column groups in output order; none for a fully spanned term. Each group has
+    // one scope per axis: one per factor, and one per argument of `i()`.
     groups: Vec<ColumnGroup>,
 }
 
 impl Coding {
     fn single_group(encodings: Vec<Encoding>) -> Self {
-        let group = vec![Scope::Full; encodings.len()];
+        let axes = encodings.iter().map(Encoding::axis_count).sum();
+        let group = vec![Scope::Full; axes];
         Self {
             encodings,
             groups: vec![group],
@@ -608,38 +676,54 @@ enum Encoding {
     /// `C(a)`: it is materialised once with every level, and each column group
     /// keeps the levels its scope selects.
     Categorical(Arc<Factor>),
+    /// The axes of `i()`: each argument's input, with the categorical encoding of
+    /// that input, or `Direct` for a numeric slope.
+    Interaction(Vec<(Arc<Factor>, Encoding)>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum RankKey<'a> {
     Direct(&'a Factor),
-    Categorical(&'a Factor),
+    /// A categorical input, binned by `i(..., bin=...)` or not. Binning makes a
+    /// different level space.
+    Categorical(&'a Factor, Option<&'a Bins>),
 }
 
 impl<'a> RankKey<'a> {
     fn input(self) -> &'a Factor {
         match self {
-            Self::Direct(input) | Self::Categorical(input) => input,
+            Self::Direct(input) | Self::Categorical(input, _) => input,
         }
     }
 }
 
 impl Encoding {
-    fn rank_factor<'a>(&'a self, factor: &'a Factor) -> RankFactor<'a, RankKey<'a>> {
+    fn axis_count(&self) -> usize {
+        match self {
+            Self::Interaction(axes) => axes.len(),
+            Self::Direct | Self::Categorical(_) => 1,
+        }
+    }
+
+    fn rank_factors<'a>(&'a self, factor: &'a Factor) -> Vec<RankFactor<'a, RankKey<'a>>> {
         match self {
             Self::Categorical(encoding) => {
-                let (input, _, state) = fitted_categorical(encoding);
-                RankFactor {
-                    key: RankKey::Categorical(input),
+                let (input, definition, state) = fitted_categorical(encoding);
+                vec![RankFactor {
+                    key: RankKey::Categorical(input, definition.bins()),
                     levels: Some(state.level_count()),
                     omitted: state.omitted_indices(),
-                }
+                }]
             }
-            Self::Direct => RankFactor {
+            Self::Direct => vec![RankFactor {
                 key: RankKey::Direct(factor),
                 levels: None,
                 omitted: &[],
-            },
+            }],
+            Self::Interaction(axes) => axes
+                .iter()
+                .flat_map(|(input, encoding)| encoding.rank_factors(input))
+                .collect(),
         }
     }
 }
@@ -697,6 +781,81 @@ fn categorical_encoding(factor: &Arc<Factor>, transformed: &[FittedFactor]) -> O
     }
 }
 
+/// An argument's input, with its unfitted categorical encoding or `None` for a slope.
+type InteractionAxis = (Arc<Factor>, Option<Arc<Factor>>);
+
+/// The axes of an `i()` factor: each argument's input, with its unfitted
+/// categorical encoding, or `None` for a numeric slope.
+///
+/// The first argument is always categorical. The second is categorical when it
+/// is written as `C(g)`, when `ref2` or `bin2` is given, or when its fitted dtype
+/// is neither numeric nor boolean. `C(g, omit=...)` supplies omitted levels
+/// unless `ref` or `ref2` does.
+fn interaction_axes(
+    factor: &Arc<Factor>,
+    transformed: &[FittedFactor],
+) -> Option<Vec<InteractionAxis>> {
+    let FactorKind::Call {
+        transform: Transform::I(interaction),
+        arguments,
+    } = &factor.kind
+    else {
+        return None;
+    };
+    let encode = |definition: CategoricalDefinition, input: &Arc<Factor>| {
+        Arc::new(Factor {
+            kind: FactorKind::Call {
+                transform: Transform::C(Fit::Unfitted(definition)),
+                arguments: vec![Arc::clone(input)],
+            },
+        })
+    };
+    // `C(g, omit=...)` as an argument: its input and omitted levels.
+    let unwrap = |argument: &Arc<Factor>| match &argument.kind {
+        FactorKind::Call {
+            transform: Transform::C(categorical),
+            arguments,
+        } => {
+            let [input] = arguments.as_slice() else {
+                unreachable!("C() takes exactly one argument");
+            };
+            let omitted = categorical
+                .definition()
+                .parameters()
+                .remove(CategoricalDefinition::OMIT_PARAMETER);
+            Some((Arc::clone(input), omitted))
+        }
+        _ => None,
+    };
+
+    let mut axes = Vec::with_capacity(arguments.len());
+    let first = &arguments[0];
+    let (input, omitted) = unwrap(first).unwrap_or_else(|| (Arc::clone(first), None));
+    let definition = interaction.first(omitted);
+    axes.push((Arc::clone(&input), Some(encode(definition, &input))));
+
+    if let Some(second) = arguments.get(1) {
+        let axis = match unwrap(second) {
+            Some((input, omitted)) => {
+                let encoding = encode(interaction.second(omitted), &input);
+                (input, Some(encoding))
+            }
+            None => {
+                let [column] = lookup_factor(transformed, second).columns.frame.columns() else {
+                    unreachable!("i() arguments transform to exactly one column");
+                };
+                let dtype = column.dtype();
+                let slope = dtype.is_primitive_numeric() || *dtype == DataType::Boolean;
+                let encoding = (interaction.second_is_categorical() || !slope)
+                    .then(|| encode(interaction.second(None), second));
+                (Arc::clone(second), encoding)
+            }
+        };
+        axes.push(axis);
+    }
+    Some(axes)
+}
+
 /// Codes the indicator columns of `encoding` for `factor` as written in a term.
 ///
 /// A bare variable `a` names its columns `a[...]`; `C(...)` keeps its call name.
@@ -707,18 +866,20 @@ fn code_categorical(
     transformed: &[FittedFactor],
 ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
     let (input, definition, state) = fitted_categorical(encoding);
-    let prefix = match &factor.kind {
-        FactorKind::Variable(variable) => PlSmallStr::from(variable.definition().name()),
-        _ => {
-            let [column] = lookup_factor(transformed, input).columns.frame.columns() else {
-                unreachable!("C() arguments transform to exactly one column");
-            };
-            definition.call_name(&[column.name()])
+    let [column] = lookup_factor(transformed, input).columns.frame.columns() else {
+        unreachable!("C() arguments transform to exactly one column");
+    };
+    // `i()` names its columns `input::level`.
+    let prefix = match (&factor.kind, definition.style()) {
+        (_, CategoricalStyle::I { .. }) => column.name().clone(),
+        (FactorKind::Variable(variable), CategoricalStyle::C) => {
+            PlSmallStr::from(variable.definition().name())
         }
+        (_, CategoricalStyle::C) => definition.call_name(&[column.name()]),
     };
     let columns = lookup_factor(transformed, encoding).columns.clone();
 
-    CategoricalDefinition::code(state, columns, &prefix, scope)
+    definition.code(state, columns, &prefix, scope)
 }
 
 #[derive(Clone, Debug)]
@@ -828,7 +989,7 @@ impl Expression {
                     term.factors
                         .iter()
                         .zip(encodings)
-                        .map(|(factor, encoding)| encoding.rank_factor(factor))
+                        .flat_map(|(factor, encoding)| encoding.rank_factors(factor))
                         .collect()
                 })
                 .collect::<Vec<Vec<_>>>();
@@ -1313,23 +1474,38 @@ impl FittedTerm {
     /// The encoding identifies the factor: bare `a` and `C(a)` both have `C(a)`.
     #[cfg(test)]
     fn categorical_factors(&self) -> impl Iterator<Item = (&Factor, &Factor)> {
-        self.term
-            .factors()
-            .zip(&self.coding.encodings)
-            .filter_map(|(factor, encoding)| match encoding {
-                Encoding::Categorical(encoding) => Some((factor, encoding.as_ref())),
-                Encoding::Direct => None,
-            })
+        self.term.factors().zip(&self.coding.encodings).flat_map(
+            |(factor, encoding)| match encoding {
+                Encoding::Categorical(encoding) => vec![(factor, encoding.as_ref())],
+                Encoding::Direct => Vec::new(),
+                Encoding::Interaction(axes) => axes
+                    .iter()
+                    .filter_map(|(_, axis)| match axis {
+                        Encoding::Categorical(encoding) => Some((factor, encoding.as_ref())),
+                        _ => None,
+                    })
+                    .collect(),
+            },
+        )
     }
 
     /// The factors to transform to materialise this term.
     fn materialized_factors(&self) -> impl Iterator<Item = &Arc<Factor>> {
-        self.term.factors.iter().zip(&self.coding.encodings).map(
-            |(factor, encoding)| match encoding {
-                Encoding::Categorical(encoding) => encoding,
-                Encoding::Direct => factor,
-            },
-        )
+        self.term
+            .factors
+            .iter()
+            .zip(&self.coding.encodings)
+            .flat_map(|(factor, encoding)| match encoding {
+                Encoding::Categorical(encoding) => vec![encoding],
+                Encoding::Direct => vec![factor],
+                // The call itself, then each axis's encoding or slope input.
+                Encoding::Interaction(axes) => std::iter::once(factor)
+                    .chain(axes.iter().map(|(input, axis)| match axis {
+                        Encoding::Categorical(encoding) => encoding,
+                        _ => input,
+                    }))
+                    .collect(),
+            })
     }
 
     pub fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
@@ -1400,7 +1576,11 @@ impl FittedExpression {
         let columns = terms
             .iter()
             .flat_map(|term| term.columns.frame().columns().iter().cloned())
-            .collect();
+            .collect::<Vec<_>>();
+        let mut names = std::collections::HashSet::with_capacity(columns.len());
+        if let Some(column) = columns.iter().find(|column| !names.insert(column.name())) {
+            return Err(ModelError::DuplicateColumn(column.name().to_string()));
+        }
         let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
 
         Ok(Self::new(expression, terms, frame, children))
@@ -1653,10 +1833,19 @@ fn schedule_encodings(expressions: &[&Expression], factors: &[FittedFactor]) -> 
     for expression in expressions {
         for term in &expression.terms {
             for factor in &term.factors {
-                if let Some(encoding) = categorical_encoding(factor, factors)
-                    && !factors.iter().any(|entry| entry.factor == encoding)
-                {
-                    push_unique(&mut scheduled, encoding);
+                let encodings = match interaction_axes(factor, factors) {
+                    Some(axes) => axes
+                        .into_iter()
+                        .filter_map(|(_, encoding)| encoding)
+                        .collect(),
+                    None => categorical_encoding(factor, factors)
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                };
+                for encoding in encodings {
+                    if !factors.iter().any(|entry| entry.factor == encoding) {
+                        push_unique(&mut scheduled, encoding);
+                    }
                 }
             }
         }
@@ -2707,7 +2896,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "C(`group name`, omit='missing'): `omit` value is not among the fitted levels",
+            "C(`group name`, omit='missing'): `omit` value 'missing' is not among the fitted levels",
         );
     }
 
@@ -3693,9 +3882,7 @@ mod tests {
         let data = polars::df!("y" => [2.0], "Intercept" => [3.0]).unwrap();
         assert!(matches!(
             crate::parse("y ~ Intercept").unwrap().fit(&data),
-            Err(ModelError::Transform(TransformError::Polars(
-                polars::error::PolarsError::Duplicate(_)
-            )))
+            Err(ModelError::DuplicateColumn(name)) if name == "Intercept"
         ));
         let model = fit("y ~ Intercept - 1", &data);
         assert_eq!(
@@ -4059,6 +4246,46 @@ mod tests {
                 assert_eq!(factor.name(), Some("a"));
                 assert_eq!(level.as_any_value().str_value(), "q");
             }
+        }
+
+        #[test]
+        fn interaction_axes_are_encoded_and_reused_on_transformation() {
+            let data = polars::df!(
+                "y" => [1.0, 2.0, 3.0, 4.0],
+                "a" => ["p", "q", "p", "q"],
+                "b" => ["u", "u", "v", "v"],
+                "x" => [1.0, 2.0, 4.0, 8.0],
+            )
+            .unwrap();
+            let model = fit("y ~ i(a, x) + i(a, b)", &data);
+            let encodings = model
+                .terms(Role::Independent)
+                .unwrap()
+                .iter()
+                .map(|term| {
+                    term.categorical_factors()
+                        .map(|(factor, encoding)| (factor.render(), encoding.render()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let pair = |factor: &str, encoding: &str| (factor.to_owned(), encoding.to_owned());
+            assert_eq!(
+                encodings,
+                [
+                    vec![],
+                    vec![pair("i(a, x)", "i(a)")],
+                    vec![pair("i(a, b)", "i(a)"), pair("i(a, b)", "i(b)")],
+                ]
+            );
+            let fitted = model.expression(Role::Independent).unwrap().frame().clone();
+            let transformed = model.transform(&data).unwrap();
+            assert!(
+                transformed
+                    .expression(Role::Independent)
+                    .unwrap()
+                    .frame()
+                    .equals_missing(&fitted)
+            );
         }
 
         #[test]

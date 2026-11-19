@@ -7,7 +7,8 @@ use crate::formula::{Expression, FactorKind};
 use crate::formula::{Factor, Formula, Formulas, Term, push_unique};
 use crate::parse::ast::StepwiseOperator;
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, ParameterValue, PolynomialDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, InteractionDefinition, ParameterValue,
+    PolynomialDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -101,7 +102,8 @@ pub(crate) fn is_identifier_character(c: char) -> bool {
 }
 
 fn is_argument_boundary(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ',' | ')' | ']')
+    // `:` and `}` end a scalar inside a mapping such as `{'ab': ['a', 'b']}`.
+    c.is_whitespace() || matches!(c, ',' | ')' | ']' | ':' | '}')
 }
 
 fn parse_bare_token<'i>(cursor: &mut &'i str) -> ModalResult<&'i str> {
@@ -124,16 +126,40 @@ pub(crate) fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
     .parse_next(cursor)
 }
 
+fn parse_scalar_list(cursor: &mut &str) -> ModalResult<Vec<Scalar>> {
+    preceded(
+        ('[', multispace0),
+        cut_err(terminated(
+            separated(0.., parse_scalar, (multispace0, ',', multispace0)),
+            (multispace0, ']'),
+        )),
+    )
+    .parse_next(cursor)
+}
+
+/// One `label: values` entry of a mapping. A single value stands for a list of one.
+fn parse_map_entry(cursor: &mut &str) -> ModalResult<(Scalar, Vec<Scalar>)> {
+    let label = parse_scalar.parse_next(cursor)?;
+    cut_err((multispace0, ':', multispace0)).parse_next(cursor)?;
+    let values = cut_err(alt((
+        parse_scalar_list,
+        parse_scalar.map(|value| vec![value]),
+    )))
+    .parse_next(cursor)?;
+    Ok((label, values))
+}
+
 fn parse_parameter_value(cursor: &mut &str) -> ModalResult<ParameterValue> {
     alt((
+        parse_scalar_list.map(ParameterValue::List),
         preceded(
-            ('[', multispace0),
+            ('{', multispace0),
             cut_err(terminated(
-                separated(0.., parse_scalar, (multispace0, ',', multispace0)),
-                (multispace0, ']'),
+                separated(0.., parse_map_entry, (multispace0, ',', multispace0)),
+                (multispace0, '}'),
             )),
         )
-        .map(ParameterValue::List),
+        .map(ParameterValue::Map),
         parse_scalar.map(ParameterValue::Scalar),
     ))
     .parse_next(cursor)
@@ -642,7 +668,28 @@ impl TryFrom<TransformCall> for Factor {
             "C" => {
                 let reference = keywords.remove(CategoricalDefinition::OMIT_PARAMETER);
                 reject_keywords("C", keywords)?;
+                if let Some(ParameterValue::Map(_)) = reference {
+                    return Err(TransformCallError::InvalidParameter {
+                        transform: "C",
+                        message: "`omit` must be a value or a list of values".into(),
+                    });
+                }
                 Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
+            }
+            "i" => {
+                let definition = InteractionDefinition::new(
+                    arguments.len(),
+                    keywords.remove(InteractionDefinition::REFERENCE_PARAMETER),
+                    keywords.remove(InteractionDefinition::REFERENCE2_PARAMETER),
+                    keywords.remove(InteractionDefinition::BIN_PARAMETER),
+                    keywords.remove(InteractionDefinition::BIN2_PARAMETER),
+                )
+                .map_err(|error| TransformCallError::InvalidParameter {
+                    transform: "i",
+                    message: error.to_string(),
+                })?;
+                reject_keywords("i", keywords)?;
+                Transform::I(Box::new(definition))
             }
             "poly" => {
                 let degree = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
@@ -709,6 +756,138 @@ mod tests {
         );
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn parameter_maps_accept_scalar_and_list_values() {
+        assert_eq!(
+            parse_parameter_value
+                .parse("{ 1 : [ 2 , -3 ] , 'u':'v' }")
+                .unwrap(),
+            ParameterValue::Map(vec![
+                (
+                    Scalar::from(1_i64),
+                    vec![Scalar::from(2_i64), Scalar::from(-3_i64)]
+                ),
+                (
+                    Scalar::from(PlSmallStr::from_static("u")),
+                    vec![Scalar::from(PlSmallStr::from_static("v"))]
+                ),
+            ])
+        );
+        assert_eq!(
+            parse_parameter_value.parse("{}").unwrap(),
+            ParameterValue::Map(vec![])
+        );
+        for source in [
+            "{'x': ['y']",
+            "{'x': ['y'}",
+            "{'x' ['y']}",
+            "{'x': ['y',]}",
+            "{'x': ['y'],}",
+            "{'x': }",
+            "{x: ['y']}",
+            "{'x': [y]}",
+        ] {
+            assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn interaction_options_preserve_identity_regardless_of_order_and_spacing() {
+        for (source, equivalent) in [
+            (
+                "y ~ i(a, b, bin2={'p': ['q']}, ref2=1, bin={'x': ['y', 'z']}, ref='r')",
+                "y ~ i(a, b, ref='r', ref2=1, bin={'x': ['y', 'z']}, bin2={'p': ['q']})",
+            ),
+            // A single value stands for a list of one, and labels may be numbers.
+            (
+                "y ~ i(a, bin={ 1 : [ 2 , -3 ] , 'u':'v' })",
+                "y ~ i(a, bin={1: [2, -3], 'u': ['v']})",
+            ),
+            ("y ~ i(a, ref=true)", "y ~ i(a, ref=TRUE)"),
+        ] {
+            assert_eq!(
+                parse(source).unwrap(),
+                parse(equivalent).unwrap(),
+                "{source}"
+            );
+        }
+        for (source, other) in [
+            ("y ~ i(a)", "y ~ i(a, ref='a')"),
+            ("y ~ i(a, ref=1)", "y ~ i(a, ref=1.0)"),
+            ("y ~ i(a, b, ref2=1)", "y ~ i(a, b, ref=1)"),
+            (
+                "y ~ i(a, b, bin={'x': ['y']})",
+                "y ~ i(a, b, bin2={'x': ['y']})",
+            ),
+            ("y ~ i(a, bin={'x': ['y']})", "y ~ i(a, bin={'x': ['z']})"),
+            ("y ~ i(a, b)", "y ~ i(b, a)"),
+            ("y ~ i(a, b)", "y ~ i(a):b"),
+        ] {
+            assert_ne!(parse(source).unwrap(), parse(other).unwrap(), "{source}");
+        }
+    }
+
+    #[test]
+    fn interaction_calls_render_to_the_formula_that_parses_back_to_them() {
+        for (source, rendered) in [
+            ("y ~ i(a)", "y ~ 1 + i(a)"),
+            ("y ~ i( a , x )", "y ~ 1 + i(a, x)"),
+            ("y ~ i(a, C(b, omit='u'))", "y ~ 1 + i(a, C(b, omit='u'))"),
+            (
+                "y ~ i(a, b, bin2={'p':'q'}, ref2=-1, ref=2.5)",
+                "y ~ 1 + i(a, b, ref=2.5, ref2=-1, bin2={'p': ['q']})",
+            ),
+            (
+                "y ~ i(a, bin={'u': ['v', 1.5, true]}, ref=['u', 'w'])",
+                "y ~ 1 + i(a, ref=['u', 'w'], bin={'u': ['v', 1.5, True]})",
+            ),
+        ] {
+            let formulas = parse(source).unwrap();
+            let formula = formulas.iter().next().unwrap();
+            assert_eq!(formula.to_string(), rendered, "{source}");
+            assert_eq!(&parse(rendered).unwrap().iter().next().unwrap(), &formula);
+        }
+    }
+
+    #[test]
+    fn interaction_options_must_have_the_expected_kind_of_value() {
+        for (source, message) in [
+            (
+                "y ~ i(a, ref={'x': ['y']})",
+                "`ref` must be a value or a list",
+            ),
+            ("y ~ i(a, b, ref2={})", "`ref2` must be a value or a list"),
+            ("y ~ i(a, bin='x')", "`bin` must be a mapping"),
+            ("y ~ i(a, b, bin2=1)", "`bin2` must be a mapping"),
+            ("y ~ i(a, bin={})", "`bin` must not be empty"),
+            ("y ~ i(a, bin={'x': []})", "at least one value"),
+            (
+                "y ~ i(a, bin={'x': 'y', 'z': ['y']})",
+                "value 'y' to more than one bin",
+            ),
+            (
+                "y ~ i(a, bin={'x': 'y', 'x': 'z'})",
+                "bin label 'x' more than once",
+            ),
+            ("y ~ i(a, ref2=1)", "require a second variable"),
+            (
+                "y ~ C(a, omit={'x': ['y']})",
+                "`omit` must be a value or a list",
+            ),
+            (
+                "y ~ poly(a, degree={})",
+                "`degree` must be a positive integer",
+            ),
+            (
+                "y ~ i(a, keep=1)",
+                "unexpected keywords for transform `i`: keep",
+            ),
+        ] {
+            let error = parse(source).unwrap_err().to_string();
+            assert!(error.contains(message), "{source}: {error}");
         }
     }
 

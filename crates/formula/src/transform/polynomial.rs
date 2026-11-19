@@ -26,7 +26,7 @@ impl PolynomialDefinition {
         let degree = match degree {
             None => Scalar::from(1_i64),
             Some(ParameterValue::Scalar(value)) => value,
-            Some(ParameterValue::List(_)) => {
+            Some(ParameterValue::List(_) | ParameterValue::Map(_)) => {
                 return Err(TransformError::InvalidParameter(
                     "`degree` must be a positive integer".into(),
                 ));
@@ -35,7 +35,7 @@ impl PolynomialDefinition {
         let raw = match raw {
             None => Scalar::from(false),
             Some(ParameterValue::Scalar(value)) => value,
-            Some(ParameterValue::List(_)) => {
+            Some(ParameterValue::List(_) | ParameterValue::Map(_)) => {
                 return Err(TransformError::InvalidParameter(
                     "`raw` must be a boolean".into(),
                 ));

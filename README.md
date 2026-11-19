@@ -257,6 +257,44 @@ original column.
 A numeric column read as strings, for example from a CSV file, therefore becomes a
 categorical predictor instead of raising an error. Cast such columns before fitting.
 
+### Fixest-style interactions with `i()`
+
+`i(f)` encodes `f` as a categorical, like `C(f)`, but names its columns `f::level`.
+`i(f, x)` interacts the levels of `f` with a second variable. A numeric or boolean
+`x` gives one slope per level, named `f::level:x`. A second variable is categorical
+when it is a string, categorical or enum column, when it is written as `C(g)`, or
+when `ref2` or `bin2` is given, and gives one column per pair of levels,
+`f::level:g::level`.
+
+```text
+y ~ i(period, ref=-1) | unit + year     # event-study indicators
+y ~ i(period, treated, ref=-1) | unit   # event-study slopes on a treatment indicator
+y ~ i(group, x)                         # group-specific slopes on x
+y ~ i(group, region, ref='a', ref2='n') # group-by-region cells
+y ~ i(group, C(year))                   # a numeric second variable as a factor
+y ~ i(group, bin={'ab': ['a', 'b']})    # merge levels a and b
+```
+
+`ref` and `ref2` omit levels of the first and second variable, like `omit=` for
+`C()`, and accept a value or a list. Integer and float references name the same
+level when the value is exact, so `ref=-1` also names `-1.0`. `bin={'new': ['old', ...]}`
+relabels the listed values before levels are fitted and `ref` is applied. Every
+binned value must occur in the fitting data, and each value may belong to one bin.
+A label that is not of the input's type, such as `'pre'` for an integer event time,
+bins the variable as strings.
+
+Structural coding treats `i(f, g)` as the interaction `f:g` and `i(f, x)` as `f:x`.
+So `y ~ i(f)` drops the first level next to an intercept or a fixed effect, `y ~ i(f) | f`
+has no columns, and `y ~ x + i(f, x)` drops the first slope. An unbinned `i(f)` shares
+its level space with `f` and `C(f)`. A binned variable has its own level space, so
+`f + i(f, bin=...)` is not detected as redundant. Column names of `i()` omit its
+options, so two spellings that keep the same level, such as `i(f)` and
+`i(f, bin=...)`, raise an error that names the repeated column.
+
+Each column of `i()` has one contribution, the `i()` factor, keyed by the level of
+each axis: `(level, None)` for a slope column, and `None` for an axis a column group
+leaves out, as in the column `g::v` of `y ~ i(f, g)`.
+
 ### Multistage formulas
 
 Square brackets attach child formulas to the containing expression. Using the
@@ -308,6 +346,7 @@ or `transform()`:
 | `log(x)`<br>`sqrt(x)`<br>`exp(x)`                                            | Apply the natural logarithm, square root, or exponential function to a numeric column or scalar argument.     |
 | `add(x, y, ...)`<br>`sub(x, y, ...)`<br>`mul(x, y, ...)`<br>`div(x, y, ...)` | Add, subtract, multiply, or divide two or more numeric columns or scalar arguments.                           |
 | `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`, optionally excluding the levels specified by `omit`. |
+| `i(group, x, ref=..., ref2=..., bin=..., bin2=...)`                          | Create fixest-style indicators `group::level`, optionally interacted with a second variable (see above). |
 | `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
 
 Numeric arguments are supported inside transformation calls:

@@ -3,16 +3,20 @@ mod expression;
 mod grouped;
 mod input;
 mod integer;
+mod interaction;
 mod polynomial;
 pub mod state;
 
-pub(crate) use categorical::{CategoricalDefinition, CategoricalState};
+pub(crate) use categorical::{
+    Bins, CategoricalDefinition, CategoricalState, Style as CategoricalStyle,
+};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
 use input::PreparedInput;
 pub(crate) use input::validate_numeric_field;
 pub(crate) use integer::IntegerEncodingDefinition;
+pub(crate) use interaction::InteractionDefinition;
 pub(crate) use polynomial::PolynomialDefinition;
 pub use state::{StateValue, TransformState};
 use std::collections::BTreeMap;
@@ -23,7 +27,7 @@ pub use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use crate::transform::state::ExportState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, PlSmallStr, Scalar};
+use polars::prelude::{AnyValue, Column, PlSmallStr, Scalar};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -34,6 +38,62 @@ fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> Pl
 pub enum ParameterValue {
     Scalar(Scalar),
     List(Vec<Scalar>),
+    /// Labels, each mapped to a list of values, as in `{'ab': ['a', 'b']}`.
+    Map(Vec<(Scalar, Vec<Scalar>)>),
+}
+
+impl ParameterValue {
+    /// The scalars of a scalar or list value, or `None` for a map.
+    pub(crate) fn scalars(&self) -> Option<&[Scalar]> {
+        match self {
+            Self::Scalar(value) => Some(std::slice::from_ref(value)),
+            Self::List(values) => Some(values),
+            Self::Map(_) => None,
+        }
+    }
+}
+
+/// Renders a level as it appears in column names: booleans as `True` and
+/// `False`, floats with a decimal point, and other values as their label.
+pub(crate) fn render_level(level: &Scalar) -> String {
+    match level.as_any_value() {
+        AnyValue::Boolean(true) => "True".into(),
+        AnyValue::Boolean(false) => "False".into(),
+        AnyValue::Float32(value) => format!("{value:?}"),
+        AnyValue::Float64(value) => format!("{value:?}"),
+        value => value.str_value().into_owned(),
+    }
+}
+
+/// Renders a scalar as formula syntax: strings in single quotes.
+pub(crate) fn render_scalar(value: &Scalar) -> String {
+    match value.as_any_value() {
+        AnyValue::String(value) => format!("'{value}'"),
+        AnyValue::StringOwned(value) => format!("'{value}'"),
+        _ => render_level(value),
+    }
+}
+
+fn render_scalars(values: &[Scalar]) -> String {
+    let values = values.iter().map(render_scalar).collect::<Vec<_>>();
+    format!("[{}]", values.join(", "))
+}
+
+/// Renders a parameter value as formula syntax that parses back to it.
+pub(crate) fn render_parameter(value: &ParameterValue) -> String {
+    match value {
+        ParameterValue::Scalar(value) => render_scalar(value),
+        ParameterValue::List(values) => render_scalars(values),
+        ParameterValue::Map(entries) => {
+            let entries = entries
+                .iter()
+                .map(|(label, values)| {
+                    format!("{}: {}", render_scalar(label), render_scalars(values))
+                })
+                .collect::<Vec<_>>();
+            format!("{{{}}}", entries.join(", "))
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -43,6 +103,8 @@ pub(crate) enum Transform {
     Poly(Fit<PolynomialDefinition, PolynomialState>),
     F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
     G(GroupedTransform),
+    // Boxed: four optional parameters would otherwise enlarge every `Transform`.
+    I(Box<InteractionDefinition>),
 }
 
 pub(crate) trait TransformDefinition {
@@ -73,6 +135,7 @@ impl Transform {
             Self::Poly(polynomial) => polynomial.definition(),
             Self::F(integer) => integer.definition(),
             Self::G(grouped) => grouped,
+            Self::I(interaction) => interaction.as_ref(),
         }
     }
 
@@ -119,6 +182,7 @@ impl Transform {
 
             Self::Expression(expression) => Ok(Self::Expression(expression.clone())),
             Self::G(grouped) => Ok(Self::G(grouped.clone())),
+            Self::I(interaction) => Ok(Self::I(interaction.clone())),
         }
     }
 
@@ -138,6 +202,7 @@ impl Transform {
             Self::Poly(polynomial) => polynomial.transform(&inputs),
             Self::F(integer) => integer.transform(&inputs),
             Self::G(grouped) => grouped.transform(&inputs).map_err(FitError::Transform),
+            Self::I(_) => Ok(InteractionDefinition::transform(&inputs)),
         }
     }
 
@@ -148,7 +213,7 @@ impl Transform {
             Self::F(integer) => integer.state().map(ExportState::export_state),
 
             Self::Expression(_) => Some(TransformState::default()),
-            Self::G(_) => Some(TransformState::default()),
+            Self::G(_) | Self::I(_) => Some(TransformState::default()),
         }
     }
 }
