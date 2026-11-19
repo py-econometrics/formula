@@ -8,6 +8,7 @@ use crate::{Formula, FormulaColumn};
 use polars::error::PolarsResult;
 use polars::prelude::DataFrame;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct FittedFormula {
@@ -16,6 +17,8 @@ pub struct FittedFormula {
     height: usize,
     // Found while coding this formula's own predictors at fit time
     deficiencies: Vec<RankDeficiency>,
+    // Positions in the fitting data of the rows left out of the fit
+    dropped_rows: Arc<[usize]>,
 }
 
 impl FittedFormula {
@@ -35,7 +38,50 @@ impl FittedFormula {
             expressions,
             height,
             deficiencies,
+            dropped_rows: Arc::from([]),
         }
+    }
+
+    pub(crate) fn with_dropped_rows(mut self, rows: Arc<[usize]>) -> Self {
+        self.dropped_rows = rows;
+        self
+    }
+
+    /// The positions, in the data passed to `fit()`, of the rows the fit left out
+    /// because they had missing or nonfinite values, in ascending order.
+    ///
+    /// Empty for models returned by `transform()`, which keeps every row, and when
+    /// fitting with [`crate::Missing::Keep`]. Child formulas are fitted on the rows
+    /// of their parent.
+    pub fn dropped_rows(&self) -> &[usize] {
+        &self.dropped_rows
+    }
+
+    /// Rows with a null or nonfinite value in any materialized column, including
+    /// those of child formulas.
+    pub(crate) fn incomplete_rows(&self) -> PolarsResult<Vec<usize>> {
+        let mut incomplete = vec![false; self.height];
+        self.mark_incomplete_rows(&mut incomplete)?;
+        Ok(incomplete
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, incomplete)| incomplete.then_some(row))
+            .collect())
+    }
+
+    fn mark_incomplete_rows(&self, incomplete: &mut [bool]) -> PolarsResult<()> {
+        for expression in self.expressions.values() {
+            for column in expression.frame().columns() {
+                let missing = crate::formula::missing_mask(column)?;
+                for (row, missing) in missing.into_iter().enumerate() {
+                    incomplete[row] |= missing;
+                }
+            }
+            for child in expression.children() {
+                child.mark_incomplete_rows(incomplete)?;
+            }
+        }
+        Ok(())
     }
 
     /// Structural rank deficiencies found at fit time, in this formula and its children.
@@ -137,7 +183,8 @@ impl FittedFormula {
             expressions,
             self.height,
             self.deficiencies.clone(),
-        ))
+        )
+        .with_dropped_rows(Arc::clone(&self.dropped_rows)))
     }
 
     pub fn select_terms(&self, source: &str, role: Role) -> Result<Self, SelectionError> {
@@ -155,7 +202,8 @@ impl FittedFormula {
             BTreeMap::from([(role, selected)]),
             self.height,
             self.deficiencies.clone(),
-        ))
+        )
+        .with_dropped_rows(Arc::clone(&self.dropped_rows)))
     }
 
     pub fn children(&self, role: Role) -> Result<&[Self], SelectionError> {
@@ -260,6 +308,9 @@ pub enum ModelError {
     TransformCall(String),
     /// Several columns of one expression have this name.
     DuplicateColumn(String),
+    /// Fitting with [`crate::Missing::Raise`] found missing or nonfinite values
+    /// in these rows.
+    MissingValues(Vec<usize>),
 }
 
 impl From<ValidationError> for ModelError {
@@ -287,6 +338,25 @@ impl std::fmt::Display for ModelError {
             Self::Transform(error) => error.fmt(f),
             Self::Fit(error) => error.fmt(f),
             Self::TransformCall(message) => f.write_str(message),
+            Self::MissingValues(rows) => {
+                let shown = rows
+                    .iter()
+                    .take(5)
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>();
+                let more = if rows.len() > shown.len() {
+                    ", ..."
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "{} rows have missing or nonfinite values, at positions [{}{more}]; \
+                     drop them, or fit with missing='drop'",
+                    rows.len(),
+                    shown.join(", ")
+                )
+            }
             Self::DuplicateColumn(name) => write!(
                 f,
                 "the formula produces the column `{name}` more than once; remove or respell \
@@ -324,6 +394,173 @@ impl std::fmt::Display for SelectionError {
 }
 
 impl std::error::Error for SelectionError {}
+
+#[cfg(test)]
+mod missing_values {
+    use crate::{FitOptions, Missing, Role};
+    use polars::prelude::{Column, DataFrame};
+
+    fn fit_all(source: &str, data: &DataFrame, missing: Missing) -> Vec<crate::FittedFormula> {
+        let options = FitOptions {
+            missing,
+            ..FitOptions::default()
+        };
+        let models = crate::parse(source)
+            .unwrap()
+            .fit_with_options(data, options)
+            .unwrap();
+        models.iter().cloned().collect()
+    }
+
+    fn values(frame: &DataFrame, name: &str) -> Vec<Option<f64>> {
+        frame
+            .column(name)
+            .unwrap()
+            .cast(&polars::prelude::DataType::Float64)
+            .unwrap()
+            .f64()
+            .unwrap()
+            .iter()
+            .collect()
+    }
+
+    fn data() -> DataFrame {
+        polars::df!(
+            "y" => [Some(1.0), None, Some(3.0), Some(4.0), Some(5.0), Some(6.0)],
+            "x" => [Some(1.0), Some(2.0), Some(f64::NAN), Some(4.0), Some(f64::INFINITY), Some(6.0)],
+            "z" => [Some(1.0), Some(2.0), Some(3.0), None, Some(5.0), Some(0.0)],
+            "g" => [Some("a"), Some("b"), Some("a"), Some("c"), Some("b"), None],
+            "f" => [Some("u"), Some("u"), Some("v"), Some("v"), None, Some("v")],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rows_with_missing_or_nonfinite_inputs_are_dropped_and_reported() {
+        let data = data();
+        for (source, dropped) in [
+            ("y ~ 1", &[1][..]),
+            ("y ~ x", &[1, 2, 4]),
+            ("y ~ z", &[1, 3]),
+            ("y ~ g", &[1, 5]),
+            ("y ~ 1 | f", &[1, 4]),
+            ("y ~ 1 | f[[x]]", &[1, 2, 4]),
+            ("y ~ 1 + [x ~ z]", &[1, 2, 3, 4]),
+            ("y ~ log(add(x, z))", &[1, 2, 3, 4]),
+            ("y ~ x + z | f", &[1, 2, 3, 4]),
+        ] {
+            let [model] = fit_all(source, &data, Missing::Drop).try_into().unwrap();
+            assert_eq!(model.dropped_rows(), dropped, "{source}");
+            let kept = data.height() - dropped.len();
+            assert_eq!(model.frame().unwrap().height(), kept, "{source}");
+            assert_eq!(
+                model.select(&[Role::Dependent]).unwrap().dropped_rows(),
+                dropped,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn fitted_state_is_learned_on_the_kept_rows() {
+        let data = data();
+        // `c` occurs only in row 3, where `z` is missing.
+        let [model] = fit_all("y ~ 0 + g + z", &data, Missing::Drop)
+            .try_into()
+            .unwrap();
+        let frame = model.frame().unwrap();
+        let names = frame.get_column_names();
+        assert_eq!(names, ["y", "g[a]", "g[b]", "z"]);
+        // The mean of `z` over rows 0, 2 and 4.
+        let [model] = fit_all("y ~ center(z)", &data, Missing::Drop)
+            .try_into()
+            .unwrap();
+        let frame = model.select(&[Role::Independent]).unwrap().frame().unwrap();
+        let mean = (1.0 + 3.0 + 5.0 + 0.0) / 4.0;
+        assert_eq!(
+            values(&frame, "center(z)"),
+            [1.0, 3.0, 5.0, 0.0].map(|z| Some(z - mean))
+        );
+    }
+
+    #[test]
+    fn transforms_that_produce_nonfinite_values_drop_their_rows_too() {
+        let data = data();
+        // log(z) is -inf in row 5, where z is 0.
+        let [model] = fit_all("y ~ center(log(z))", &data, Missing::Drop)
+            .try_into()
+            .unwrap();
+        assert_eq!(model.dropped_rows(), [1, 3, 5]);
+        let frame = model.select(&[Role::Independent]).unwrap().frame().unwrap();
+        let logs = [1.0_f64, 3.0, 5.0].map(f64::ln);
+        let mean = logs.iter().sum::<f64>() / 3.0;
+        assert_eq!(
+            values(&frame, "center(log(z))"),
+            logs.map(|log| Some(log - mean))
+        );
+    }
+
+    #[test]
+    fn stepwise_models_each_keep_their_own_rows() {
+        let data = data();
+        let models = fit_all("y ~ sw(x, z, 1)", &data, Missing::Drop);
+        let dropped = models
+            .iter()
+            .map(|model| model.dropped_rows().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(dropped, [vec![1, 2, 4], vec![1, 3], vec![1]]);
+    }
+
+    #[test]
+    fn keep_preserves_every_row_and_raise_reports_them() {
+        let data = data();
+        let [model] = fit_all("y ~ x", &data, Missing::Keep).try_into().unwrap();
+        assert!(model.dropped_rows().is_empty());
+        assert_eq!(model.frame().unwrap().height(), data.height());
+
+        let Err(error) = crate::parse("y ~ x + z").unwrap().fit_with_options(
+            &data,
+            FitOptions {
+                missing: Missing::Raise,
+                ..FitOptions::default()
+            },
+        ) else {
+            panic!("expected missing values to be reported");
+        };
+        assert!(matches!(&error, crate::ModelError::MissingValues(rows) if rows == &[1, 2, 3, 4]));
+        assert_eq!(
+            error.to_string(),
+            "4 rows have missing or nonfinite values, at positions [1, 2, 3, 4]; drop them, or \
+             fit with missing='drop'"
+        );
+    }
+
+    #[test]
+    fn transformation_keeps_every_row() {
+        let data = data();
+        let [model] = fit_all("y ~ x", &data, Missing::Drop).try_into().unwrap();
+        let transformed = model.transform(&data).unwrap();
+        assert!(transformed.dropped_rows().is_empty());
+        let frame = transformed
+            .select(&[Role::Independent])
+            .unwrap()
+            .frame()
+            .unwrap();
+        assert_eq!(frame.height(), data.height());
+        // NaN and infinity pass through unchanged; compare bit patterns.
+        let bits = |values: Vec<Option<f64>>| {
+            values
+                .into_iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>()
+        };
+        let x: Column = data.column("x").unwrap().clone();
+        assert_eq!(
+            bits(values(&frame, "x")),
+            bits(x.f64().unwrap().iter().collect())
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -396,7 +633,20 @@ mod tests {
                 "exposure" => [Some(0.5), Some(1.0), None],
             )
             .unwrap();
-            let model = fit("y ~ x | firm:year[[time, exposure]]", &data);
+            let model = crate::parse("y ~ x | firm:year[[time, exposure]]")
+                .unwrap()
+                .fit_with_options(
+                    &data,
+                    crate::FitOptions {
+                        missing: crate::Missing::Keep,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .clone();
             assert_eq!(
                 model
                     .expression(Role::Independent)

@@ -51,6 +51,9 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         let (field, input) = inputs.single()?;
         validate_numeric_field(field)?;
         let input = input.cast(&DataType::Float64)?;
+        // Nonfinite values give nonfinite outputs, which fitting with missing
+        // values dropped then leaves out. They do not enter the statistics.
+        let input = input.filter(&input.is_finite()?)?;
         let values = input.f64()?;
         let mean = values.mean().ok_or_else(|| {
             TransformError::NumericalError(format!(
@@ -69,12 +72,6 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         } else {
             1.0
         };
-        if !mean.is_finite() {
-            return Err(TransformError::NumericalError(format!(
-                "{}: the mean must be finite",
-                self.name()
-            )));
-        }
         Ok(StandardizeState {
             field: field.clone(),
             mean,
@@ -168,7 +165,10 @@ mod tests {
             (StandardizeDefinition::SCALE, &[2.0, 2.0][..]),
             (StandardizeDefinition::SCALE, &[2.0][..]),
             (StandardizeDefinition::CENTER, &[][..]),
-            (StandardizeDefinition::CENTER, &[f64::INFINITY][..]),
+            (
+                StandardizeDefinition::CENTER,
+                &[f64::INFINITY, f64::NAN][..],
+            ),
         ] {
             assert!(
                 Fitted::fit(definition, &prepare(values)).is_err(),

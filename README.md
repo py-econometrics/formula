@@ -245,7 +245,8 @@ emits a `formula.RankDeficiencyWarning` naming the formula and terms (in Rust,
 `x + mul(2, x)` or empty interaction cells, is not detected.
 
 To disable structural coding, fit with `ensure_full_rank=False`
-(`FitOptions { ensure_full_rank: false }` with `Formulas::fit_with_options` in Rust).
+(`FitOptions { ensure_full_rank: false, ..Default::default() }` with
+`Formulas::fit_with_options` in Rust).
 Each term emits the Cartesian product of its factors' columns, subject to explicit
 omissions. This mode emits no rank deficiency warnings.
 
@@ -296,6 +297,27 @@ options, so two spellings that keep the same level, such as `i(f)` and
 Each column of `i()` has one contribution, the `i()` factor, keyed by the level of
 each axis: `(level, None)` for a slope column, and `None` for an axis a column group
 leaves out, as in the column `g::v` of `y ~ i(f, g)`.
+
+### Missing values
+
+By default, `fit()` leaves out the rows where any column a formula reads is null,
+NaN or infinite. That includes the response, the predictors, child formulas,
+fixed-effect groups and loadings, and the inputs of transformations. Rows that a
+transformation makes nonfinite, such as `log(0)`, are left out too. Fitted state,
+such as categorical levels and the mean of `center(x)`, is learned on the rows that
+remain, so a level observed only in a dropped row is not a level.
+
+```python
+model = formula.parse("y ~ x + log(z)").fit(data)[0]
+model.dropped_rows  # positions of the left-out rows in `data`, ascending
+```
+
+Each formula keeps its own rows: in `y ~ sw(x, z)`, a missing `x` drops a row only
+from the first model. Formulas that keep the same rows share their fitted
+transformations. Pass `missing="keep"` to fit on every row, so that missing inputs
+give null or nonfinite outputs, or `missing="raise"` to fail with the positions of
+the incomplete rows (`FitOptions { missing: Missing::Keep, ..Default::default() }`
+in Rust). `transform()` never drops rows.
 
 ### Multistage formulas
 

@@ -10,7 +10,10 @@ use crate::transform::{
     TransformDefinition, TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
-use polars::prelude::{AnyValue, Column, DataFrame, DataType, PlSmallStr, PolarsResult, Scalar};
+use polars::prelude::{
+    AnyValue, BooleanChunked, Column, DataFrame, DataType, IntoLazy, NewChunkedArray, PlSmallStr,
+    PolarsResult, Scalar, col, lit,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use winnow::Parser;
@@ -1196,6 +1199,47 @@ impl Formula {
         ))
     }
 
+    /// The rows of `data` where a column this formula reads is missing.
+    fn missing_input_rows(&self, data: &DataFrame) -> Result<Vec<usize>, TransformError> {
+        let mut names = Vec::new();
+        self.collect_inputs(&mut names);
+        let mut missing = vec![false; data.height()];
+        for name in names {
+            let column = data.column(name)?;
+            for (row, value) in missing_mask(column)?.into_iter().enumerate() {
+                missing[row] |= value;
+            }
+        }
+        Ok(missing
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row, missing)| missing.then_some(row))
+            .collect())
+    }
+
+    /// The names of the data columns this formula and its children read.
+    fn collect_inputs<'a>(&'a self, names: &mut Vec<&'a str>) {
+        fn factor_inputs<'a>(factor: &'a Factor, names: &mut Vec<&'a str>) {
+            match &factor.kind {
+                FactorKind::Variable(variable) => push_unique(names, variable.definition().name()),
+                FactorKind::Call { arguments, .. } => {
+                    for argument in arguments {
+                        factor_inputs(argument, names);
+                    }
+                }
+                FactorKind::Literal(_) => {}
+            }
+        }
+        for expression in self.expressions.values() {
+            for factor in expression.terms.iter().flat_map(|term| &term.factors) {
+                factor_inputs(factor, names);
+            }
+            for child in &expression.children {
+                child.collect_inputs(names);
+            }
+        }
+    }
+
     fn collect_fit_expressions<'a>(
         &'a self,
         data: &DataFrame,
@@ -1291,14 +1335,95 @@ impl Formulas {
     ///
     /// Structural rank deficiencies the coding cannot remove are reported by
     /// [`FittedFormula::rank_deficiencies`].
+    ///
+    /// With [`Missing::Drop`], each formula is fitted on the rows where every
+    /// column it reads, and every column it materializes, is present and finite.
+    /// Formulas that keep the same rows share their fitted transformations.
     pub fn fit_with_options(
         &self,
         data: &DataFrame,
         options: FitOptions,
     ) -> Result<FittedFormulas, ModelError> {
-        let mut expressions = Vec::new();
         for formula in &self.formulas {
             formula.validate()?;
+        }
+        if options.missing == Missing::Keep {
+            let formulas = self.formulas.iter().collect::<Vec<_>>();
+            return Ok(FittedFormulas::new(Self::fit_together(
+                &formulas, data, options,
+            )?));
+        }
+
+        // Formulas that leave out the same rows are fitted together, starting
+        // with the rows whose inputs are missing.
+        let mut queue: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        let enqueue = |queue: &mut Vec<(Vec<usize>, Vec<usize>)>, rows, index| match queue
+            .iter_mut()
+            .find(|(other, _)| *other == rows)
+        {
+            Some((_, members)) => members.push(index),
+            None => queue.push((rows, vec![index])),
+        };
+        for (index, formula) in self.formulas.iter().enumerate() {
+            enqueue(&mut queue, formula.missing_input_rows(data)?, index);
+        }
+
+        let mut fitted = (0..self.formulas.len()).map(|_| None).collect::<Vec<_>>();
+        while let Some((rows, members)) = queue.pop() {
+            if options.missing == Missing::Raise && !rows.is_empty() {
+                return Err(ModelError::MissingValues(rows));
+            }
+            let mut keep = vec![true; data.height()];
+            for &row in &rows {
+                keep[row] = false;
+            }
+            let kept = (0..data.height())
+                .filter(|&row| keep[row])
+                .collect::<Vec<_>>();
+            let complete = if rows.is_empty() {
+                data.clone()
+            } else {
+                let mask = BooleanChunked::from_slice(PlSmallStr::EMPTY, &keep);
+                data.filter(&mask).map_err(TransformError::from)?
+            };
+
+            let formulas = members
+                .iter()
+                .map(|&index| &self.formulas[index])
+                .collect::<Vec<_>>();
+            let entries = Self::fit_together(&formulas, &complete, options)?;
+            let dropped: Arc<[usize]> = Arc::from(rows.as_slice());
+            for (&index, entry) in members.iter().zip(entries) {
+                // Transforms can make complete inputs nonfinite, as log(0) does.
+                // Leave those rows out too, and fit again without them.
+                let produced = entry.incomplete_rows().map_err(TransformError::from)?;
+                if produced.is_empty() {
+                    fitted[index] = Some(entry.with_dropped_rows(Arc::clone(&dropped)));
+                } else {
+                    let mut more = rows.clone();
+                    more.extend(produced.into_iter().map(|row| kept[row]));
+                    more.sort_unstable();
+                    enqueue(&mut queue, more, index);
+                }
+            }
+        }
+
+        Ok(FittedFormulas::new(
+            fitted
+                .into_iter()
+                .map(|entry| entry.expect("every formula is fitted"))
+                .collect(),
+        ))
+    }
+
+    /// Fits `formulas` on all of `data`, sharing fitted transformations.
+    fn fit_together(
+        formulas: &[&Formula],
+        data: &DataFrame,
+        options: FitOptions,
+    ) -> Result<Vec<FittedFormula>, ModelError> {
+        let mut expressions = Vec::new();
+        for formula in formulas {
             formula.collect_fit_expressions(data, &mut expressions)?;
         }
 
@@ -1307,14 +1432,48 @@ impl Formulas {
 
         // Terms are coded per expression; equally coded terms are assembled once.
         let mut assembled = Vec::new();
-        let entries = self
-            .formulas
+        formulas
             .iter()
             .map(|formula| formula.assemble(data.height(), &factors, &mut assembled, options))
-            .collect::<Result<Vec<_>, ModelError>>()?;
-
-        Ok(FittedFormulas::new(entries))
+            .collect()
     }
+}
+
+/// Whether each value of `column` is null or, for floats, NaN or infinite.
+pub(crate) fn missing_mask(column: &Column) -> PolarsResult<Vec<bool>> {
+    let name = column.name().clone();
+    let missing = if column.dtype().is_float() {
+        col(name.clone())
+            .is_null()
+            .or(col(name).is_finite().not().fill_null(lit(true)))
+    } else {
+        col(name).is_null()
+    };
+    let frame = column
+        .clone()
+        .into_frame()
+        .lazy()
+        .select([missing.alias("missing")])
+        .collect()?;
+    Ok(frame
+        .column("missing")?
+        .bool()?
+        .iter()
+        .map(|missing| missing.unwrap_or(true))
+        .collect())
+}
+
+/// How fitting treats rows with missing values: nulls, and NaN or infinite floats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Missing {
+    /// Leave such rows out of the fit, and report them in
+    /// [`FittedFormula::dropped_rows`].
+    #[default]
+    Drop,
+    /// Fit on every row. Missing inputs give null or nonfinite outputs.
+    Keep,
+    /// Fail with [`ModelError::MissingValues`].
+    Raise,
 }
 
 /// Options for fitting formulas.
@@ -1326,12 +1485,15 @@ pub struct FitOptions {
     /// columns, subject to explicit categorical omissions.
     /// Defaults to `true`.
     pub ensure_full_rank: bool,
+    /// How to treat rows with missing values. Defaults to [`Missing::Drop`].
+    pub missing: Missing,
 }
 
 impl Default for FitOptions {
     fn default() -> Self {
         Self {
             ensure_full_rank: true,
+            missing: Missing::Drop,
         }
     }
 }
@@ -2708,10 +2870,25 @@ mod tests {
             "y" => [3.0], "a" => [4.0], "b" => [6.0], "c" => [8.0],
         )
         .unwrap();
-        let nested = crate::parse("y ~ (a+b)/c").unwrap().fit(&training).unwrap();
+        let nested = crate::parse("y ~ (a+b)/c")
+            .unwrap()
+            .fit_with_options(
+                &training,
+                crate::FitOptions {
+                    missing: crate::Missing::Keep,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let expanded = crate::parse("y ~ a+b+a:b:c")
             .unwrap()
-            .fit(&training)
+            .fit_with_options(
+                &training,
+                crate::FitOptions {
+                    missing: crate::Missing::Keep,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         let transformed_nested = nested.transform(&input).unwrap();
         let transformed_expanded = expanded.transform(&input).unwrap();
@@ -3222,7 +3399,15 @@ mod tests {
         fn preserves_model_contents_and_order() {
             let (specification, data) = fixture();
             assert_eq!(specification.len(), 6);
-            let collection = specification.fit(&data).unwrap();
+            let collection = specification
+                .fit_with_options(
+                    &data,
+                    crate::FitOptions {
+                        missing: crate::Missing::Keep,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             assert_eq!(collection.len(), 6);
             let expected_interaction = Column::new(
                 INTERACTION.into(),
@@ -3405,7 +3590,15 @@ mod tests {
             ] {
                 let specification = crate::parse(source).unwrap();
                 TRANSFORM_CALLS.set((0, 0));
-                let collection = specification.fit(&data).unwrap();
+                let collection = specification
+                    .fit_with_options(
+                        &data,
+                        crate::FitOptions {
+                            missing: crate::Missing::Keep,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
                 assert_eq!(TRANSFORM_CALLS.get(), (1, 1), "{source}");
 
                 TRANSFORM_CALLS.set((0, 0));
@@ -3451,7 +3644,15 @@ mod tests {
             )
             .unwrap();
             let specification = crate::parse("y ~ C(g) + sw0(x)").unwrap();
-            let collection = specification.fit(&data).unwrap();
+            let collection = specification
+                .fit_with_options(
+                    &data,
+                    crate::FitOptions {
+                        missing: crate::Missing::Keep,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             let retained = (&collection)
                 .into_iter()
                 .next()

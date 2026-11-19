@@ -774,6 +774,7 @@ fn opting_out_still_honors_explicit_omissions() {
     let data = grid_data();
     let options = FitOptions {
         ensure_full_rank: false,
+        ..FitOptions::default()
     };
     for (source, expected) in [
         (
