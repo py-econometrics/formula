@@ -1,11 +1,11 @@
 //! `center(x)` and `scale(x)`, which learn the mean (and standard deviation)
 //! of `x` when fitting and reuse them when transforming new data.
 
-use super::input::{PreparedInput, validate_numeric_field};
+use super::input::{PreparedInput, finite_values, validate_numeric_field};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
-use polars::prelude::{ChunkAgg, ChunkVar, DataType, Field, IntoLazy, col, lit};
+use polars::prelude::{Field, IntoLazy, col, lit};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StandardizeDefinition {
@@ -50,11 +50,19 @@ impl Definition<StandardizeState> for StandardizeDefinition {
     fn fit(&self, inputs: &PreparedInput) -> Result<StandardizeState, TransformError> {
         let (field, input) = inputs.single()?;
         validate_numeric_field(field)?;
-        let input = input.cast(&DataType::Float64)?;
-        let values = input.f64()?;
+        // Skip non-finite values
+        let values = inputs
+            .frame
+            .clone()
+            .lazy()
+            .select([finite_values(col(input.name().clone()))])
+            .collect()?
+            .columns()[0]
+            .as_materialized_series()
+            .clone();
         let mean = values.mean().ok_or_else(|| {
             TransformError::NumericalError(format!(
-                "{}: no values to compute the mean of",
+                "{}: no finite values to compute the mean of",
                 self.name()
             ))
         })?;
@@ -66,7 +74,7 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         }
         let deviation = if self.scale {
             // Constant columns may end up with non-zero deviation due to rounding
-            if values.min() == values.max() {
+            if values.min_reduce()? == values.max_reduce()? {
                 return Err(TransformError::NumericalError(
                     "scale: the input is constant".into(),
                 ));
@@ -111,7 +119,7 @@ impl Definition<StandardizeState> for StandardizeDefinition {
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
         let name = call_name(self.name(), [field.name().as_str()]);
-        let expression = ((col(input.name().clone()).cast(DataType::Float64) - lit(state.mean))
+        let expression = ((finite_values(col(input.name().clone())) - lit(state.mean))
             / lit(state.deviation))
         .alias(name);
         let output = inputs.frame.clone().lazy().select([expression]).collect()?;
@@ -126,7 +134,7 @@ impl Definition<StandardizeState> for StandardizeDefinition {
 mod tests {
     use super::*;
     use crate::fit::Fitted;
-    use polars::prelude::Column;
+    use polars::prelude::{Column, DataType};
 
     fn prepare(values: &[f64]) -> PreparedInput {
         PreparedInput::new(&[Column::new("x".into(), values)], false).unwrap()
@@ -188,7 +196,10 @@ mod tests {
             // The fitted deviation of [0.1; 3] is about 1.7e-17, not zero.
             (&[0.1, 0.1, 0.1][..], "constant"),
             (&[2.2; 100][..], "constant"),
-            (&[1.0, f64::INFINITY][..], "mean"),
+            // The infinite value is dropped, leaving one value.
+            (&[1.0, f64::INFINITY][..], "constant"),
+            (&[f64::MAX, f64::MAX][..], "mean"),
+            (&[f64::NAN, f64::INFINITY][..], "no finite values"),
         ] {
             assert!(
                 matches!(
@@ -198,5 +209,71 @@ mod tests {
                 "{values:?}"
             );
         }
+    }
+
+    #[test]
+    fn nonfinite_values_are_missing() -> Result<(), TransformError> {
+        let inputs = PreparedInput::new(
+            &[Column::new(
+                "x".into(),
+                [
+                    Some(1.0),
+                    None,
+                    Some(f64::NAN),
+                    Some(3.0),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                    Some(5.0),
+                ],
+            )],
+            false,
+        )?;
+        for (definition, expected) in [
+            (
+                StandardizeDefinition::CENTER,
+                [Some(-2.0), None, None, Some(0.0), None, None, Some(2.0)],
+            ),
+            (
+                StandardizeDefinition::SCALE,
+                [Some(-1.0), None, None, Some(0.0), None, None, Some(1.0)],
+            ),
+        ] {
+            let output = Fitted::fit(definition, &inputs)?.transform(&inputs)?;
+            let actual = output.frame().columns()[0]
+                .f64()?
+                .iter()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn integers_become_floats_and_float_types_are_kept() -> Result<(), TransformError> {
+        for (input, dtype) in [
+            (Column::new("x".into(), [1_i64, 3, 5]), DataType::Float64),
+            (Column::new("x".into(), [1_u8, 3, 5]), DataType::Float64),
+            (
+                Column::new("x".into(), [1.0_f32, 3.0, 5.0]),
+                DataType::Float32,
+            ),
+        ] {
+            let inputs = PreparedInput::new(&[input], false)?;
+            for (definition, expected) in [
+                (StandardizeDefinition::CENTER, [-2.0, 0.0, 2.0]),
+                (StandardizeDefinition::SCALE, [-1.0, 0.0, 1.0]),
+            ] {
+                let output = Fitted::fit(definition, &inputs)?.transform(&inputs)?;
+                let column = &output.frame().columns()[0];
+                assert_eq!(column.dtype(), &dtype);
+                let actual = column
+                    .cast(&DataType::Float64)?
+                    .f64()?
+                    .into_no_null_iter()
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+        }
+        Ok(())
     }
 }

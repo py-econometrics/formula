@@ -1,5 +1,5 @@
 use super::TransformError;
-use polars::prelude::{Column, DataFrame, Field, PlSmallStr};
+use polars::prelude::{Column, DataFrame, Expr, Field, NULL, PlSmallStr, lit, when};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgumentCount {
@@ -89,4 +89,10 @@ pub(crate) fn validate_numeric_field(field: &Field) -> Result<(), TransformError
         });
     }
     Ok(())
+}
+
+pub(super) fn finite_values(input: Expr) -> Expr {
+    when(input.clone().is_finite())
+        .then(input)
+        .otherwise(lit(NULL))
 }
