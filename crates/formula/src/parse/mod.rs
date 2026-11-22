@@ -1,16 +1,12 @@
 mod ast;
 mod expand;
-mod syntax;
-
-use syntax::ParseLayer;
 
 use crate::Role;
 use crate::fit::Fit;
-#[cfg(test)]
-use crate::formula::Term;
-use crate::formula::{Expression, FactorKind};
+use crate::formula::{Expression, FactorKind, Term, VariableDefinition};
 use crate::formula::{Factor, Formula, Formulas, push_unique};
-use crate::parse::ast::StepwiseOperator;
+use crate::parse::ast::{Compose, StepwiseOperator};
+use crate::parse::expand::Expand;
 use crate::transform::{
     CategoricalDefinition, ExpressionTransform, ParameterValue, PolynomialDefinition, Transform,
 };
@@ -20,8 +16,8 @@ use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
 use winnow::combinator::{
-    Prefix, alt, backtrack_err, cut_err, delimited, eof, expression, fail, opt, peek, preceded,
-    repeat, separated, terminated,
+    Postfix, Prefix, alt, cut_err, delimited, eof, expression, fail, opt, peek, preceded, repeat,
+    separated, terminated,
 };
 use winnow::error::{
     ContextError, ErrMode, FromExternalError, ParseError, StrContext, StrContextValue,
@@ -33,6 +29,7 @@ pub(crate) const FORMULA_SEPARATOR: char = '~';
 pub(crate) const PIPE_SEPARATOR: char = '|';
 const SUM_PRECEDENCE: i64 = 10;
 const PRODUCT_PRECEDENCE: i64 = 20;
+const ANNOTATION_PRECEDENCE: i64 = 25;
 const INTERACTION_PRECEDENCE: i64 = 30;
 const PREFIX_PRECEDENCE: i64 = 40;
 
@@ -321,20 +318,13 @@ pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>
         .parse_next(cursor)
 }
 
-fn parse_node<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
-    parse_node_at::<K>(cursor, 0)
-}
-
-fn parse_node_at<K: ParseLayer>(
-    cursor: &mut &str,
-    min_power: i64,
-) -> ModalResult<ast::ExpressionAst<K>> {
-    expression(parse_operand::<K>)
+fn parse_node<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<L>> {
+    expression(parse_operand::<L>)
         .prefix(
             preceded(multispace0, '-')
                 .value(Prefix(
                     PREFIX_PRECEDENCE,
-                    |cursor, node: ast::ExpressionAst<K>| {
+                    |cursor, node: ast::ExpressionAst<L>| {
                         construction_result(cursor, node.negate())
                     },
                 ))
@@ -346,19 +336,19 @@ fn parse_node_at<K: ParseLayer>(
             '+'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Add, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Add, left, right),
                 )
             })),
             '-'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Subtract, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Subtract, left, right),
                 )
             })),
             '*'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<K>::binary(
+                    ast::ExpressionAst::<L>::binary(
                         ast::BinaryOperator::InteractFully,
                         left,
                         right,
@@ -368,31 +358,30 @@ fn parse_node_at<K: ParseLayer>(
             '/'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Nest, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Nest, left, right),
                 )
             })),
             ':'.value(Right(INTERACTION_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<K>::binary(ast::BinaryOperator::Interact, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Interact, left, right),
                 )
             })),
         )))
-        .postfix(syntax::postfix::<K>)
-        .current_precedence_level(min_power)
+        .postfix(postfix::<L>)
         .parse_next(cursor)
 }
 
-fn parse_stepwise_arguments<K: ParseLayer>(
+fn parse_stepwise_arguments<L: ParseLayer>(
     cursor: &mut &str,
-) -> ModalResult<(ast::ExpressionAst<K>, Vec<ast::ExpressionAst<K>>)> {
+) -> ModalResult<(ast::ExpressionAst<L>, Vec<ast::ExpressionAst<L>>)> {
     multispace0.parse_next(cursor)?;
 
-    let first = cut_err(parse_node::<K>).parse_next(cursor)?;
+    let first = cut_err(parse_node::<L>).parse_next(cursor)?;
 
     let rest = repeat(
         0..,
-        preceded((multispace0, ',', multispace0), cut_err(parse_node::<K>)),
+        preceded((multispace0, ',', multispace0), cut_err(parse_node::<L>)),
     )
     .parse_next(cursor)?;
 
@@ -406,7 +395,7 @@ fn parse_stepwise_arguments<K: ParseLayer>(
     Ok((first, rest))
 }
 
-fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
+fn parse_stepwise<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<L>> {
     let operator = terminated(
         alt((
             "sw0".value(StepwiseOperator::Sw0),
@@ -419,11 +408,11 @@ fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::Expressi
     )
     .parse_next(cursor)?;
 
-    let (first, rest) = cut_err(parse_stepwise_arguments::<K>).parse_next(cursor)?;
+    let (first, rest) = cut_err(parse_stepwise_arguments::<L>).parse_next(cursor)?;
 
     construction_result(
         cursor,
-        ast::ExpressionAst::<K>::stepwise(ast::Stepwise {
+        ast::ExpressionAst::<L>::stepwise(ast::Stepwise {
             operator,
             first,
             rest,
@@ -431,12 +420,12 @@ fn parse_stepwise<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::Expressi
     )
 }
 
-fn parse_node_parenthesized<K: ParseLayer>(
+fn parse_node_parenthesized<L: ParseLayer>(
     cursor: &mut &str,
-) -> ModalResult<ast::ExpressionAst<K>> {
+) -> ModalResult<ast::ExpressionAst<L>> {
     '('.parse_next(cursor)?;
 
-    let node = cut_err(parse_node::<K>).parse_next(cursor)?;
+    let node = cut_err(parse_node::<L>).parse_next(cursor)?;
 
     cut_err(
         ')'.context(StrContext::Expected(StrContextValue::Description(
@@ -445,25 +434,166 @@ fn parse_node_parenthesized<K: ParseLayer>(
     )
     .parse_next(cursor)?;
 
-    construction_result(cursor, node.parenthesized())
+    Ok(node.parenthesized())
 }
 
-fn parse_operand<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<K>> {
+fn parse_operand<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAst<L>> {
     delimited(
         multispace0,
         alt((
-            syntax::nested::<K>,
-            // A source operand may itself contain grouped/stepwise nested values.
-            // If it cannot read them, retry those delimiters in this layer.
-            backtrack_err(syntax::primary::<K>),
-            parse_node_parenthesized::<K>,
-            parse_stepwise::<K>,
-            syntax::primary::<K>,
-            syntax::reject_child::<K>,
+            parse_node_parenthesized::<L>,
+            parse_stepwise::<L>,
+            ast::ExpressionAst::<L>::atom,
         )),
         multispace0,
     )
     .parse_next(cursor)
+}
+
+/// Generic description of how the `winnow` parser converts strings to the typed AST
+trait ParseAtom: Sized {
+    fn parse(cursor: &mut &str) -> ModalResult<(Self, bool)>;
+}
+
+impl ParseAtom for ast::Forbidden {
+    fn parse(cursor: &mut &str) -> ModalResult<(Self, bool)> {
+        fail.parse_next(cursor)
+    }
+}
+
+impl ParseAtom for Term {
+    fn parse(cursor: &mut &str) -> ModalResult<(Self, bool)> {
+        alt((
+            take_while(1.., is_identifier_character)
+                .verify(|name: &str| matches!(name, "0" | "1"))
+                .map(|name| (Term::intercept(), name == "0")),
+            parse_factor.map(|factor| (Term::from(factor), false)),
+        ))
+        .parse_next(cursor)
+    }
+}
+
+impl ParseAtom for VariableDefinition {
+    fn parse(cursor: &mut &str) -> ModalResult<(Self, bool)> {
+        let (term, negate) = Term::parse(cursor)?;
+        construction_result(
+            cursor,
+            Self::try_from(term).map_err(|_| ast::ConstructionError::Unsupported),
+        )
+        .map(|value| (value, negate))
+    }
+}
+
+impl ParseAtom for Box<ast::FormulaAst> {
+    fn parse(cursor: &mut &str) -> ModalResult<(Self, bool)> {
+        preceded(
+            '[',
+            cut_err(terminated(
+                parse_formula_ast,
+                ']'.context(StrContext::Expected(StrContextValue::Description(
+                    "']' to close the nested formula",
+                ))),
+            )),
+        )
+        .map(|formula| (Box::new(formula), false))
+        .parse_next(cursor)
+    }
+}
+
+trait ParseAnnotation: Sized {
+    fn starts(input: &str) -> bool;
+    fn parse(cursor: &mut &str) -> ModalResult<Self>;
+}
+
+impl ParseAnnotation for ast::Forbidden {
+    fn starts(_: &str) -> bool {
+        false
+    }
+    fn parse(cursor: &mut &str) -> ModalResult<Self> {
+        fail.parse_next(cursor)
+    }
+}
+
+impl ParseAnnotation for ast::VaryingSlopes {
+    fn starts(input: &str) -> bool {
+        input.starts_with('[')
+    }
+    fn parse(cursor: &mut &str) -> ModalResult<Self> {
+        let intercept = alt(("[[".value(false), '['.value(true))).parse_next(cursor)?;
+        let close = if intercept { "]" } else { "]]" };
+        let (first, rest) =
+            cut_err(terminated(parse_loadings, (close, multispace0))).parse_next(cursor)?;
+        Ok(Self {
+            intercept,
+            first,
+            rest,
+        })
+    }
+}
+
+// Alias for [`ast::Layer`] for more compact type bounds in `parse_node` etc
+trait ParseLayer:
+    ast::Layer<Atom: ParseAtom, Inner: ParseExpression, Annotation: ParseAnnotation>
+{
+}
+impl<L> ParseLayer for L where
+    L: ast::Layer<Atom: ParseAtom, Inner: ParseExpression, Annotation: ParseAnnotation>
+{
+}
+
+trait ParseExpression: Compose {
+    fn atom(cursor: &mut &str) -> ModalResult<Self>;
+    fn annotation_starts(input: &str) -> bool;
+    fn annotation(self, cursor: &mut &str) -> ModalResult<Self>;
+}
+
+impl ParseExpression for ast::Forbidden {
+    fn atom(cursor: &mut &str) -> ModalResult<Self> {
+        fail.parse_next(cursor)
+    }
+    fn annotation_starts(_: &str) -> bool {
+        false
+    }
+    fn annotation(self, _: &mut &str) -> ModalResult<Self> {
+        match self {}
+    }
+}
+
+impl<L: ParseLayer> ParseExpression for ast::ExpressionAst<L> {
+    fn atom(cursor: &mut &str) -> ModalResult<Self> {
+        match opt(L::Atom::parse).parse_next(cursor)? {
+            Some((atom, false)) => Ok(Self::Atom(atom)),
+            Some((atom, true)) => construction_result(cursor, Self::Atom(atom).negate()),
+            None => L::Inner::atom(cursor).map(Self::embed),
+        }
+    }
+
+    fn annotation_starts(input: &str) -> bool {
+        L::Annotation::starts(input) || L::Inner::annotation_starts(input)
+    }
+
+    fn annotation(self, cursor: &mut &str) -> ModalResult<Self> {
+        if L::Annotation::starts(cursor) {
+            let annotation = L::Annotation::parse(cursor)?;
+            return construction_result(cursor, self.annotate(annotation));
+        }
+        match self.into_inner() {
+            Ok(inner) => inner.annotation(cursor).map(Self::embed),
+            Err(_) => construction_result(cursor, Err(ast::ConstructionError::Unsupported)),
+        }
+    }
+}
+
+fn postfix<'i, L: ParseLayer>(
+    cursor: &mut &'i str,
+) -> ModalResult<Postfix<&'i str, ast::ExpressionAst<L>, ErrMode<ContextError>>> {
+    if ast::ExpressionAst::<L>::annotation_starts(cursor) {
+        Ok(Postfix(ANNOTATION_PRECEDENCE, |cursor, node| {
+            node.annotation(cursor)
+        }))
+    } else {
+        fail.parse_next(cursor)
+    }
 }
 
 fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
@@ -534,7 +664,7 @@ pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression
     let parser = |cursor: &mut &str| -> ModalResult<Expression> {
         let mut alternatives = match role {
             Role::Dependent | Role::Independent => {
-                parse_node::<ast::SingleFormula>(cursor)?.expand()
+                parse_node::<ast::SingleSimpleFormula>(cursor)?.expand()
             }
             Role::FixedEffect => {
                 let node = parse_node::<ast::SingleFixedEffects>(cursor)?;
@@ -741,17 +871,14 @@ mod tests {
                 ("firm[[-2.5]]", Scalar::from(-2.5_f64), false),
             ] {
                 let node = parse_node::<typed::FixedEffects>.parse(source).unwrap();
-                let typed::ExpressionAst::Nested(group) = node else {
-                    panic!("expected grouped loadings for {source}");
+                let typed::ExpressionAst::Embedded(_, Some(slopes)) = node else {
+                    panic!("expected varying slopes for {source}");
                 };
-                assert!(group.rest_loadings.is_empty());
-                let actual = group
-                    .first_loading
-                    .value()
-                    .expect("expected a numeric literal");
+                assert!(slopes.rest.is_empty());
+                let actual = slopes.first.value().expect("expected a numeric literal");
                 assert_eq!(actual.dtype(), value.dtype(), "{source}");
                 assert_eq!(actual, &value, "{source}");
-                assert_eq!(group.intercept, intercept, "{source}");
+                assert_eq!(slopes.intercept, intercept, "{source}");
             }
         }
 
@@ -859,18 +986,16 @@ mod tests {
 
         #[test]
         fn loadings_are_restricted_to_the_fixed_effect_pipe() {
-            for source in [
-                "y ~ x[time]",
-                "y ~ x[[time]]",
-                "y[time] ~ x",
-                "y ~ [a ~ b[time]]",
+            // Outside the fixed-effect section a bracket after a term is not
+            // part of the grammar, so parsing stops at it.
+            for (source, offset) in [
+                ("y ~ x[time]", 5),
+                ("y ~ x[[time]]", 5),
+                ("y[time] ~ x", 1),
+                ("y ~ [a ~ b[time]]", 10),
             ] {
                 let error = parse(source).unwrap_err();
-                assert_eq!(
-                    construction_error(error.inner()),
-                    &typed::ConstructionError::Unsupported,
-                    "{source}: {error}",
-                );
+                assert_eq!(error.offset(), offset, "{source}: {error}");
             }
         }
     }
@@ -1025,15 +1150,22 @@ mod tests {
         use super::*;
         use typed::{ExpressionAst as Ast, SimpleFormula};
 
+        /// The inner expression of an unannotated embedding.
+        fn inner<L: typed::Layer>(node: Ast<L>) -> L::Inner {
+            node.into_inner()
+                .unwrap_or_else(|_| panic!("expected an unannotated embedding"))
+        }
+
         fn simple(source: &str) -> Ast<SimpleFormula> {
-            let expression = parse_node::<typed::MultistageFormula>
-                .parse(source)
-                .unwrap();
-            expression.into_inner().unwrap()
+            inner(
+                parse_node::<typed::MultistageFormula>
+                    .parse(source)
+                    .unwrap(),
+            )
         }
 
         fn assert_term(node: &Ast<SimpleFormula>, name: &str) {
-            let Ast::Operand(term) = node else {
+            let Ast::Atom(term) = node else {
                 panic!("expected term {name}");
             };
             assert_eq!(term, &Term::from(Factor::from(name)));
@@ -1042,14 +1174,9 @@ mod tests {
         #[test]
         fn parsing_preserves_formula_sections_and_default_group_settings() {
             let formula = parse_formula_ast.parse("y ~ x | firm").unwrap();
-            let left = formula.left.into_inner().unwrap();
-            let right = formula.right.into_inner().unwrap();
-            assert_term(&left, "y");
-            assert_term(&right, "x");
-            let Some(Ast::Operand(group)) = formula.fixed_effects else {
-                panic!("expected a complete fixed-effect operand");
-            };
-            let Ast::Operand(column) = group.group else {
+            assert_term(&inner(formula.left), "y");
+            assert_term(&inner(formula.right), "x");
+            let Ast::Atom(column) = inner(formula.fixed_effects.unwrap()) else {
                 panic!("expected a grouping column")
             };
             assert_eq!(column.name(), "firm");
@@ -1057,13 +1184,13 @@ mod tests {
 
         #[test]
         fn child_formulas_remain_unexpanded() {
-            let Ast::Nested(child) = parse_node::<typed::MultistageFormula>
+            let Ast::Atom(child) = parse_node::<typed::MultistageFormula>
                 .parse("[a ~ sw(x, z)]")
                 .unwrap()
             else {
                 panic!("expected a child formula");
             };
-            let Ast::Stepwise(_, call) = child.right.into_inner().unwrap() else {
+            let Ast::Stepwise(_, call) = inner(child.right) else {
                 panic!("expected an unexpanded stepwise call");
             };
             assert_term(&call.first, "x");
@@ -1081,11 +1208,8 @@ mod tests {
                 ("0x", "0x"),
                 ("1x", "1x"),
             ] {
-                let Ast::Operand(column) = parse_node::<typed::FixedEffects>
-                    .parse(source)
-                    .unwrap()
-                    .into_inner()
-                    .unwrap()
+                let Ast::Atom(column) =
+                    inner(parse_node::<typed::FixedEffects>.parse(source).unwrap())
                 else {
                     panic!("expected a grouping column for {source}");
                 };
@@ -1095,26 +1219,22 @@ mod tests {
 
         #[test]
         fn loading_postfix_wraps_the_entire_grouping_interaction() {
-            let Ast::Nested(group) = parse_node::<typed::FixedEffects>
-                .parse("firm:year[time]")
-                .unwrap()
+            let Ast::Embedded(Ast::Interact(_, operands), Some(slopes)) =
+                parse_node::<typed::FixedEffects>
+                    .parse("firm:year[time]")
+                    .unwrap()
             else {
-                panic!("expected a loaded fixed-effect operand");
+                panic!("expected varying slopes on the whole interaction");
             };
-            let actual_loadings = group.loadings().cloned().collect::<Vec<_>>();
-            let Ast::Interact(_, operands) = group.group.group else {
-                panic!("expected an interaction inside the group");
-            };
-            let (Ast::Operand(left), Ast::Operand(right)) = (*operands.left, *operands.right)
-            else {
+            let (Ast::Atom(left), Ast::Atom(right)) = (*operands.left, *operands.right) else {
                 panic!("expected grouping columns");
             };
             assert_eq!((left.name(), right.name()), ("firm", "year"));
             assert_eq!(
-                actual_loadings.as_slice(),
-                &[std::sync::Arc::new(Factor::from("time"))]
+                slopes.loadings().cloned().collect::<Vec<_>>(),
+                [Arc::new(Factor::from("time"))]
             );
-            assert!(group.intercept);
+            assert!(slopes.intercept);
         }
 
         #[test]
@@ -2623,6 +2743,93 @@ mod tests {
 #[cfg(test)]
 mod layers {
     use super::*;
+
+    // Layers that were never declared in the AST: child formulas *and*
+    // varying slopes over simple expressions, under two operator vocabularies.
+    enum Additive {}
+    impl ast::Layer for Additive {
+        type Atom = Box<ast::FormulaAst>;
+        type Operators = ast::MultistageOperations;
+        type Inner = ast::ExpressionAst<ast::SimpleFormula>;
+        type Annotation = ast::VaryingSlopes;
+        type Stepwise = ast::Permitted;
+    }
+
+    enum Algebraic {}
+    impl ast::Layer for Algebraic {
+        type Atom = Box<ast::FormulaAst>;
+        type Operators = ast::FormulaOperations;
+        type Inner = ast::ExpressionAst<ast::SimpleFormula>;
+        type Annotation = ast::VaryingSlopes;
+        type Stepwise = ast::Permitted;
+    }
+
+    #[test]
+    fn atoms_and_annotations_are_reusable_across_operator_vocabularies() {
+        for source in ["x*y + [a ~ z]", "x*y + z[t]", "x*y + (z:w)[t]"] {
+            let ast::ExpressionAst::Add(_, pair) = parse_node::<Additive>.parse(source).unwrap()
+            else {
+                panic!("expected outer addition: {source}");
+            };
+            let ast::ExpressionAst::Embedded(inner, None) = *pair.left else {
+                panic!("inner subtree");
+            };
+            assert!(matches!(inner, ast::ExpressionAst::InteractFully(_, _)));
+        }
+        assert!(parse_node::<Additive>.parse("[a ~ x] * y[t]").is_err());
+        let ast::ExpressionAst::InteractFully(_, pair) =
+            parse_node::<Algebraic>.parse("[a ~ x] * y[t]").unwrap()
+        else {
+            panic!("outer interaction");
+        };
+        assert!(matches!(*pair.left, ast::ExpressionAst::Atom(_)));
+        assert!(matches!(
+            *pair.right,
+            ast::ExpressionAst::Embedded(_, Some(_))
+        ));
+    }
+
+    #[test]
+    fn annotation_binds_as_a_pratt_postfix() {
+        let ast::ExpressionAst::Add(_, pair) = parse_node::<Additive>.parse("x + y:z[t]").unwrap()
+        else {
+            panic!("outer addition");
+        };
+        let ast::ExpressionAst::Embedded(group, Some(_)) = *pair.right else {
+            panic!("loaded group");
+        };
+        assert!(matches!(group, ast::ExpressionAst::Interact(_, _)));
+        assert!(matches!(
+            parse_node::<Additive>
+                .parse("sw([a ~ x], (y:z)[t])")
+                .unwrap(),
+            ast::ExpressionAst::Stepwise(_, _)
+        ));
+        for source in ["[a ~ x][t]", "x[t][u]", "([a ~ x] + y)[t]", "sw(x[t], y):z"] {
+            assert!(parse_node::<Additive>.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_third_layer_reuses_the_entire_fixed_effect_grammar() {
+        enum Envelope {}
+        impl ast::Layer for Envelope {
+            type Atom = ast::Forbidden;
+            type Operators = ast::FixedEffectOperations;
+            type Inner = ast::ExpressionAst<ast::FixedEffects>;
+            type Annotation = ast::Forbidden;
+            type Stepwise = ast::Permitted;
+        }
+        for source in [
+            "firm:year + sector[t]",
+            "sw(firm, year)[t]",
+            "(firm[t] + year)",
+        ] {
+            let expression = parse_node::<Envelope>.parse(source).unwrap();
+            assert!(expression.into_inner().is_ok(), "{source}");
+        }
+    }
+
     #[test]
     fn mixed_layer_example_keeps_inner_interaction_and_outer_parentheses() {
         assert_eq!(
@@ -2635,7 +2842,7 @@ mod layers {
         let ast::ExpressionAst::Add(_, pair) = node else {
             panic!("outer addition");
         };
-        let ast::ExpressionAst::Operand(inner) = *pair.left else {
+        let ast::ExpressionAst::Embedded(inner, None) = *pair.left else {
             panic!("inner expression operand");
         };
         assert!(matches!(inner, ast::ExpressionAst::InteractFully(_, _)));
