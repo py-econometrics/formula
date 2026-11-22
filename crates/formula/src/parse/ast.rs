@@ -1,54 +1,33 @@
-use crate::Factor;
-use std::sync::Arc;
-
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum ConstructionError {
-    Unsupported,
-}
-
-impl std::fmt::Display for ConstructionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unsupported => f.write_str("operation is not supported"),
-        }
-    }
-}
-
-impl std::error::Error for ConstructionError {}
+use crate::formula::VaryingSlopes;
 
 pub(super) struct Permitted;
 pub(super) enum Forbidden {}
 
 pub(super) trait Permission: Sized {
-    fn permit() -> Result<Self, ConstructionError>;
+    fn permit() -> Option<Self>;
 }
 
 impl Permission for Permitted {
-    fn permit() -> Result<Self, ConstructionError> {
-        Ok(Self)
+    fn permit() -> Option<Self> {
+        Some(Self)
     }
 }
 
 impl Permission for Forbidden {
-    fn permit() -> Result<Self, ConstructionError> {
-        Err(ConstructionError::Unsupported)
+    fn permit() -> Option<Self> {
+        None
     }
 }
 
-impl<E: ExpressionKind> TryFrom<ExpressionAst<E>> for Forbidden {
-    type Error = ConstructionError;
-
-    fn try_from(_: ExpressionAst<E>) -> Result<Self, Self::Error> {
-        Err(ConstructionError::Unsupported)
-    }
-}
-
-/// Check if this constructor is permitted
+/// Apply the constructor if it is permitted, or hand the value back
 pub(super) fn permitted<P: Permission, T, E>(
     value: T,
     constructor: impl FnOnce(P, T) -> E,
-) -> Result<E, ConstructionError> {
-    Ok(constructor(P::permit()?, value))
+) -> Result<E, T> {
+    match P::permit() {
+        Some(permission) => Ok(constructor(permission, value)),
+        None => Err(value),
+    }
 }
 
 /// Two operands of the same expression type
@@ -66,6 +45,7 @@ impl<E> Binary<E> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum BinaryOperator {
     Add,
     Subtract,
@@ -75,17 +55,20 @@ pub(super) enum BinaryOperator {
 }
 
 impl BinaryOperator {
-    fn construct<K: ExpressionKind>(
+    fn construct<L: Layer>(
         self,
-        operands: Binary<ExpressionAst<K>>,
-    ) -> Result<ExpressionAst<K>, ConstructionError> {
+        left: ExpressionAst<L>,
+        right: ExpressionAst<L>,
+    ) -> Result<ExpressionAst<L>, (ExpressionAst<L>, ExpressionAst<L>)> {
+        let operands = Binary::new(left, right);
         match self {
-            Self::Add => permitted(operands, ExpressionAst::<K>::Add),
-            Self::Subtract => permitted(operands, ExpressionAst::<K>::Subtract),
-            Self::Interact => permitted(operands, ExpressionAst::<K>::Interact),
-            Self::InteractFully => permitted(operands, ExpressionAst::<K>::InteractFully),
-            Self::Nest => permitted(operands, ExpressionAst::<K>::Nesting),
+            Self::Add => permitted(operands, ExpressionAst::<L>::Add),
+            Self::Subtract => permitted(operands, ExpressionAst::<L>::Subtract),
+            Self::Interact => permitted(operands, ExpressionAst::<L>::Interact),
+            Self::InteractFully => permitted(operands, ExpressionAst::<L>::InteractFully),
+            Self::Nest => permitted(operands, ExpressionAst::<L>::Nesting),
         }
+        .map_err(|operands| (*operands.left, *operands.right))
     }
 }
 
@@ -98,426 +81,411 @@ pub(super) enum StepwiseOperator {
     Mvsw,
 }
 
-/// A nonempty sequence of stepwise arguments.
-pub(super) struct Stepwise<E> {
-    pub(super) operator: StepwiseOperator,
-    pub(super) first: E,
-    pub(super) rest: Vec<E>,
+/// A layer of a formula expression.
+///
+/// A layer is defined by its atomic operand and operators. It may also embed an inner layer,
+/// and optionally annotate the inner layer.
+pub(super) trait Layer {
+    type Atom;
+    type Operators: Operations;
+    type Inner: Compose;
+    type Annotation;
+    type Stepwise: Permission;
 }
 
-/// A fixed effect with optional varying-slope loadings.
-pub(super) struct FixedEffectGroup<K: ExpressionKind> {
-    pub(super) group: ExpressionAst<K>,
-    pub(super) intercept: bool,
-    pub(super) loadings: Vec<Arc<Factor>>,
+/// An expression in layer `L` determining which variants can exist.
+pub(super) enum ExpressionAst<L: Layer> {
+    Atom(L::Atom),
+
+    Embedded(L::Inner, Option<L::Annotation>),
+
+    Add(<L::Operators as Operations>::Addition, Binary<Self>),
+    Subtract(<L::Operators as Operations>::Subtraction, Binary<Self>),
+    Negate(<L::Operators as Operations>::Negation, Box<Self>),
+    Interact(<L::Operators as Operations>::Interaction, Binary<Self>),
+    InteractFully(<L::Operators as Operations>::FullInteraction, Binary<Self>),
+    Nesting(<L::Operators as Operations>::Nesting, Binary<Self>),
+
+    Parenthesized(Box<Self>),
+    /// A stepwise call over a nonempty sequence of arguments.
+    Stepwise(L::Stepwise, StepwiseOperator, Box<Self>, Vec<Self>),
 }
 
-impl<K: ExpressionKind> From<ExpressionAst<K>> for FixedEffectGroup<K> {
-    fn from(group: ExpressionAst<K>) -> Self {
-        Self {
-            group,
-            intercept: true,
-            loadings: Vec::new(),
-        }
+/// A description of how [`Layer`]s can be composed.
+pub(super) trait Compose: Sized {
+    fn parenthesized(self) -> Self;
+    fn negate(self) -> Result<Self, Self>;
+    fn binary(operator: BinaryOperator, left: Self, right: Self) -> Result<Self, (Self, Self)>;
+    fn stepwise(
+        operator: StepwiseOperator,
+        first: Self,
+        rest: Vec<Self>,
+    ) -> Result<Self, (Self, Vec<Self>)>;
+}
+
+impl Compose for Forbidden {
+    fn parenthesized(self) -> Self {
+        match self {}
+    }
+    fn negate(self) -> Result<Self, Self> {
+        match self {}
+    }
+    fn binary(_: BinaryOperator, left: Self, _: Self) -> Result<Self, (Self, Self)> {
+        match left {}
+    }
+    fn stepwise(_: StepwiseOperator, first: Self, _: Vec<Self>) -> Result<Self, (Self, Vec<Self>)> {
+        match first {}
     }
 }
 
-/// An expression's operand type and permitted operations.
-pub(super) trait ExpressionKind: Sized {
-    type Operand;
-
+pub(super) trait Operations {
     type Addition: Permission;
     type Subtraction: Permission;
     type Negation: Permission;
     type Interaction: Permission;
     type FullInteraction: Permission;
     type Nesting: Permission;
-    type Stepwise: Permission;
-    type Child: Permission;
 }
 
-/// An expression enum whose [`ExpressionKind`] determines which variants can exist
-pub(super) enum ExpressionAst<K: ExpressionKind> {
-    Operand(K::Operand),
+pub(super) enum FormulaOperations {}
 
-    Add(K::Addition, Binary<Self>),
-    Subtract(K::Subtraction, Binary<Self>),
-    Negate(K::Negation, Box<Self>),
-    Interact(K::Interaction, Binary<Self>),
-    InteractFully(K::FullInteraction, Binary<Self>),
-    Nesting(K::Nesting, Binary<Self>),
-
-    Parenthesized(Box<Self>),
-    Stepwise(K::Stepwise, Box<Stepwise<Self>>),
-
-    Child(K::Child, Box<FormulaAst>),
-}
-
-/// A forbidden expression
-impl ExpressionKind for Forbidden {
-    type Operand = Forbidden;
-
-    type Addition = Forbidden;
-    type Subtraction = Forbidden;
-    type Negation = Forbidden;
-    type Interaction = Forbidden;
-    type FullInteraction = Forbidden;
-    type Nesting = Forbidden;
-    type Stepwise = Forbidden;
-    type Child = Forbidden;
-}
-
-/// An expression without stepwise calls or multistage formulas
-pub(super) enum SingleFormulaExpression {}
-
-impl ExpressionKind for SingleFormulaExpression {
-    type Operand = crate::Term;
-
+impl Operations for FormulaOperations {
     type Addition = Permitted;
     type Subtraction = Permitted;
     type Negation = Permitted;
     type Interaction = Permitted;
     type FullInteraction = Permitted;
     type Nesting = Permitted;
-    type Stepwise = Forbidden;
-    type Child = Forbidden;
 }
 
-/// An expression over formula terms including stepwise but without multistage terms
-pub(super) enum SimpleFormulaExpression {}
+pub(super) enum MultistageOperations {}
 
-impl ExpressionKind for SimpleFormulaExpression {
-    type Operand = crate::Term;
-
-    type Addition = Permitted;
-    type Subtraction = Permitted;
-    type Negation = Permitted;
-    type Interaction = Permitted;
-    type FullInteraction = Permitted;
-    type Nesting = Permitted;
-    type Stepwise = Permitted;
-    type Child = Forbidden;
-}
-
-/// An expression over formula terms including stepwise and multistage
-pub(super) enum MultistageFormulaExpression {}
-
-impl ExpressionKind for MultistageFormulaExpression {
-    type Operand = ExpressionAst<SimpleFormulaExpression>;
-
+impl Operations for MultistageOperations {
     type Addition = Permitted;
     type Subtraction = Permitted;
     type Negation = Forbidden;
     type Interaction = Forbidden;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
-    type Stepwise = Permitted;
-    type Child = Permitted;
 }
 
-/// An expression over potentially grouped column terms, including stepwise expansion
-pub(super) enum GroupingExpression {}
+pub(super) enum GroupingOperations {}
 
-impl ExpressionKind for GroupingExpression {
-    type Operand = crate::formula::VariableDefinition;
-
+impl Operations for GroupingOperations {
     type Addition = Permitted;
     type Subtraction = Forbidden;
     type Negation = Forbidden;
     type Interaction = Permitted;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
-    type Stepwise = Permitted;
-    type Child = Forbidden;
 }
 
-/// An expression over fixed-effect terms, potentially loaded with varying slopes, including stepwise expansion
-pub(super) enum FixedEffectExpression {}
+pub(super) enum FixedEffectOperations {}
 
-impl ExpressionKind for FixedEffectExpression {
-    type Operand = FixedEffectGroup<GroupingExpression>;
-
+impl Operations for FixedEffectOperations {
     type Addition = Permitted;
     type Subtraction = Forbidden;
     type Negation = Forbidden;
     type Interaction = Forbidden;
     type FullInteraction = Forbidden;
     type Nesting = Forbidden;
+}
+
+/// A formula with stepwise calls
+pub(super) enum SimpleFormula {}
+impl Layer for SimpleFormula {
+    type Atom = crate::Term;
+    type Operators = FormulaOperations;
+    type Inner = Forbidden;
+    type Annotation = Forbidden;
     type Stepwise = Permitted;
-    type Child = Forbidden;
 }
 
-/// An expression over potentially grouped column terms, excluding stepwise expansion
-pub(super) enum SingleGroupingExpression {}
+/// A formula including multistage child formulas
+pub(super) enum MultistageFormula {}
+impl Layer for MultistageFormula {
+    type Atom = Box<FormulaAst>;
+    type Operators = MultistageOperations;
+    type Inner = ExpressionAst<SimpleFormula>;
+    type Annotation = Forbidden;
+    type Stepwise = Permitted;
+}
 
-impl ExpressionKind for SingleGroupingExpression {
-    type Operand = crate::formula::VariableDefinition;
-
-    type Addition = Permitted;
-    type Subtraction = Forbidden;
-    type Negation = Forbidden;
-    type Interaction = Permitted;
-    type FullInteraction = Forbidden;
-    type Nesting = Forbidden;
+/// A simple formula without stepwise calls
+pub(super) enum SingleSimpleFormula {}
+impl Layer for SingleSimpleFormula {
+    type Atom = crate::Term;
+    type Operators = FormulaOperations;
+    type Inner = Forbidden;
+    type Annotation = Forbidden;
     type Stepwise = Forbidden;
-    type Child = Forbidden;
 }
 
-/// An expression over fixed-effect terms, potentially loaded with varying slopes, excluding stepwise expansion
-pub(super) enum SingleFixedEffectExpression {}
+/// Grouping of bare variables
+pub(super) enum VariableGrouping {}
+impl Layer for VariableGrouping {
+    type Atom = crate::formula::VariableDefinition;
+    type Operators = GroupingOperations;
+    type Inner = Forbidden;
+    type Annotation = Forbidden;
+    type Stepwise = Permitted;
+}
 
-impl ExpressionKind for SingleFixedEffectExpression {
-    type Operand = FixedEffectGroup<SingleGroupingExpression>;
-
-    type Addition = Permitted;
-    type Subtraction = Forbidden;
-    type Negation = Forbidden;
-    type Interaction = Forbidden;
-    type FullInteraction = Forbidden;
-    type Nesting = Forbidden;
+/// Grouping of bare variables excluding stepwise calls
+pub(super) enum SingleVariableGrouping {}
+impl Layer for SingleVariableGrouping {
+    type Atom = crate::formula::VariableDefinition;
+    type Operators = GroupingOperations;
+    type Inner = Forbidden;
+    type Annotation = Forbidden;
     type Stepwise = Forbidden;
-    type Child = Forbidden;
 }
 
-/// Defines an [`ExpressionKind`] with its embedded counterpart
-pub(super) trait ParseGrammar: ExpressionKind<Operand: TryFrom<crate::Term>> {
-    type Embedded: ExpressionKind<Operand: TryFrom<ExpressionAst<Self>>>;
-
-    fn grouped(
-        _group: FixedEffectGroup<Self>,
-    ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Err(ConstructionError::Unsupported)
-    }
+/// Grouping of bare variables with optional varying slopes
+pub(super) enum FixedEffects {}
+impl Layer for FixedEffects {
+    type Atom = Forbidden;
+    type Operators = FixedEffectOperations;
+    type Inner = ExpressionAst<VariableGrouping>;
+    type Annotation = VaryingSlopes;
+    type Stepwise = Permitted;
 }
 
-impl ParseGrammar for SingleFormulaExpression {
-    type Embedded = Forbidden;
+/// Grouping of bare variables with optional varying slopes but without stepwise calls
+pub(super) enum SingleFixedEffects {}
+impl Layer for SingleFixedEffects {
+    type Atom = Forbidden;
+    type Operators = FixedEffectOperations;
+    type Inner = ExpressionAst<SingleVariableGrouping>;
+    type Annotation = VaryingSlopes;
+    type Stepwise = Forbidden;
 }
-
-impl ParseGrammar for SimpleFormulaExpression {
-    type Embedded = MultistageFormulaExpression;
-}
-
-impl ParseGrammar for GroupingExpression {
-    type Embedded = FixedEffectExpression;
-
-    fn grouped(
-        group: FixedEffectGroup<Self>,
-    ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Ok(ExpressionAst::Operand(group))
-    }
-}
-
-impl ParseGrammar for SingleGroupingExpression {
-    type Embedded = SingleFixedEffectExpression;
-
-    fn grouped(
-        group: FixedEffectGroup<Self>,
-    ) -> Result<ExpressionAst<Self::Embedded>, ConstructionError> {
-        Ok(ExpressionAst::Operand(group))
-    }
-}
-
-/// Homogeneous result returned by the Pratt parser.
-pub(super) enum ParsedNode<K: ParseGrammar> {
-    Flat(ExpressionAst<K>),
-    Embedded(ExpressionAst<K::Embedded>),
-}
-
-pub(super) type FormulaNode = ParsedNode<SimpleFormulaExpression>;
 
 /// A formula before expansion into estimation alternatives.
 pub(super) struct FormulaAst {
-    pub(super) left: FormulaNode,
-    pub(super) right: FormulaNode,
-    pub(super) fixed_effects: Option<ExpressionAst<FixedEffectExpression>>,
+    pub(super) left: ExpressionAst<MultistageFormula>,
+    pub(super) right: ExpressionAst<MultistageFormula>,
+    pub(super) fixed_effects: Option<ExpressionAst<FixedEffects>>,
 }
 
-impl<K: ParseGrammar> ParsedNode<K> {
-    fn into_flat(self) -> Result<ExpressionAst<K>, ConstructionError> {
+/// Implements the lifecycle of an [`ExpressionAst`]:
+/// atom -> operators -> embed -> annotate -> next layer ->
+impl<L: Layer> ExpressionAst<L> {
+    pub(super) fn embed(inner: L::Inner) -> Self {
+        Self::Embedded(inner, None)
+    }
+
+    pub(super) fn into_inner(self) -> Result<L::Inner, Self> {
         match self {
-            Self::Flat(expression) => Ok(expression),
-            Self::Embedded(_) => Err(ConstructionError::Unsupported),
+            Self::Embedded(inner, None) => Ok(inner),
+            outer => Err(outer),
         }
     }
 
-    pub(super) fn parenthesized(self) -> Self {
+    pub(super) fn annotate(self, annotation: L::Annotation) -> Option<Self> {
         match self {
-            Self::Flat(expression) => {
-                Self::Flat(ExpressionAst::Parenthesized(Box::new(expression)))
-            }
-            Self::Embedded(expression) => {
-                Self::Embedded(ExpressionAst::Parenthesized(Box::new(expression)))
-            }
+            Self::Embedded(inner, None) => Some(Self::Embedded(inner, Some(annotation))),
+            _ => None,
+        }
+    }
+}
+
+/// [`Compose`] operators of an [`ExpressionAst`]
+impl<L: Layer> Compose for ExpressionAst<L> {
+    fn parenthesized(self) -> Self {
+        match self.into_inner() {
+            Ok(inner) => Self::embed(inner.parenthesized()),
+            Err(outer) => Self::Parenthesized(Box::new(outer)),
         }
     }
 
-    pub(super) fn negate(self) -> Result<Self, ConstructionError> {
-        match self {
-            Self::Flat(expression) => {
-                permitted(Box::new(expression), ExpressionAst::<K>::Negate).map(Self::Flat)
-            }
-            Self::Embedded(expression) => {
-                permitted(Box::new(expression), ExpressionAst::<K::Embedded>::Negate)
-                    .map(Self::Embedded)
-            }
-        }
-    }
-
-    pub(super) fn child(formula: FormulaAst) -> Result<Self, ConstructionError> {
-        permitted(Box::new(formula), ExpressionAst::<K::Embedded>::Child).map(Self::Embedded)
-    }
-
-    pub(super) fn from_term(term: crate::Term) -> Result<Self, ConstructionError> {
-        let operand = K::Operand::try_from(term).map_err(|_| ConstructionError::Unsupported)?;
-        Ok(Self::Flat(ExpressionAst::Operand(operand)))
-    }
-
-    pub(super) fn into_embedded(self) -> Result<ExpressionAst<K::Embedded>, ConstructionError> {
-        match self {
-            Self::Flat(expression) => {
-                let operand = <K::Embedded as ExpressionKind>::Operand::try_from(expression)
-                    .map_err(|_| ConstructionError::Unsupported)?;
-
-                Ok(ExpressionAst::Operand(operand))
-            }
-            Self::Embedded(expression) => Ok(expression),
-        }
-    }
-
-    pub(super) fn binary(
-        operator: BinaryOperator,
-        left: Self,
-        right: Self,
-    ) -> Result<Self, ConstructionError> {
-        match (left, right) {
-            (Self::Flat(left), Self::Flat(right)) => {
-                operator.construct(Binary::new(left, right)).map(Self::Flat)
-            }
-            (left, right) => {
-                let operands = Binary::new(left.into_embedded()?, right.into_embedded()?);
-                operator.construct(operands).map(Self::Embedded)
-            }
-        }
-    }
-
-    pub(super) fn grouped(
-        self,
-        intercept: bool,
-        first: Arc<Factor>,
-        rest: Vec<Arc<Factor>>,
-    ) -> Result<Self, ConstructionError> {
-        let group = FixedEffectGroup {
-            group: self.into_flat()?,
-            intercept,
-            loadings: std::iter::once(first).chain(rest).collect(),
+    fn negate(self) -> Result<Self, Self> {
+        let operand = match self.into_inner() {
+            Ok(inner) => match inner.negate() {
+                Ok(inner) => return Ok(Self::embed(inner)),
+                Err(inner) => Self::embed(inner),
+            },
+            Err(outer) => outer,
         };
-
-        K::grouped(group).map(Self::Embedded)
+        permitted(Box::new(operand), Self::Negate).map_err(|operand| *operand)
     }
 
-    pub(super) fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError> {
-        let has_embedded = std::iter::once(&call.first)
-            .chain(call.rest.iter())
-            .any(|argument| matches!(argument, Self::Embedded(_)));
+    fn binary(operator: BinaryOperator, left: Self, right: Self) -> Result<Self, (Self, Self)> {
+        let (left, right) = match (left, right) {
+            (Self::Embedded(left, None), Self::Embedded(right, None)) => {
+                match L::Inner::binary(operator, left, right) {
+                    Ok(inner) => return Ok(Self::embed(inner)),
+                    Err((left, right)) => (Self::embed(left), Self::embed(right)),
+                }
+            }
+            operands => operands,
+        };
+        operator.construct(left, right)
+    }
 
-        let Stepwise {
-            operator,
-            first,
-            rest,
-        } = call;
-
-        if has_embedded {
-            let call = Stepwise {
-                operator,
-                first: first.into_embedded()?,
-                rest: rest
-                    .into_iter()
-                    .map(Self::into_embedded)
-                    .collect::<Result<Vec<_>, _>>()?,
+    fn stepwise(
+        operator: StepwiseOperator,
+        first: Self,
+        rest: Vec<Self>,
+    ) -> Result<Self, (Self, Vec<Self>)> {
+        let is_inner = |argument: &Self| matches!(argument, Self::Embedded(_, None));
+        let (first, rest) = if is_inner(&first) && rest.iter().all(is_inner) {
+            let unwrap = |argument| match argument {
+                Self::Embedded(inner, None) => inner,
+                _ => unreachable!("every argument is an unannotated embedding"),
             };
-            permitted(Box::new(call), ExpressionAst::<K::Embedded>::Stepwise).map(Self::Embedded)
+            match L::Inner::stepwise(
+                operator,
+                unwrap(first),
+                rest.into_iter().map(unwrap).collect(),
+            ) {
+                Ok(inner) => return Ok(Self::embed(inner)),
+                Err((first, rest)) => (
+                    Self::embed(first),
+                    rest.into_iter().map(Self::embed).collect(),
+                ),
+            }
         } else {
-            let call = Stepwise {
-                operator,
-                first: first.into_flat()?,
-                rest: rest
-                    .into_iter()
-                    .map(Self::into_flat)
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-
-            permitted(Box::new(call), ExpressionAst::<K>::Stepwise).map(Self::Flat)
-        }
+            (first, rest)
+        };
+        permitted((Box::new(first), rest), |permission, (first, rest)| {
+            Self::Stepwise(permission, operator, first, rest)
+        })
+        .map_err(|(first, rest)| (*first, rest))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Factor;
+    use std::sync::Arc;
 
-    type Node = ParsedNode<GroupingExpression>;
+    type Node = ExpressionAst<FixedEffects>;
 
     fn column(name: &str) -> Node {
-        Node::from_term(crate::Term::from(Factor::from(name))).unwrap()
+        let definition =
+            crate::formula::VariableDefinition::try_from(crate::Term::from(Factor::from(name)))
+                .unwrap();
+        Node::embed(ExpressionAst::Atom(definition))
+    }
+
+    fn slopes(loading: &str) -> VaryingSlopes {
+        VaryingSlopes {
+            intercept: false,
+            first: Arc::new(Factor::from(loading)),
+            rest: Vec::new(),
+        }
+    }
+
+    fn built<T, R>(result: Result<T, R>) -> T {
+        result.unwrap_or_else(|_| panic!("expected the construction to be permitted"))
     }
 
     fn loaded() -> Node {
-        column("year")
-            .grouped(false, Arc::new(Factor::from("time")), Vec::new())
-            .unwrap()
+        column("year").annotate(slopes("time")).unwrap()
     }
 
     #[test]
-    fn non_nesting_kind_rejects_embedding() {
-        let node =
-            ParsedNode::<SingleFormulaExpression>::from_term(crate::Term::intercept()).unwrap();
+    fn atoms_have_no_inner_expression() {
+        let node = ExpressionAst::<SingleSimpleFormula>::Atom(crate::Term::intercept());
+        assert!(node.into_inner().is_err());
+    }
+
+    #[test]
+    fn annotations_apply_once_and_only_to_unannotated_embeddings() {
+        assert!(loaded().into_inner().is_err());
+        assert!(loaded().annotate(slopes("u")).is_none());
+        let sum = built(Node::binary(BinaryOperator::Add, loaded(), column("firm")));
+        assert!(sum.annotate(slopes("u")).is_none());
+    }
+
+    #[test]
+    fn binary_operators_combine_in_the_innermost_shared_layer() {
+        let interaction = built(Node::binary(
+            BinaryOperator::Interact,
+            column("firm"),
+            column("sector"),
+        ));
         assert!(matches!(
-            node.into_embedded(),
-            Err(ConstructionError::Unsupported)
+            interaction,
+            ExpressionAst::Embedded(ExpressionAst::Interact(_, _), None)
+        ));
+
+        let ExpressionAst::Add(_, operands) =
+            built(Node::binary(BinaryOperator::Add, interaction, loaded()))
+        else {
+            panic!("expected an addition in the fixed-effect layer");
+        };
+        assert!(matches!(
+            *operands.left,
+            ExpressionAst::Embedded(ExpressionAst::Interact(_, _), None)
+        ));
+        assert!(matches!(
+            *operands.right,
+            ExpressionAst::Embedded(_, Some(_))
+        ));
+
+        // A loaded group stays in the fixed-effect layer, which forbids interaction.
+        assert!(Node::binary(BinaryOperator::Interact, loaded(), column("firm")).is_err());
+    }
+
+    #[test]
+    fn stepwise_calls_combine_in_the_innermost_shared_layer() {
+        let call = |rest| built(Node::stepwise(StepwiseOperator::Sw, column("firm"), rest));
+        assert!(matches!(
+            call(vec![column("year")]),
+            ExpressionAst::Embedded(ExpressionAst::Stepwise(..), None)
+        ));
+
+        let ExpressionAst::Stepwise(_, _, first, rest) = call(vec![loaded()]) else {
+            panic!("expected a stepwise call in the fixed-effect layer");
+        };
+        assert!(matches!(*first, ExpressionAst::Embedded(_, None)));
+        assert!(matches!(
+            rest.as_slice(),
+            [ExpressionAst::Embedded(_, Some(_))]
         ));
     }
 
     #[test]
-    fn mixed_binary_wraps_the_flat_subtree_with_default_group_settings() {
-        let flat =
-            Node::binary(BinaryOperator::Interact, column("firm"), column("sector")).unwrap();
-        let Node::Embedded(ExpressionAst::Add(_, operands)) =
-            Node::binary(BinaryOperator::Add, flat, loaded()).unwrap()
-        else {
-            panic!("expected embedded addition");
-        };
-        let (ExpressionAst::Operand(left), ExpressionAst::Operand(right)) =
-            (*operands.left, *operands.right)
-        else {
-            panic!("expected complete group operands");
-        };
-        assert!(matches!(left.group, ExpressionAst::Interact(_, _)));
-        assert!(left.intercept);
-        assert!(left.loadings.is_empty());
-        assert!(!right.intercept);
-        assert_eq!(right.loadings, vec![Arc::new(Factor::from("time"))]);
-    }
+    fn operators_forbidden_in_inner_layers_are_built_in_the_layer_that_permits_them() {
+        enum Envelope {}
+        impl Layer for Envelope {
+            type Atom = Forbidden;
+            type Operators = FormulaOperations;
+            type Inner = Node;
+            type Annotation = Forbidden;
+            type Stepwise = Permitted;
+        }
+        type Outer = ExpressionAst<Envelope>;
+        let column = |name| Outer::embed(column(name));
 
-    #[test]
-    fn mixed_stepwise_wraps_flat_arguments_and_preserves_loaded_arguments() {
-        let Node::Embedded(ExpressionAst::Stepwise(_, call)) = Node::stepwise(Stepwise {
-            operator: StepwiseOperator::Sw,
-            first: column("firm"),
-            rest: vec![loaded()],
-        })
-        .unwrap() else {
-            panic!("expected embedded stepwise call");
-        };
-        let ExpressionAst::Operand(first) = &call.first else {
-            panic!("expected a complete first group");
-        };
-        let [ExpressionAst::Operand(second)] = call.rest.as_slice() else {
-            panic!("expected one loaded alternative");
-        };
-        assert!(first.intercept);
-        assert!(first.loadings.is_empty());
-        assert!(!second.intercept);
-        assert_eq!(second.loadings, vec![Arc::new(Factor::from("time"))]);
+        // Interaction is permitted two layers down, in the grouping layer.
+        assert!(matches!(
+            built(Outer::binary(
+                BinaryOperator::Interact,
+                column("firm"),
+                column("year")
+            )),
+            ExpressionAst::Embedded(
+                ExpressionAst::Embedded(ExpressionAst::Interact(_, _), None),
+                None
+            )
+        ));
+
+        // Subtraction and negation are forbidden below the envelope, which permits them.
+        assert!(matches!(
+            built(Outer::binary(
+                BinaryOperator::Subtract,
+                column("firm"),
+                column("year")
+            )),
+            ExpressionAst::Subtract(_, _)
+        ));
+        assert!(matches!(
+            built(column("firm").negate()),
+            ExpressionAst::Negate(_, _)
+        ));
     }
 }

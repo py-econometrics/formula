@@ -1,7 +1,5 @@
-use crate::parse::ast::{
-    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, ParseGrammar,
-    ParsedNode, StepwiseOperator,
-};
+use crate::formula::VaryingSlopes;
+use crate::parse::ast::{ExpressionAst, Forbidden, FormulaAst, Layer, StepwiseOperator};
 use crate::{Factor, formula};
 
 fn cartesian_product_with<L: Clone, R: Clone, O>(
@@ -100,87 +98,126 @@ impl StepwiseOperator {
     }
 }
 
-pub(super) trait OperandExpansion {
-    fn expand_operand(&self) -> Vec<formula::Expression>;
-
-    fn apply_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        self.expand_operand()
-            .into_iter()
-            .map(|value| accumulated.clone().add(value))
-            .collect()
-    }
-
-    fn subtract_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        self.expand_operand()
-            .into_iter()
-            .map(|value| accumulated.clone().subtract(value))
-            .collect()
-    }
+pub(super) trait AtomExpansion {
+    fn expand_atom(&self) -> Vec<formula::Expression>;
 }
 
-impl OperandExpansion for formula::Term {
-    fn expand_operand(&self) -> Vec<formula::Expression> {
+impl AtomExpansion for formula::Term {
+    fn expand_atom(&self) -> Vec<formula::Expression> {
         vec![formula::Expression::from(self.clone())]
     }
 }
 
-impl OperandExpansion for formula::VariableDefinition {
-    fn expand_operand(&self) -> Vec<formula::Expression> {
+impl AtomExpansion for formula::VariableDefinition {
+    fn expand_atom(&self) -> Vec<formula::Expression> {
         vec![formula::Expression::from(formula::Term::from(
             Factor::from(self.name()),
         ))]
     }
 }
 
-impl OperandExpansion for Forbidden {
-    fn expand_operand(&self) -> Vec<formula::Expression> {
+impl AtomExpansion for Forbidden {
+    fn expand_atom(&self) -> Vec<formula::Expression> {
         match *self {}
     }
 }
 
-impl<K: ExpressionKind> OperandExpansion for FixedEffectGroup<K>
-where
-    K::Operand: OperandExpansion,
-{
-    fn expand_operand(&self) -> Vec<formula::Expression> {
-        self.group
-            .expand()
+impl AtomExpansion for Box<FormulaAst> {
+    fn expand_atom(&self) -> Vec<formula::Expression> {
+        FormulaAst::expand(self)
             .into_iter()
-            .map(|expression| {
-                formula::encode_fixed_effects(
-                    expression,
-                    self.intercept,
-                    self.loadings.iter().cloned(),
-                )
-            })
+            .map(|child| formula::Expression::new([], vec![child]))
             .collect()
     }
 }
 
-impl<K: ExpressionKind> OperandExpansion for ExpressionAst<K>
-where
-    K::Operand: OperandExpansion,
-{
-    fn expand_operand(&self) -> Vec<formula::Expression> {
-        self.expand()
-    }
+pub(super) trait Expand {
+    fn expand(&self) -> Vec<formula::Expression>;
+    fn apply_to(&self, accumulated: formula::Expression) -> Vec<formula::Expression>;
+    fn subtract_from(&self, accumulated: formula::Expression) -> Vec<formula::Expression>;
+}
 
-    fn apply_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        self.apply_to(accumulated)
+impl Expand for Forbidden {
+    fn expand(&self) -> Vec<formula::Expression> {
+        match *self {}
     }
-
-    fn subtract_operand(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
-        self.subtract_from(accumulated)
+    fn apply_to(&self, _: formula::Expression) -> Vec<formula::Expression> {
+        match *self {}
+    }
+    fn subtract_from(&self, _: formula::Expression) -> Vec<formula::Expression> {
+        match *self {}
     }
 }
 
-impl<K: ExpressionKind> ExpressionAst<K>
+/// Describes how an inner expression expands in its layer.
+pub(super) trait EmbeddedExpansion: Sized {
+    fn expand(inner: &impl Expand, annotation: Option<&Self>) -> Vec<formula::Expression>;
+
+    fn apply(
+        inner: &impl Expand,
+        annotation: Option<&Self>,
+        accumulated: formula::Expression,
+    ) -> Vec<formula::Expression> {
+        Self::expand(inner, annotation)
+            .into_iter()
+            .map(|value| accumulated.clone().add(value))
+            .collect()
+    }
+
+    fn subtract(
+        inner: &impl Expand,
+        annotation: Option<&Self>,
+        accumulated: formula::Expression,
+    ) -> Vec<formula::Expression> {
+        Self::expand(inner, annotation)
+            .into_iter()
+            .map(|value| accumulated.clone().subtract(value))
+            .collect()
+    }
+}
+
+impl EmbeddedExpansion for Forbidden {
+    fn expand(inner: &impl Expand, _: Option<&Self>) -> Vec<formula::Expression> {
+        inner.expand()
+    }
+
+    fn apply(
+        inner: &impl Expand,
+        _: Option<&Self>,
+        accumulated: formula::Expression,
+    ) -> Vec<formula::Expression> {
+        inner.apply_to(accumulated)
+    }
+
+    fn subtract(
+        inner: &impl Expand,
+        _: Option<&Self>,
+        accumulated: formula::Expression,
+    ) -> Vec<formula::Expression> {
+        inner.subtract_from(accumulated)
+    }
+}
+
+impl EmbeddedExpansion for VaryingSlopes {
+    fn expand(inner: &impl Expand, slopes: Option<&Self>) -> Vec<formula::Expression> {
+        inner
+            .expand()
+            .into_iter()
+            .map(|group| formula::encode_fixed_effects(group, slopes))
+            .collect()
+    }
+}
+
+impl<L: Layer> Expand for ExpressionAst<L>
 where
-    K::Operand: OperandExpansion,
+    L::Atom: AtomExpansion,
+    L::Inner: Expand,
+    L::Annotation: EmbeddedExpansion,
 {
-    pub(in crate::parse) fn expand(&self) -> Vec<formula::Expression> {
+    fn expand(&self) -> Vec<formula::Expression> {
         match self {
-            Self::Operand(operand) => operand.expand_operand(),
+            Self::Atom(atom) => atom.expand_atom(),
+            Self::Embedded(inner, annotation) => L::Annotation::expand(inner, annotation.as_ref()),
 
             Self::Add(_, _) | Self::Subtract(_, _) | Self::Negate(_, _) => {
                 self.apply_to(formula::Expression::from_iter([]))
@@ -206,23 +243,17 @@ where
 
             Self::Parenthesized(expression) => expression.expand(),
 
-            Self::Stepwise(_, call) => call.operator.expand(
-                std::iter::once(&call.first)
-                    .chain(call.rest.iter())
-                    .map(Self::expand),
-            ),
-
-            Self::Child(_, formula) => formula
-                .expand()
-                .into_iter()
-                .map(|child| formula::Expression::new([], vec![child]))
-                .collect(),
+            Self::Stepwise(_, operator, first, rest) => {
+                operator.expand(std::iter::once(&**first).chain(rest).map(Self::expand))
+            }
         }
     }
 
     fn apply_to(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
         match self {
-            Self::Operand(operand) => operand.apply_operand(accumulated),
+            Self::Embedded(inner, annotation) => {
+                L::Annotation::apply(inner, annotation.as_ref(), accumulated)
+            }
 
             Self::Add(_, operands) => operands
                 .left
@@ -250,7 +281,9 @@ where
 
     fn subtract_from(&self, accumulated: formula::Expression) -> Vec<formula::Expression> {
         match self {
-            Self::Operand(operand) => operand.subtract_operand(accumulated),
+            Self::Embedded(inner, annotation) => {
+                L::Annotation::subtract(inner, annotation.as_ref(), accumulated)
+            }
 
             Self::Negate(_, expression) => expression.apply_to(accumulated),
 
@@ -263,44 +296,19 @@ where
     }
 }
 
-impl<K: ParseGrammar> ParsedNode<K>
-where
-    K::Operand: OperandExpansion,
-    <K::Embedded as ExpressionKind>::Operand: OperandExpansion,
-{
-    pub(in crate::parse) fn expand(&self) -> Vec<formula::Expression> {
-        match self {
-            Self::Flat(expression) => expression.expand(),
-            Self::Embedded(expression) => expression.expand(),
-        }
-    }
-
-    pub(in crate::parse) fn apply_to(
-        &self,
-        accumulated: formula::Expression,
-    ) -> Vec<formula::Expression> {
-        match self {
-            Self::Flat(expression) => expression.apply_to(accumulated),
-            Self::Embedded(expression) => expression.apply_to(accumulated),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::ast::{
-        Binary, MultistageFormulaExpression, Permitted, SimpleFormulaExpression,
-    };
+    use crate::parse::ast::{Binary, MultistageFormula, Permitted, SimpleFormula};
 
-    type Ast = ExpressionAst<SimpleFormulaExpression>;
+    type Ast = ExpressionAst<SimpleFormula>;
 
     fn term(name: &str) -> formula::Term {
         formula::Term::from(Factor::from(name))
     }
 
-    fn operand(name: &str) -> Ast {
-        Ast::Operand(term(name))
+    fn atom(name: &str) -> Ast {
+        Ast::Atom(term(name))
     }
 
     fn negate(value: Ast) -> Ast {
@@ -323,22 +331,22 @@ mod tests {
     fn negation_and_parentheses_preserve_subtraction_scope() {
         for (node, local, applied) in [
             (
-                negate(negate(operand("x"))),
+                negate(negate(atom("x"))),
                 value([term("x")]),
                 value([formula::Term::intercept(), term("x")]),
             ),
             (
-                negate(parenthesized(negate(operand("x")))),
+                negate(parenthesized(negate(atom("x")))),
                 value([]),
                 value([formula::Term::intercept()]),
             ),
             (
-                subtract(operand("x"), negate(operand("z"))),
+                subtract(atom("x"), negate(atom("z"))),
                 value([term("x"), term("z")]),
                 value([formula::Term::intercept(), term("x"), term("z")]),
             ),
             (
-                subtract(operand("x"), parenthesized(negate(operand("z")))),
+                subtract(atom("x"), parenthesized(negate(atom("z")))),
                 value([term("x")]),
                 value([formula::Term::intercept(), term("x")]),
             ),
@@ -353,20 +361,19 @@ mod tests {
 
     #[test]
     fn embedded_simple_expressions_are_transparent_until_parenthesized() {
-        type Embedded = ExpressionAst<MultistageFormulaExpression>;
-        let removed = || subtract(operand("x"), Ast::Operand(formula::Term::intercept()));
+        type Outer = ExpressionAst<MultistageFormula>;
         let seed = value([formula::Term::intercept()]);
-        let node = Embedded::Operand(removed());
+        let node = Outer::embed(subtract(atom("x"), Ast::Atom(formula::Term::intercept())));
         assert_eq!(node.apply_to(seed.clone()), [value([term("x")])]);
 
-        let grouped = Embedded::Parenthesized(Box::new(node));
+        let grouped = Outer::Parenthesized(Box::new(node));
         assert_eq!(
             grouped.apply_to(seed.clone()),
             [value([formula::Term::intercept(), term("x")])]
         );
 
         // Subtracting an embedded negation adds its operand to the accumulator.
-        let negated = Embedded::Operand(negate(operand("x")));
+        let negated = Outer::embed(negate(atom("x")));
         assert_eq!(
             negated.subtract_from(seed),
             [value([formula::Term::intercept(), term("x")])]

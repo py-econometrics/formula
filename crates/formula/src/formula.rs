@@ -1232,12 +1232,30 @@ fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term) -> &'a FittedTerm
         .expect("every term must have an transformed entry")
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct VaryingSlopes {
+    pub(crate) intercept: bool,
+    pub(crate) first: Arc<Factor>,
+    pub(crate) rest: Vec<Arc<Factor>>,
+}
+
+impl VaryingSlopes {
+    pub(crate) fn loadings(&self) -> impl Iterator<Item = &Arc<Factor>> {
+        std::iter::once(&self.first).chain(self.rest.iter())
+    }
+}
+
 pub(crate) fn encode_fixed_effects(
     expression: Expression,
-    intercept: bool,
-    loadings: impl IntoIterator<Item = Arc<Factor>>,
+    slopes: Option<&VaryingSlopes>,
 ) -> Expression {
-    let loadings = collect_unique(loadings);
+    let intercept = slopes.is_none_or(|slopes| slopes.intercept);
+    let loadings = collect_unique(
+        slopes
+            .into_iter()
+            .flat_map(VaryingSlopes::loadings)
+            .cloned(),
+    );
 
     Expression::new(
         expression
@@ -1635,7 +1653,7 @@ mod tests {
             vec![child.clone()],
         );
 
-        let encoded = encode_fixed_effects(expression, true, []);
+        let encoded = encode_fixed_effects(expression, None);
         let expected = crate::parse("y ~ x | firm")
             .unwrap()
             .iter()
