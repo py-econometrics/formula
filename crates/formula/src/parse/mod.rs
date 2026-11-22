@@ -3,7 +3,7 @@ mod expand;
 
 use crate::Role;
 use crate::fit::Fit;
-use crate::formula::{Expression, FactorKind, Term, VariableDefinition};
+use crate::formula::{Expression, FactorKind, Term, VariableDefinition, VaryingSlopes};
 use crate::formula::{Factor, Formula, Formulas, push_unique};
 use crate::parse::ast::{Compose, StepwiseOperator};
 use crate::parse::expand::Expand;
@@ -514,7 +514,7 @@ impl ParseAnnotation for ast::Forbidden {
     }
 }
 
-impl ParseAnnotation for ast::VaryingSlopes {
+impl ParseAnnotation for VaryingSlopes {
     fn starts(input: &str) -> bool {
         input.starts_with('[')
     }
@@ -2751,7 +2751,7 @@ mod layers {
         type Atom = Box<ast::FormulaAst>;
         type Operators = ast::MultistageOperations;
         type Inner = ast::ExpressionAst<ast::SimpleFormula>;
-        type Annotation = ast::VaryingSlopes;
+        type Annotation = VaryingSlopes;
         type Stepwise = ast::Permitted;
     }
 
@@ -2760,7 +2760,7 @@ mod layers {
         type Atom = Box<ast::FormulaAst>;
         type Operators = ast::FormulaOperations;
         type Inner = ast::ExpressionAst<ast::SimpleFormula>;
-        type Annotation = ast::VaryingSlopes;
+        type Annotation = VaryingSlopes;
         type Stepwise = ast::Permitted;
     }
 

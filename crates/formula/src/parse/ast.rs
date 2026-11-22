@@ -1,5 +1,4 @@
-use crate::Factor;
-use std::sync::Arc;
+use crate::formula::VaryingSlopes;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ConstructionError {
@@ -95,19 +94,6 @@ pub(super) struct Stepwise<E> {
     pub(super) operator: StepwiseOperator,
     pub(super) first: E,
     pub(super) rest: Vec<E>,
-}
-
-/// Varying slopes attached to a fixed-effect group: `g[x]` or `g[[x]]`.
-pub(super) struct VaryingSlopes {
-    pub(super) intercept: bool,
-    pub(super) first: Arc<Factor>,
-    pub(super) rest: Vec<Arc<Factor>>,
-}
-
-impl VaryingSlopes {
-    pub(super) fn loadings(&self) -> impl Iterator<Item = &Arc<Factor>> {
-        std::iter::once(&self.first).chain(self.rest.iter())
-    }
 }
 
 /// A layer of a formula expression.
@@ -366,6 +352,8 @@ impl<L: Layer> Compose for ExpressionAst<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Factor;
+    use std::sync::Arc;
 
     type Node = ExpressionAst<FixedEffects>;
 

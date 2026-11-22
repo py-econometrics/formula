@@ -1,6 +1,5 @@
-use crate::parse::ast::{
-    ExpressionAst, Forbidden, FormulaAst, Layer, StepwiseOperator, VaryingSlopes,
-};
+use crate::formula::VaryingSlopes;
+use crate::parse::ast::{ExpressionAst, Forbidden, FormulaAst, Layer, StepwiseOperator};
 use crate::{Factor, formula};
 
 fn cartesian_product_with<L: Clone, R: Clone, O>(
@@ -204,14 +203,7 @@ impl EmbeddedExpansion for VaryingSlopes {
         inner
             .expand()
             .into_iter()
-            .map(|group| match slopes {
-                None => formula::encode_fixed_effects(group, true, []),
-                Some(slopes) => formula::encode_fixed_effects(
-                    group,
-                    slopes.intercept,
-                    slopes.loadings().cloned(),
-                ),
-            })
+            .map(|group| formula::encode_fixed_effects(group, slopes))
             .collect()
     }
 }
