@@ -243,11 +243,9 @@ where
 
             Self::Parenthesized(expression) => expression.expand(),
 
-            Self::Stepwise(_, call) => call.operator.expand(
-                std::iter::once(&call.first)
-                    .chain(call.rest.iter())
-                    .map(Self::expand),
-            ),
+            Self::Stepwise(_, operator, first, rest) => {
+                operator.expand(std::iter::once(&**first).chain(rest).map(Self::expand))
+            }
         }
     }
 

@@ -19,27 +19,30 @@ pub(super) struct Permitted;
 pub(super) enum Forbidden {}
 
 pub(super) trait Permission: Sized {
-    fn permit() -> Result<Self, ConstructionError>;
+    fn permit() -> Option<Self>;
 }
 
 impl Permission for Permitted {
-    fn permit() -> Result<Self, ConstructionError> {
-        Ok(Self)
+    fn permit() -> Option<Self> {
+        Some(Self)
     }
 }
 
 impl Permission for Forbidden {
-    fn permit() -> Result<Self, ConstructionError> {
-        Err(ConstructionError::Unsupported)
+    fn permit() -> Option<Self> {
+        None
     }
 }
 
-/// Check if this constructor is permitted
+/// Apply the constructor if it is permitted, or hand the value back
 pub(super) fn permitted<P: Permission, T, E>(
     value: T,
     constructor: impl FnOnce(P, T) -> E,
-) -> Result<E, ConstructionError> {
-    Ok(constructor(P::permit()?, value))
+) -> Result<E, T> {
+    match P::permit() {
+        Some(permission) => Ok(constructor(permission, value)),
+        None => Err(value),
+    }
 }
 
 /// Two operands of the same expression type
@@ -57,6 +60,7 @@ impl<E> Binary<E> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum BinaryOperator {
     Add,
     Subtract,
@@ -68,8 +72,10 @@ pub(super) enum BinaryOperator {
 impl BinaryOperator {
     fn construct<L: Layer>(
         self,
-        operands: Binary<ExpressionAst<L>>,
-    ) -> Result<ExpressionAst<L>, ConstructionError> {
+        left: ExpressionAst<L>,
+        right: ExpressionAst<L>,
+    ) -> Result<ExpressionAst<L>, (ExpressionAst<L>, ExpressionAst<L>)> {
+        let operands = Binary::new(left, right);
         match self {
             Self::Add => permitted(operands, ExpressionAst::<L>::Add),
             Self::Subtract => permitted(operands, ExpressionAst::<L>::Subtract),
@@ -77,6 +83,7 @@ impl BinaryOperator {
             Self::InteractFully => permitted(operands, ExpressionAst::<L>::InteractFully),
             Self::Nest => permitted(operands, ExpressionAst::<L>::Nesting),
         }
+        .map_err(|operands| (*operands.left, *operands.right))
     }
 }
 
@@ -87,13 +94,6 @@ pub(super) enum StepwiseOperator {
     Csw,
     Csw0,
     Mvsw,
-}
-
-/// A nonempty sequence of stepwise arguments.
-pub(super) struct Stepwise<E> {
-    pub(super) operator: StepwiseOperator,
-    pub(super) first: E,
-    pub(super) rest: Vec<E>,
 }
 
 /// A layer of a formula expression.
@@ -122,30 +122,34 @@ pub(super) enum ExpressionAst<L: Layer> {
     Nesting(<L::Operators as Operations>::Nesting, Binary<Self>),
 
     Parenthesized(Box<Self>),
-    Stepwise(L::Stepwise, Box<Stepwise<Self>>),
+    /// A stepwise call over a nonempty sequence of arguments.
+    Stepwise(L::Stepwise, StepwiseOperator, Box<Self>, Vec<Self>),
 }
 
 /// A description of how [`Layer`]s can be composed.
 pub(super) trait Compose: Sized {
     fn parenthesized(self) -> Self;
-    fn negate(self) -> Result<Self, ConstructionError>;
-    fn binary(operator: BinaryOperator, left: Self, right: Self)
-    -> Result<Self, ConstructionError>;
-    fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError>;
+    fn negate(self) -> Result<Self, Self>;
+    fn binary(operator: BinaryOperator, left: Self, right: Self) -> Result<Self, (Self, Self)>;
+    fn stepwise(
+        operator: StepwiseOperator,
+        first: Self,
+        rest: Vec<Self>,
+    ) -> Result<Self, (Self, Vec<Self>)>;
 }
 
 impl Compose for Forbidden {
     fn parenthesized(self) -> Self {
         match self {}
     }
-    fn negate(self) -> Result<Self, ConstructionError> {
+    fn negate(self) -> Result<Self, Self> {
         match self {}
     }
-    fn binary(_: BinaryOperator, left: Self, _: Self) -> Result<Self, ConstructionError> {
+    fn binary(_: BinaryOperator, left: Self, _: Self) -> Result<Self, (Self, Self)> {
         match left {}
     }
-    fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError> {
-        match call.first {}
+    fn stepwise(_: StepwiseOperator, first: Self, _: Vec<Self>) -> Result<Self, (Self, Vec<Self>)> {
+        match first {}
     }
 }
 
@@ -310,42 +314,59 @@ impl<L: Layer> Compose for ExpressionAst<L> {
         }
     }
 
-    fn negate(self) -> Result<Self, ConstructionError> {
-        match self.into_inner() {
-            Ok(inner) => inner.negate().map(Self::embed),
-            Err(outer) => permitted(Box::new(outer), Self::Negate),
-        }
+    fn negate(self) -> Result<Self, Self> {
+        let operand = match self.into_inner() {
+            Ok(inner) => match inner.negate() {
+                Ok(inner) => return Ok(Self::embed(inner)),
+                Err(inner) => Self::embed(inner),
+            },
+            Err(outer) => outer,
+        };
+        permitted(Box::new(operand), Self::Negate).map_err(|operand| *operand)
     }
 
-    fn binary(
-        operator: BinaryOperator,
-        left: Self,
-        right: Self,
-    ) -> Result<Self, ConstructionError> {
-        match (left, right) {
+    fn binary(operator: BinaryOperator, left: Self, right: Self) -> Result<Self, (Self, Self)> {
+        let (left, right) = match (left, right) {
             (Self::Embedded(left, None), Self::Embedded(right, None)) => {
-                L::Inner::binary(operator, left, right).map(Self::embed)
+                match L::Inner::binary(operator, left, right) {
+                    Ok(inner) => return Ok(Self::embed(inner)),
+                    Err((left, right)) => (Self::embed(left), Self::embed(right)),
+                }
             }
-            (left, right) => operator.construct(Binary::new(left, right)),
-        }
+            operands => operands,
+        };
+        operator.construct(left, right)
     }
 
-    fn stepwise(call: Stepwise<Self>) -> Result<Self, ConstructionError> {
+    fn stepwise(
+        operator: StepwiseOperator,
+        first: Self,
+        rest: Vec<Self>,
+    ) -> Result<Self, (Self, Vec<Self>)> {
         let is_inner = |argument: &Self| matches!(argument, Self::Embedded(_, None));
-        if !std::iter::once(&call.first).chain(&call.rest).all(is_inner) {
-            return permitted(Box::new(call), Self::Stepwise);
-        }
-        let inner = |argument: Self| {
-            argument
-                .into_inner()
-                .map_err(|_| ConstructionError::Unsupported)
+        let (first, rest) = if is_inner(&first) && rest.iter().all(is_inner) {
+            let unwrap = |argument| match argument {
+                Self::Embedded(inner, None) => inner,
+                _ => unreachable!("every argument is an unannotated embedding"),
+            };
+            match L::Inner::stepwise(
+                operator,
+                unwrap(first),
+                rest.into_iter().map(unwrap).collect(),
+            ) {
+                Ok(inner) => return Ok(Self::embed(inner)),
+                Err((first, rest)) => (
+                    Self::embed(first),
+                    rest.into_iter().map(Self::embed).collect(),
+                ),
+            }
+        } else {
+            (first, rest)
         };
-        let call = Stepwise {
-            operator: call.operator,
-            first: inner(call.first)?,
-            rest: call.rest.into_iter().map(inner).collect::<Result<_, _>>()?,
-        };
-        L::Inner::stepwise(call).map(Self::embed)
+        permitted((Box::new(first), rest), |permission, (first, rest)| {
+            Self::Stepwise(permission, operator, first, rest)
+        })
+        .map_err(|(first, rest)| (*first, rest))
     }
 }
 
@@ -372,6 +393,10 @@ mod tests {
         }
     }
 
+    fn built<T, R>(result: Result<T, R>) -> T {
+        result.unwrap_or_else(|_| panic!("expected the construction to be permitted"))
+    }
+
     fn loaded() -> Node {
         column("year").annotate(slopes("time")).unwrap()
     }
@@ -386,21 +411,24 @@ mod tests {
     fn annotations_apply_once_and_only_to_unannotated_embeddings() {
         assert!(loaded().into_inner().is_err());
         assert!(loaded().annotate(slopes("u")).is_err());
-        let sum = Node::binary(BinaryOperator::Add, loaded(), column("firm")).unwrap();
+        let sum = built(Node::binary(BinaryOperator::Add, loaded(), column("firm")));
         assert!(sum.annotate(slopes("u")).is_err());
     }
 
     #[test]
     fn binary_operators_combine_in_the_innermost_shared_layer() {
-        let interaction =
-            Node::binary(BinaryOperator::Interact, column("firm"), column("sector")).unwrap();
+        let interaction = built(Node::binary(
+            BinaryOperator::Interact,
+            column("firm"),
+            column("sector"),
+        ));
         assert!(matches!(
             interaction,
             ExpressionAst::Embedded(ExpressionAst::Interact(_, _), None)
         ));
 
         let ExpressionAst::Add(_, operands) =
-            Node::binary(BinaryOperator::Add, interaction, loaded()).unwrap()
+            built(Node::binary(BinaryOperator::Add, interaction, loaded()))
         else {
             panic!("expected an addition in the fixed-effect layer");
         };
@@ -419,26 +447,60 @@ mod tests {
 
     #[test]
     fn stepwise_calls_combine_in_the_innermost_shared_layer() {
-        let call = |rest: Vec<Node>| {
-            Node::stepwise(Stepwise {
-                operator: StepwiseOperator::Sw,
-                first: column("firm"),
-                rest,
-            })
-            .unwrap()
-        };
+        let call = |rest| built(Node::stepwise(StepwiseOperator::Sw, column("firm"), rest));
         assert!(matches!(
             call(vec![column("year")]),
-            ExpressionAst::Embedded(ExpressionAst::Stepwise(_, _), None)
+            ExpressionAst::Embedded(ExpressionAst::Stepwise(..), None)
         ));
 
-        let ExpressionAst::Stepwise(_, mixed) = call(vec![loaded()]) else {
+        let ExpressionAst::Stepwise(_, _, first, rest) = call(vec![loaded()]) else {
             panic!("expected a stepwise call in the fixed-effect layer");
         };
-        assert!(matches!(mixed.first, ExpressionAst::Embedded(_, None)));
+        assert!(matches!(*first, ExpressionAst::Embedded(_, None)));
         assert!(matches!(
-            mixed.rest.as_slice(),
+            rest.as_slice(),
             [ExpressionAst::Embedded(_, Some(_))]
+        ));
+    }
+
+    #[test]
+    fn operators_forbidden_in_inner_layers_are_built_in_the_layer_that_permits_them() {
+        enum Envelope {}
+        impl Layer for Envelope {
+            type Atom = Forbidden;
+            type Operators = FormulaOperations;
+            type Inner = Node;
+            type Annotation = Forbidden;
+            type Stepwise = Permitted;
+        }
+        type Outer = ExpressionAst<Envelope>;
+        let column = |name| Outer::embed(column(name));
+
+        // Interaction is permitted two layers down, in the grouping layer.
+        assert!(matches!(
+            built(Outer::binary(
+                BinaryOperator::Interact,
+                column("firm"),
+                column("year")
+            )),
+            ExpressionAst::Embedded(
+                ExpressionAst::Embedded(ExpressionAst::Interact(_, _), None),
+                None
+            )
+        ));
+
+        // Subtraction and negation are forbidden below the envelope, which permits them.
+        assert!(matches!(
+            built(Outer::binary(
+                BinaryOperator::Subtract,
+                column("firm"),
+                column("year")
+            )),
+            ExpressionAst::Subtract(_, _)
+        ));
+        assert!(matches!(
+            built(column("firm").negate()),
+            ExpressionAst::Negate(_, _)
         ));
     }
 }

@@ -304,11 +304,13 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     })
 }
 
-fn construction_result<T>(
-    cursor: &mut &str,
-    result: Result<T, ast::ConstructionError>,
-) -> ModalResult<T> {
-    result.map_err(|error| ErrMode::Cut(ContextError::from_external_error(&*cursor, error)))
+fn construction_result<T>(cursor: &mut &str, value: Option<T>) -> ModalResult<T> {
+    value.ok_or_else(|| {
+        ErrMode::Cut(ContextError::from_external_error(
+            &*cursor,
+            ast::ConstructionError::Unsupported,
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -325,7 +327,7 @@ fn parse_node<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAs
                 .value(Prefix(
                     PREFIX_PRECEDENCE,
                     |cursor, node: ast::ExpressionAst<L>| {
-                        construction_result(cursor, node.negate())
+                        construction_result(cursor, node.negate().ok())
                     },
                 ))
                 .context(StrContext::Expected(StrContextValue::Description(
@@ -336,13 +338,14 @@ fn parse_node<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAs
             '+'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Add, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Add, left, right).ok(),
                 )
             })),
             '-'.value(Left(SUM_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Subtract, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Subtract, left, right)
+                        .ok(),
                 )
             })),
             '*'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
@@ -352,19 +355,21 @@ fn parse_node<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::ExpressionAs
                         ast::BinaryOperator::InteractFully,
                         left,
                         right,
-                    ),
+                    )
+                    .ok(),
                 )
             })),
             '/'.value(Left(PRODUCT_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Nest, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Nest, left, right).ok(),
                 )
             })),
             ':'.value(Right(INTERACTION_PRECEDENCE, |cursor, left, right| {
                 construction_result(
                     cursor,
-                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Interact, left, right),
+                    ast::ExpressionAst::<L>::binary(ast::BinaryOperator::Interact, left, right)
+                        .ok(),
                 )
             })),
         )))
@@ -412,11 +417,7 @@ fn parse_stepwise<L: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::Expressi
 
     construction_result(
         cursor,
-        ast::ExpressionAst::<L>::stepwise(ast::Stepwise {
-            operator,
-            first,
-            rest,
-        }),
+        ast::ExpressionAst::<L>::stepwise(operator, first, rest).ok(),
     )
 }
 
@@ -476,11 +477,7 @@ impl ParseAtom for Term {
 impl ParseAtom for VariableDefinition {
     fn parse(cursor: &mut &str) -> ModalResult<(Self, bool)> {
         let (term, negate) = Term::parse(cursor)?;
-        construction_result(
-            cursor,
-            Self::try_from(term).map_err(|_| ast::ConstructionError::Unsupported),
-        )
-        .map(|value| (value, negate))
+        construction_result(cursor, Self::try_from(term).ok()).map(|value| (value, negate))
     }
 }
 
@@ -563,7 +560,7 @@ impl<L: ParseLayer> ParseExpression for ast::ExpressionAst<L> {
     fn atom(cursor: &mut &str) -> ModalResult<Self> {
         match opt(L::Atom::parse).parse_next(cursor)? {
             Some((atom, false)) => Ok(Self::Atom(atom)),
-            Some((atom, true)) => construction_result(cursor, Self::Atom(atom).negate()),
+            Some((atom, true)) => construction_result(cursor, Self::Atom(atom).negate().ok()),
             None => L::Inner::atom(cursor).map(Self::embed),
         }
     }
@@ -575,11 +572,11 @@ impl<L: ParseLayer> ParseExpression for ast::ExpressionAst<L> {
     fn annotation(self, cursor: &mut &str) -> ModalResult<Self> {
         if L::Annotation::starts(cursor) {
             let annotation = L::Annotation::parse(cursor)?;
-            return construction_result(cursor, self.annotate(annotation));
+            return construction_result(cursor, self.annotate(annotation).ok());
         }
         match self.into_inner() {
             Ok(inner) => inner.annotation(cursor).map(Self::embed),
-            Err(_) => construction_result(cursor, Err(ast::ConstructionError::Unsupported)),
+            Err(_) => construction_result(cursor, None),
         }
     }
 }
@@ -1190,12 +1187,12 @@ mod tests {
             else {
                 panic!("expected a child formula");
             };
-            let Ast::Stepwise(_, call) = inner(child.right) else {
+            let Ast::Stepwise(_, _, first, rest) = inner(child.right) else {
                 panic!("expected an unexpanded stepwise call");
             };
-            assert_term(&call.first, "x");
-            assert_eq!(call.rest.len(), 1);
-            assert_term(&call.rest[0], "z");
+            assert_term(&first, "x");
+            assert_eq!(rest.len(), 1);
+            assert_term(&rest[0], "z");
         }
 
         #[test]
@@ -1274,13 +1271,13 @@ mod tests {
 
         #[test]
         fn parsing_preserves_stepwise_argument_scope() {
-            let Ast::Stepwise(_, call) = simple("sw((x - 1), z)") else {
+            let Ast::Stepwise(_, operator, first, rest) = simple("sw((x - 1), z)") else {
                 panic!("expected stepwise call");
             };
-            assert!(matches!(call.operator, StepwiseOperator::Sw));
-            assert!(matches!(call.first, Ast::Parenthesized(_)));
-            assert_eq!(call.rest.len(), 1);
-            assert_term(&call.rest[0], "z");
+            assert!(matches!(operator, StepwiseOperator::Sw));
+            assert!(matches!(*first, Ast::Parenthesized(_)));
+            assert_eq!(rest.len(), 1);
+            assert_term(&rest[0], "z");
         }
     }
 
@@ -2803,7 +2800,7 @@ mod layers {
             parse_node::<Additive>
                 .parse("sw([a ~ x], (y:z)[t])")
                 .unwrap(),
-            ast::ExpressionAst::Stepwise(_, _)
+            ast::ExpressionAst::Stepwise(..)
         ));
         for source in ["[a ~ x][t]", "x[t][u]", "([a ~ x] + y)[t]", "sw(x[t], y):z"] {
             assert!(parse_node::<Additive>.parse(source).is_err(), "{source}");
