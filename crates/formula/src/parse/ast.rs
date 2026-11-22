@@ -75,16 +75,16 @@ pub(super) enum BinaryOperator {
 }
 
 impl BinaryOperator {
-    fn construct<K: Layer>(
+    fn construct<L: Layer>(
         self,
-        operands: Binary<ExpressionAst<K>>,
-    ) -> Result<ExpressionAst<K>, ConstructionError> {
+        operands: Binary<ExpressionAst<L>>,
+    ) -> Result<ExpressionAst<L>, ConstructionError> {
         match self {
-            Self::Add => permitted(operands, ExpressionAst::<K>::Add),
-            Self::Subtract => permitted(operands, ExpressionAst::<K>::Subtract),
-            Self::Interact => permitted(operands, ExpressionAst::<K>::Interact),
-            Self::InteractFully => permitted(operands, ExpressionAst::<K>::InteractFully),
-            Self::Nest => permitted(operands, ExpressionAst::<K>::Nesting),
+            Self::Add => permitted(operands, ExpressionAst::<L>::Add),
+            Self::Subtract => permitted(operands, ExpressionAst::<L>::Subtract),
+            Self::Interact => permitted(operands, ExpressionAst::<L>::Interact),
+            Self::InteractFully => permitted(operands, ExpressionAst::<L>::InteractFully),
+            Self::Nest => permitted(operands, ExpressionAst::<L>::Nesting),
         }
     }
 }
@@ -106,11 +106,11 @@ pub(super) struct Stepwise<E> {
 }
 
 /// An unloaded fixed effect, with its grouping algebra still intact.
-pub(super) struct FixedEffect<K: Layer> {
-    pub(super) group: ExpressionAst<K>,
+pub(super) struct FixedEffect<L: Layer> {
+    pub(super) group: ExpressionAst<L>,
 }
-impl<K: Layer> From<ExpressionAst<K>> for FixedEffect<K> {
-    fn from(group: ExpressionAst<K>) -> Self {
+impl<L: Layer> From<ExpressionAst<L>> for FixedEffect<L> {
+    fn from(group: ExpressionAst<L>) -> Self {
         Self { group }
     }
 }
@@ -129,7 +129,7 @@ impl<T> Loaded<T> {
     }
 }
 
-pub(super) type FixedEffectGroup<K> = Loaded<FixedEffect<K>>;
+pub(super) type FixedEffectGroup<L> = Loaded<FixedEffect<L>>;
 
 /// Embedding is reversible: the parser can recover an inner tree without
 /// maintaining a second representation of the expression's current layer.
@@ -155,19 +155,19 @@ pub(super) trait Layer: Sized {
 }
 
 /// An expression in layer, which determines the variants that can exist.
-pub(super) enum ExpressionAst<K: Layer> {
-    Operand(K::Operand),
-    Nested(Box<K::Nested>),
+pub(super) enum ExpressionAst<L: Layer> {
+    Operand(L::Operand),
+    Nested(Box<L::Nested>),
 
-    Add(<K::Operators as Operations>::Addition, Binary<Self>),
-    Subtract(<K::Operators as Operations>::Subtraction, Binary<Self>),
-    Negate(<K::Operators as Operations>::Negation, Box<Self>),
-    Interact(<K::Operators as Operations>::Interaction, Binary<Self>),
-    InteractFully(<K::Operators as Operations>::FullInteraction, Binary<Self>),
-    Nesting(<K::Operators as Operations>::Nesting, Binary<Self>),
+    Add(<L::Operators as Operations>::Addition, Binary<Self>),
+    Subtract(<L::Operators as Operations>::Subtraction, Binary<Self>),
+    Negate(<L::Operators as Operations>::Negation, Box<Self>),
+    Interact(<L::Operators as Operations>::Interaction, Binary<Self>),
+    InteractFully(<L::Operators as Operations>::FullInteraction, Binary<Self>),
+    Nesting(<L::Operators as Operations>::Nesting, Binary<Self>),
 
     Parenthesized(Box<Self>),
-    Stepwise(K::Stepwise, Box<Stepwise<Self>>),
+    Stepwise(L::Stepwise, Box<Stepwise<Self>>),
 }
 
 /// A forbidden expression
@@ -330,12 +330,12 @@ impl TryFrom<ExpressionAst<Forbidden>> for crate::formula::VariableDefinition {
     }
 }
 
-impl<K: Layer> ExpressionAst<K> {
+impl<L: Layer> ExpressionAst<L> {
     pub(super) fn try_operand<T>(input: T) -> Result<Self, ConstructionError>
     where
-        K::Operand: TryFrom<T>,
+        L::Operand: TryFrom<T>,
     {
-        K::Operand::try_from(input)
+        L::Operand::try_from(input)
             .map(Self::Operand)
             .map_err(|_| ConstructionError::Unsupported)
     }
@@ -348,19 +348,19 @@ pub(super) struct FormulaAst {
     pub(super) fixed_effects: Option<ExpressionAst<FixedEffects>>,
 }
 
-impl<K: Layer> ExpressionAst<K> {
+impl<L: Layer> ExpressionAst<L> {
     fn is_inner(&self) -> bool {
         matches!(self, Self::Operand(operand) if operand.is_inner())
     }
 
-    fn try_into_inner(self) -> Result<ExpressionAst<K::Inner>, Self> {
+    fn try_into_inner(self) -> Result<ExpressionAst<L::Inner>, Self> {
         match self {
             Self::Operand(operand) => operand.into_inner().map_err(Self::Operand),
             other => Err(other),
         }
     }
 
-    pub(super) fn into_inner(self) -> Result<ExpressionAst<K::Inner>, ConstructionError> {
+    pub(super) fn into_inner(self) -> Result<ExpressionAst<L::Inner>, ConstructionError> {
         self.try_into_inner()
             .map_err(|_| ConstructionError::Unsupported)
     }
@@ -385,7 +385,7 @@ impl<K: Layer> ExpressionAst<K> {
         right: Self,
     ) -> Result<Self, ConstructionError> {
         if left.is_inner() && right.is_inner() {
-            ExpressionAst::<K::Inner>::binary(operator, left.into_inner()?, right.into_inner()?)
+            ExpressionAst::<L::Inner>::binary(operator, left.into_inner()?, right.into_inner()?)
                 .and_then(Self::try_operand)
         } else {
             operator.construct(Binary::new(left, right))
@@ -406,7 +406,7 @@ impl<K: Layer> ExpressionAst<K> {
                     .map(Self::into_inner)
                     .collect::<Result<_, _>>()?,
             };
-            ExpressionAst::<K::Inner>::stepwise(inner_call).and_then(Self::try_operand)
+            ExpressionAst::<L::Inner>::stepwise(inner_call).and_then(Self::try_operand)
         } else {
             permitted(Box::new(call), Self::Stepwise)
         }
