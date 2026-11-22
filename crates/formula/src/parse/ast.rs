@@ -1,20 +1,5 @@
 use crate::formula::VaryingSlopes;
 
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum ConstructionError {
-    Unsupported,
-}
-
-impl std::fmt::Display for ConstructionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unsupported => f.write_str("operation is not supported"),
-        }
-    }
-}
-
-impl std::error::Error for ConstructionError {}
-
 pub(super) struct Permitted;
 pub(super) enum Forbidden {}
 
@@ -297,10 +282,10 @@ impl<L: Layer> ExpressionAst<L> {
         }
     }
 
-    pub(super) fn annotate(self, annotation: L::Annotation) -> Result<Self, ConstructionError> {
+    pub(super) fn annotate(self, annotation: L::Annotation) -> Option<Self> {
         match self {
-            Self::Embedded(inner, None) => Ok(Self::Embedded(inner, Some(annotation))),
-            _ => Err(ConstructionError::Unsupported),
+            Self::Embedded(inner, None) => Some(Self::Embedded(inner, Some(annotation))),
+            _ => None,
         }
     }
 }
@@ -410,9 +395,9 @@ mod tests {
     #[test]
     fn annotations_apply_once_and_only_to_unannotated_embeddings() {
         assert!(loaded().into_inner().is_err());
-        assert!(loaded().annotate(slopes("u")).is_err());
+        assert!(loaded().annotate(slopes("u")).is_none());
         let sum = built(Node::binary(BinaryOperator::Add, loaded(), column("firm")));
-        assert!(sum.annotate(slopes("u")).is_err());
+        assert!(sum.annotate(slopes("u")).is_none());
     }
 
     #[test]

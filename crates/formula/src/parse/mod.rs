@@ -304,11 +304,26 @@ fn parse_transform_argument_keyword(cursor: &mut &str) -> ModalResult<TransformC
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ConstructionError {
+    Unsupported,
+}
+
+impl std::fmt::Display for ConstructionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => f.write_str("operation is not supported"),
+        }
+    }
+}
+
+impl std::error::Error for ConstructionError {}
+
 fn construction_result<T>(cursor: &mut &str, value: Option<T>) -> ModalResult<T> {
     value.ok_or_else(|| {
         ErrMode::Cut(ContextError::from_external_error(
             &*cursor,
-            ast::ConstructionError::Unsupported,
+            ConstructionError::Unsupported,
         ))
     })
 }
@@ -572,7 +587,7 @@ impl<L: ParseLayer> ParseExpression for ast::ExpressionAst<L> {
     fn annotation(self, cursor: &mut &str) -> ModalResult<Self> {
         if L::Annotation::starts(cursor) {
             let annotation = L::Annotation::parse(cursor)?;
-            return construction_result(cursor, self.annotate(annotation).ok());
+            return construction_result(cursor, self.annotate(annotation));
         }
         match self.into_inner() {
             Ok(inner) => inner.annotation(cursor).map(Self::embed),
@@ -811,7 +826,7 @@ mod tests {
             let error = parse_term("sw(x)", role).unwrap_err();
             assert_eq!(
                 construction_error(error.inner()),
-                &typed::ConstructionError::Unsupported,
+                &ConstructionError::Unsupported,
                 "{role:?}: {error}"
             );
         }
@@ -975,7 +990,7 @@ mod tests {
                 let error = parse(&source).unwrap_err();
                 assert_eq!(
                     construction_error(error.inner()),
-                    &typed::ConstructionError::Unsupported,
+                    &ConstructionError::Unsupported,
                     "{source}: {error}",
                 );
             }
@@ -1136,10 +1151,10 @@ mod tests {
         }
     }
 
-    fn construction_error(error: &ContextError) -> &typed::ConstructionError {
+    fn construction_error(error: &ContextError) -> &ConstructionError {
         error
             .cause()
-            .and_then(|cause| cause.downcast_ref::<typed::ConstructionError>())
+            .and_then(|cause| cause.downcast_ref::<ConstructionError>())
             .expect("expected an AST construction error")
     }
 
@@ -1306,7 +1321,7 @@ mod tests {
                 .err()
                 .expect("expected fixed-effect construction failure");
             assert!(
-                construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
+                construction_error(error.inner()) == &ConstructionError::Unsupported,
                 "{formula}: {error}"
             );
             assert!(
@@ -1336,7 +1351,7 @@ mod tests {
                 .expect("expected fixed-effect construction failure");
             assert_eq!(
                 construction_error(error.inner()),
-                &typed::ConstructionError::Unsupported,
+                &ConstructionError::Unsupported,
                 "{formula}: {error}",
             );
             assert!(
@@ -2281,7 +2296,7 @@ mod tests {
                     .err()
                     .expect("expected construction failure");
                 assert!(
-                    construction_error(error.inner()) == &typed::ConstructionError::Unsupported,
+                    construction_error(error.inner()) == &ConstructionError::Unsupported,
                     "{source}: {error}"
                 );
             }
