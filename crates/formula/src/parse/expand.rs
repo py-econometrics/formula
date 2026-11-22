@@ -283,11 +283,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::ast::{
-        Binary, MultistageFormulaExpression, Permitted, SimpleFormulaExpression,
-    };
+    use crate::parse::ast::{Binary, MultistageFormula, Permitted, SimpleFormula};
 
-    type Ast = ExpressionAst<SimpleFormulaExpression>;
+    type Ast = ExpressionAst<SimpleFormula>;
 
     fn term(name: &str) -> formula::Term {
         formula::Term::from(Factor::from(name))
@@ -347,7 +345,7 @@ mod tests {
 
     #[test]
     fn embedded_simple_expressions_are_transparent_until_parenthesized() {
-        type Embedded = ExpressionAst<MultistageFormulaExpression>;
+        type Embedded = ExpressionAst<MultistageFormula>;
         let removed = || subtract(operand("x"), Ast::Operand(formula::Term::intercept()));
         let seed = value([formula::Term::intercept()]);
         let node = Embedded::Operand(removed());

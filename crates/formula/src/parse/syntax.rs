@@ -152,33 +152,33 @@ fn reject_loading<K: ParseLayer, const INTERCEPT: bool>(
 mod tests {
     use super::*;
     use crate::parse::ast::{
-        FixedEffectExpression, FixedEffectOperations, FormulaOperations, LayerSpec,
-        MultistageOperations, Permitted, SimpleFormulaExpression,
+        FixedEffectOperations, FixedEffects, FormulaOperations, LayerSpec, MultistageOperations,
+        Permitted, SimpleFormula,
     };
     enum Wrapped {
         Child(FormulaAst),
-        Loaded(Loaded<FixedEffect<SimpleFormulaExpression>>),
+        Loaded(Loaded<FixedEffect<SimpleFormula>>),
     }
     impl ReadValue for Wrapped {
         fn read(cursor: &mut &str) -> ModalResult<(Self, bool)> {
             alt((
                 FormulaAst::read.map(|(child, negate)| (Self::Child(child), negate)),
-                Loaded::<FixedEffect<SimpleFormulaExpression>>::read
+                Loaded::<FixedEffect<SimpleFormula>>::read
                     .map(|(loaded, negate)| (Self::Loaded(loaded), negate)),
             ))
             .parse_next(cursor)
         }
     }
     type Additive = LayerSpec<
-        ExpressionAst<SimpleFormulaExpression>,
-        SimpleFormulaExpression,
+        ExpressionAst<SimpleFormula>,
+        SimpleFormula,
         MultistageOperations,
         Permitted,
         Wrapped,
     >;
     type Algebraic = LayerSpec<
-        ExpressionAst<SimpleFormulaExpression>,
-        SimpleFormulaExpression,
+        ExpressionAst<SimpleFormula>,
+        SimpleFormula,
         FormulaOperations,
         Permitted,
         Wrapped,
@@ -248,12 +248,8 @@ mod tests {
 
     #[test]
     fn another_layer_reuses_the_entire_fixed_effect_grammar() {
-        type Envelope = LayerSpec<
-            ExpressionAst<FixedEffectExpression>,
-            FixedEffectExpression,
-            FixedEffectOperations,
-            Permitted,
-        >;
+        type Envelope =
+            LayerSpec<ExpressionAst<FixedEffects>, FixedEffects, FixedEffectOperations, Permitted>;
         for source in [
             "firm:year + sector[t]",
             "sw(firm, year)[t]",

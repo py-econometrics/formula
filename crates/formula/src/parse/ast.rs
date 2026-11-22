@@ -286,35 +286,33 @@ impl<I: Layer> Embedding<I> for FixedEffect<I> {
     }
 }
 
-pub(super) type SingleFormulaExpression =
-    LayerSpec<crate::Term, Forbidden, FormulaOperations, Forbidden>;
-pub(super) type SimpleFormulaExpression =
-    LayerSpec<crate::Term, Forbidden, FormulaOperations, Permitted>;
-pub(super) type GroupingExpression =
+pub(super) type SingleFormula = LayerSpec<crate::Term, Forbidden, FormulaOperations, Forbidden>;
+pub(super) type SimpleFormula = LayerSpec<crate::Term, Forbidden, FormulaOperations, Permitted>;
+pub(super) type Grouping =
     LayerSpec<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Permitted>;
-pub(super) type SingleGroupingExpression =
+pub(super) type SingleGrouping =
     LayerSpec<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Forbidden>;
-pub(super) type MultistageFormulaExpression = LayerSpec<
-    ExpressionAst<SimpleFormulaExpression>,
-    SimpleFormulaExpression,
+pub(super) type MultistageFormula = LayerSpec<
+    ExpressionAst<SimpleFormula>,
+    SimpleFormula,
     MultistageOperations,
     Permitted,
     FormulaAst,
 >;
-pub(super) type FixedEffectExpression = LayerSpec<
-    FixedEffect<GroupingExpression>,
-    GroupingExpression,
+pub(super) type FixedEffects = LayerSpec<
+    FixedEffect<Grouping>,
+    Grouping,
     FixedEffectOperations,
     Permitted,
-    Loaded<FixedEffect<GroupingExpression>>,
+    Loaded<FixedEffect<Grouping>>,
 >;
 
-pub(super) type SingleFixedEffectExpression = LayerSpec<
-    FixedEffect<SingleGroupingExpression>,
-    SingleGroupingExpression,
+pub(super) type SingleFixedEffects = LayerSpec<
+    FixedEffect<SingleGrouping>,
+    SingleGrouping,
     FixedEffectOperations,
     Forbidden,
-    Loaded<FixedEffect<SingleGroupingExpression>>,
+    Loaded<FixedEffect<SingleGrouping>>,
 >;
 
 // Leaf operands cannot embed expressions. This is the same embedding interface
@@ -345,9 +343,9 @@ impl<K: Layer> ExpressionAst<K> {
 
 /// A formula before expansion into estimation alternatives.
 pub(super) struct FormulaAst {
-    pub(super) left: ExpressionAst<MultistageFormulaExpression>,
-    pub(super) right: ExpressionAst<MultistageFormulaExpression>,
-    pub(super) fixed_effects: Option<ExpressionAst<FixedEffectExpression>>,
+    pub(super) left: ExpressionAst<MultistageFormula>,
+    pub(super) right: ExpressionAst<MultistageFormula>,
+    pub(super) fixed_effects: Option<ExpressionAst<FixedEffects>>,
 }
 
 impl<K: Layer> ExpressionAst<K> {
@@ -419,12 +417,11 @@ impl<K: Layer> ExpressionAst<K> {
 mod tests {
     use super::*;
 
-    type Node = ExpressionAst<FixedEffectExpression>;
+    type Node = ExpressionAst<FixedEffects>;
 
     fn column(name: &str) -> Node {
         Node::try_operand(
-            ExpressionAst::<GroupingExpression>::try_operand(crate::Term::from(Factor::from(name)))
-                .unwrap(),
+            ExpressionAst::<Grouping>::try_operand(crate::Term::from(Factor::from(name))).unwrap(),
         )
         .unwrap()
     }
@@ -440,8 +437,7 @@ mod tests {
 
     #[test]
     fn leaf_node_has_no_inner_expression() {
-        let node = ExpressionAst::<SingleFormulaExpression>::try_operand(crate::Term::intercept())
-            .unwrap();
+        let node = ExpressionAst::<SingleFormula>::try_operand(crate::Term::intercept()).unwrap();
         assert!(matches!(
             node.into_inner(),
             Err(ConstructionError::Unsupported)
@@ -500,29 +496,28 @@ mod layers {
     use super::*;
 
     // A third layer with a new operand type: no Child or Grouped vocabulary.
-    struct Envelope(ExpressionAst<FixedEffectExpression>);
-    impl From<ExpressionAst<FixedEffectExpression>> for Envelope {
-        fn from(value: ExpressionAst<FixedEffectExpression>) -> Self {
+    struct Envelope(ExpressionAst<FixedEffects>);
+    impl From<ExpressionAst<FixedEffects>> for Envelope {
+        fn from(value: ExpressionAst<FixedEffects>) -> Self {
             Self(value)
         }
     }
-    impl Embedding<FixedEffectExpression> for Envelope {
+    impl Embedding<FixedEffects> for Envelope {
         fn is_inner(&self) -> bool {
             true
         }
-        fn into_inner(self) -> Result<ExpressionAst<FixedEffectExpression>, Self> {
+        fn into_inner(self) -> Result<ExpressionAst<FixedEffects>, Self> {
             Ok(self.0)
         }
     }
-    type Enveloped = LayerSpec<Envelope, FixedEffectExpression, FixedEffectOperations, Forbidden>;
+    type Enveloped = LayerSpec<Envelope, FixedEffects, FixedEffectOperations, Forbidden>;
 
     #[test]
     fn new_layer_embeds_an_existing_layer_without_changing_the_ast() {
-        let grouping = ExpressionAst::<GroupingExpression>::try_operand(crate::Term::from(
-            Factor::from("firm"),
-        ))
-        .unwrap_or_else(|_| panic!("column"));
-        let fixed: ExpressionAst<FixedEffectExpression> = grouping.into();
+        let grouping =
+            ExpressionAst::<Grouping>::try_operand(crate::Term::from(Factor::from("firm")))
+                .unwrap_or_else(|_| panic!("column"));
+        let fixed: ExpressionAst<FixedEffects> = grouping.into();
         let envelope: ExpressionAst<Enveloped> = fixed.into();
         let ExpressionAst::Operand(Envelope(ExpressionAst::Operand(group))) = envelope else {
             panic!("wrong representation");

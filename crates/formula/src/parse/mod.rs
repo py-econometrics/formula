@@ -316,7 +316,7 @@ fn construction_result<T>(
 
 #[cfg(test)]
 pub(crate) fn parse_expression(cursor: &mut &str) -> ModalResult<Vec<Expression>> {
-    parse_node::<ast::MultistageFormulaExpression>
+    parse_node::<ast::MultistageFormula>
         .map(|node| node.expand())
         .parse_next(cursor)
 }
@@ -469,8 +469,7 @@ fn parse_operand<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ast::Expressio
 fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
     let left = preceded(
         multispace0,
-        parse_node::<ast::MultistageFormulaExpression>
-            .context(StrContext::Label("left-hand expression")),
+        parse_node::<ast::MultistageFormula>.context(StrContext::Label("left-hand expression")),
     )
     .parse_next(cursor)?;
 
@@ -483,7 +482,7 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
     let right = preceded(
         multispace0,
         cut_err(
-            parse_node::<ast::MultistageFormulaExpression>
+            parse_node::<ast::MultistageFormula>
                 .context(StrContext::Label("right-hand expression")),
         ),
     )
@@ -492,8 +491,7 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
     let fixed_effects = opt(preceded(
         PIPE_SEPARATOR,
         cut_err(
-            parse_node::<ast::FixedEffectExpression>
-                .context(StrContext::Label("fixed-effect expression")),
+            parse_node::<ast::FixedEffects>.context(StrContext::Label("fixed-effect expression")),
         ),
     ))
     .parse_next(cursor)?;
@@ -536,10 +534,10 @@ pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression
     let parser = |cursor: &mut &str| -> ModalResult<Expression> {
         let mut alternatives = match role {
             Role::Dependent | Role::Independent => {
-                parse_node::<ast::SingleFormulaExpression>(cursor)?.expand()
+                parse_node::<ast::SingleFormula>(cursor)?.expand()
             }
             Role::FixedEffect => {
-                let node = parse_node::<ast::SingleFixedEffectExpression>(cursor)?;
+                let node = parse_node::<ast::SingleFixedEffects>(cursor)?;
                 node.expand()
             }
         };
@@ -742,9 +740,7 @@ mod tests {
                 ("firm[[2.0]]", Scalar::from(2_f64), false),
                 ("firm[[-2.5]]", Scalar::from(-2.5_f64), false),
             ] {
-                let node = parse_node::<typed::FixedEffectExpression>
-                    .parse(source)
-                    .unwrap();
+                let node = parse_node::<typed::FixedEffects>.parse(source).unwrap();
                 let typed::ExpressionAst::Nested(group) = node else {
                     panic!("expected grouped loadings for {source}");
                 };
@@ -1027,16 +1023,16 @@ mod tests {
 
     mod syntax {
         use super::*;
-        use typed::{ExpressionAst as Ast, SimpleFormulaExpression};
+        use typed::{ExpressionAst as Ast, SimpleFormula};
 
-        fn simple(source: &str) -> Ast<SimpleFormulaExpression> {
-            let expression = parse_node::<typed::MultistageFormulaExpression>
+        fn simple(source: &str) -> Ast<SimpleFormula> {
+            let expression = parse_node::<typed::MultistageFormula>
                 .parse(source)
                 .unwrap();
             expression.into_inner().unwrap()
         }
 
-        fn assert_term(node: &Ast<SimpleFormulaExpression>, name: &str) {
+        fn assert_term(node: &Ast<SimpleFormula>, name: &str) {
             let Ast::Operand(term) = node else {
                 panic!("expected term {name}");
             };
@@ -1061,7 +1057,7 @@ mod tests {
 
         #[test]
         fn child_formulas_remain_unexpanded() {
-            let Ast::Nested(child) = parse_node::<typed::MultistageFormulaExpression>
+            let Ast::Nested(child) = parse_node::<typed::MultistageFormula>
                 .parse("[a ~ sw(x, z)]")
                 .unwrap()
             else {
@@ -1085,7 +1081,7 @@ mod tests {
                 ("0x", "0x"),
                 ("1x", "1x"),
             ] {
-                let Ast::Operand(column) = parse_node::<typed::FixedEffectExpression>
+                let Ast::Operand(column) = parse_node::<typed::FixedEffects>
                     .parse(source)
                     .unwrap()
                     .into_inner()
@@ -1099,7 +1095,7 @@ mod tests {
 
         #[test]
         fn loading_postfix_wraps_the_entire_grouping_interaction() {
-            let Ast::Nested(group) = parse_node::<typed::FixedEffectExpression>
+            let Ast::Nested(group) = parse_node::<typed::FixedEffects>
                 .parse("firm:year[time]")
                 .unwrap()
             else {
@@ -2633,7 +2629,7 @@ mod layers {
             parse("out ~ x*y + ([x ~ z] + w)").unwrap(),
             parse("out ~ x + y + x:y + w + [x ~ z]").unwrap()
         );
-        let node = parse_node::<ast::MultistageFormulaExpression>
+        let node = parse_node::<ast::MultistageFormula>
             .parse("x*y + ([x ~ z] + w)")
             .unwrap();
         let ast::ExpressionAst::Add(_, pair) = node else {
