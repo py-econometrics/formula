@@ -24,8 +24,8 @@ impl StandardizeDefinition {
 pub(crate) struct StandardizeState {
     field: Field,
     mean: f64,
-    // 1 for `center(x)`
-    deviation: f64,
+    // `None` for `center(x)`
+    deviation: Option<f64>,
 }
 
 impl TransformDefinition for StandardizeDefinition {
@@ -85,9 +85,9 @@ impl Definition<StandardizeState> for StandardizeDefinition {
                     "scale: the standard deviation must be positive and finite".into(),
                 ));
             }
-            deviation
+            Some(deviation)
         } else {
-            1.0
+            None
         };
         Ok(StandardizeState {
             field: field.clone(),
@@ -119,8 +119,11 @@ impl Definition<StandardizeState> for StandardizeDefinition {
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
         let name = call_name(self.name(), [field.name().as_str()]);
-        let expression = ((finite_values(col(input.name().clone())) - lit(state.mean))
-            / lit(state.deviation))
+        let centered = finite_values(col(input.name().clone())) - lit(state.mean);
+        let expression = match state.deviation {
+            Some(deviation) => centered / lit(deviation),
+            None => centered,
+        }
         .alias(name);
         let output = inputs.frame.clone().lazy().select([expression]).collect()?;
         Ok(MaterializedColumns::single_column(
