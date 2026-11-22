@@ -58,7 +58,19 @@ impl Definition<StandardizeState> for StandardizeDefinition {
                 self.name()
             ))
         })?;
+        if !mean.is_finite() {
+            return Err(TransformError::NumericalError(format!(
+                "{}: the mean must be finite",
+                self.name()
+            )));
+        }
         let deviation = if self.scale {
+            // Constant columns may end up with non-zero deviation due to rounding
+            if values.min() == values.max() {
+                return Err(TransformError::NumericalError(
+                    "scale: the input is constant".into(),
+                ));
+            }
             let deviation = values.std(1).unwrap_or(f64::NAN);
             if !(deviation.is_finite() && deviation > 0.0) {
                 return Err(TransformError::NumericalError(
@@ -69,12 +81,6 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         } else {
             1.0
         };
-        if !mean.is_finite() {
-            return Err(TransformError::NumericalError(format!(
-                "{}: the mean must be finite",
-                self.name()
-            )));
-        }
         Ok(StandardizeState {
             field: field.clone(),
             mean,
@@ -171,6 +177,24 @@ mod tests {
         ] {
             assert!(
                 Fitted::fit(definition, &prepare(values)).is_err(),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_rejection_names_the_cause() {
+        for (values, cause) in [
+            // The fitted deviation of [0.1; 3] is about 1.7e-17, not zero.
+            (&[0.1, 0.1, 0.1][..], "constant"),
+            (&[2.2; 100][..], "constant"),
+            (&[1.0, f64::INFINITY][..], "mean"),
+        ] {
+            assert!(
+                matches!(
+                    Fitted::fit(StandardizeDefinition::SCALE, &prepare(values)),
+                    Err(TransformError::NumericalError(message)) if message.contains(cause)
+                ),
                 "{values:?}"
             );
         }
