@@ -1,7 +1,7 @@
 //! Direct readers for typed operand values. Layer transitions are AST structure,
 //! not parser callbacks or conversions from a second operand enum.
 use super::ast::{
-    ConstructionError, ExpressionAst, ExpressionKind, FixedEffect, Forbidden, FormulaAst, Loaded,
+    ConstructionError, ExpressionAst, FixedEffect, Forbidden, FormulaAst, Layer, Loaded,
 };
 use super::{construction_result, parse_factor, parse_formula_ast, parse_loadings};
 use crate::formula::VariableDefinition;
@@ -93,8 +93,8 @@ impl<I: ParseLayer> ReadValue for Loaded<FixedEffect<I>> {
     }
 }
 
-pub(super) trait ParseLayer: ExpressionKind<Operand: ReadValue, Nested: ReadValue> {}
-impl<K: ExpressionKind<Operand: ReadValue, Nested: ReadValue>> ParseLayer for K {}
+pub(super) trait ParseLayer: Layer<Operand: ReadValue, Nested: ReadValue> {}
+impl<K: Layer<Operand: ReadValue, Nested: ReadValue>> ParseLayer for K {}
 
 pub(super) fn nested<K: ParseLayer>(cursor: &mut &str) -> ModalResult<ExpressionAst<K>> {
     let (nested, negate) = K::Nested::read(cursor)?;
@@ -152,7 +152,7 @@ fn reject_loading<K: ParseLayer, const INTERCEPT: bool>(
 mod tests {
     use super::*;
     use crate::parse::ast::{
-        FixedEffectExpression, FixedEffectOperations, FormulaOperations, Layer,
+        FixedEffectExpression, FixedEffectOperations, FormulaOperations, LayerSpec,
         MultistageOperations, Permitted, SimpleFormulaExpression,
     };
     enum Wrapped {
@@ -169,14 +169,14 @@ mod tests {
             .parse_next(cursor)
         }
     }
-    type Additive = Layer<
+    type Additive = LayerSpec<
         ExpressionAst<SimpleFormulaExpression>,
         SimpleFormulaExpression,
         MultistageOperations,
         Permitted,
         Wrapped,
     >;
-    type Algebraic = Layer<
+    type Algebraic = LayerSpec<
         ExpressionAst<SimpleFormulaExpression>,
         SimpleFormulaExpression,
         FormulaOperations,
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn another_layer_reuses_the_entire_fixed_effect_grammar() {
-        type Envelope = Layer<
+        type Envelope = LayerSpec<
             ExpressionAst<FixedEffectExpression>,
             FixedEffectExpression,
             FixedEffectOperations,

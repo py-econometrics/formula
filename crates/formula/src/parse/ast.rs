@@ -35,7 +35,7 @@ impl Permission for Forbidden {
     }
 }
 
-impl<E: ExpressionKind> TryFrom<ExpressionAst<E>> for Forbidden {
+impl<E: Layer> TryFrom<ExpressionAst<E>> for Forbidden {
     type Error = ConstructionError;
 
     fn try_from(_: ExpressionAst<E>) -> Result<Self, Self::Error> {
@@ -75,7 +75,7 @@ pub(super) enum BinaryOperator {
 }
 
 impl BinaryOperator {
-    fn construct<K: ExpressionKind>(
+    fn construct<K: Layer>(
         self,
         operands: Binary<ExpressionAst<K>>,
     ) -> Result<ExpressionAst<K>, ConstructionError> {
@@ -106,10 +106,10 @@ pub(super) struct Stepwise<E> {
 }
 
 /// An unloaded fixed effect, with its grouping algebra still intact.
-pub(super) struct FixedEffect<K: ExpressionKind> {
+pub(super) struct FixedEffect<K: Layer> {
     pub(super) group: ExpressionAst<K>,
 }
-impl<K: ExpressionKind> From<ExpressionAst<K>> for FixedEffect<K> {
+impl<K: Layer> From<ExpressionAst<K>> for FixedEffect<K> {
     fn from(group: ExpressionAst<K>) -> Self {
         Self { group }
     }
@@ -133,7 +133,7 @@ pub(super) type FixedEffectGroup<K> = Loaded<FixedEffect<K>>;
 
 /// Embedding is reversible: the parser can recover an inner tree without
 /// maintaining a second representation of the expression's current layer.
-pub(super) trait Embedding<I: ExpressionKind>: TryFrom<ExpressionAst<I>> {
+pub(super) trait Embedding<I: Layer>: TryFrom<ExpressionAst<I>> {
     fn is_inner(&self) -> bool {
         false
     }
@@ -145,17 +145,17 @@ impl Embedding<Forbidden> for crate::Term {}
 impl Embedding<Forbidden> for crate::formula::VariableDefinition {}
 impl Embedding<Forbidden> for Forbidden {}
 
-/// Independent operand, algebraic-operator, and expansion choices for an expression.
-pub(super) trait ExpressionKind: Sized {
+/// A layer of a formula expression: support for operands, operators and stepwise syntax.
+pub(super) trait Layer: Sized {
     type Operand: Embedding<Self::Inner>;
     type Nested;
-    type Inner: ExpressionKind;
+    type Inner: Layer;
     type Operators: Operations;
     type Stepwise: Permission;
 }
 
-/// An expression enum whose [`ExpressionKind`] determines which variants can exist
-pub(super) enum ExpressionAst<K: ExpressionKind> {
+/// An expression in layer, which determines the variants that can exist.
+pub(super) enum ExpressionAst<K: Layer> {
     Operand(K::Operand),
     Nested(Box<K::Nested>),
 
@@ -171,7 +171,7 @@ pub(super) enum ExpressionAst<K: ExpressionKind> {
 }
 
 /// A forbidden expression
-impl ExpressionKind for Forbidden {
+impl Layer for Forbidden {
     type Operand = Forbidden;
     type Nested = Forbidden;
     type Inner = Forbidden;
@@ -241,10 +241,10 @@ impl Operations for FixedEffectOperations {
     type Nesting = Forbidden;
 }
 
-/// An expression layer with independent operands, operators, and stepwise support.
-/// `Inner = Forbidden` denotes a layer without an embedded expression domain.
-pub(super) struct Layer<O, I, P, S, N = Forbidden>(std::marker::PhantomData<(O, I, P, S, N)>);
-impl<O, I: ExpressionKind, P: Operations, S: Permission, N> ExpressionKind for Layer<O, I, P, S, N>
+/// A [`Layer`] given by its operand, inner-layer, operator,
+/// stepwise and nested value. `Inner = Forbidden` means nothing is embedded.
+pub(super) struct LayerSpec<O, I, P, S, N = Forbidden>(std::marker::PhantomData<(O, I, P, S, N)>);
+impl<O, I: Layer, P: Operations, S: Permission, N> Layer for LayerSpec<O, I, P, S, N>
 where
     O: Embedding<I>,
 {
@@ -257,9 +257,9 @@ where
 
 // Embedding preserves the complete inner tree; operand expansion decides how
 // it participates in the outer domain.
-impl<I, O, P, S, N> From<ExpressionAst<I>> for ExpressionAst<Layer<O, I, P, S, N>>
+impl<I, O, P, S, N> From<ExpressionAst<I>> for ExpressionAst<LayerSpec<O, I, P, S, N>>
 where
-    I: ExpressionKind,
+    I: Layer,
     O: Embedding<I> + From<ExpressionAst<I>>,
     P: Operations,
     S: Permission,
@@ -269,7 +269,7 @@ where
     }
 }
 
-impl<I: ExpressionKind> Embedding<I> for ExpressionAst<I> {
+impl<I: Layer> Embedding<I> for ExpressionAst<I> {
     fn is_inner(&self) -> bool {
         true
     }
@@ -277,7 +277,7 @@ impl<I: ExpressionKind> Embedding<I> for ExpressionAst<I> {
         Ok(self)
     }
 }
-impl<I: ExpressionKind> Embedding<I> for FixedEffect<I> {
+impl<I: Layer> Embedding<I> for FixedEffect<I> {
     fn is_inner(&self) -> bool {
         true
     }
@@ -287,21 +287,21 @@ impl<I: ExpressionKind> Embedding<I> for FixedEffect<I> {
 }
 
 pub(super) type SingleFormulaExpression =
-    Layer<crate::Term, Forbidden, FormulaOperations, Forbidden>;
+    LayerSpec<crate::Term, Forbidden, FormulaOperations, Forbidden>;
 pub(super) type SimpleFormulaExpression =
-    Layer<crate::Term, Forbidden, FormulaOperations, Permitted>;
+    LayerSpec<crate::Term, Forbidden, FormulaOperations, Permitted>;
 pub(super) type GroupingExpression =
-    Layer<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Permitted>;
+    LayerSpec<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Permitted>;
 pub(super) type SingleGroupingExpression =
-    Layer<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Forbidden>;
-pub(super) type MultistageFormulaExpression = Layer<
+    LayerSpec<crate::formula::VariableDefinition, Forbidden, GroupingOperations, Forbidden>;
+pub(super) type MultistageFormulaExpression = LayerSpec<
     ExpressionAst<SimpleFormulaExpression>,
     SimpleFormulaExpression,
     MultistageOperations,
     Permitted,
     FormulaAst,
 >;
-pub(super) type FixedEffectExpression = Layer<
+pub(super) type FixedEffectExpression = LayerSpec<
     FixedEffect<GroupingExpression>,
     GroupingExpression,
     FixedEffectOperations,
@@ -309,7 +309,7 @@ pub(super) type FixedEffectExpression = Layer<
     Loaded<FixedEffect<GroupingExpression>>,
 >;
 
-pub(super) type SingleFixedEffectExpression = Layer<
+pub(super) type SingleFixedEffectExpression = LayerSpec<
     FixedEffect<SingleGroupingExpression>,
     SingleGroupingExpression,
     FixedEffectOperations,
@@ -332,7 +332,7 @@ impl TryFrom<ExpressionAst<Forbidden>> for crate::formula::VariableDefinition {
     }
 }
 
-impl<K: ExpressionKind> ExpressionAst<K> {
+impl<K: Layer> ExpressionAst<K> {
     pub(super) fn try_operand<T>(input: T) -> Result<Self, ConstructionError>
     where
         K::Operand: TryFrom<T>,
@@ -350,7 +350,7 @@ pub(super) struct FormulaAst {
     pub(super) fixed_effects: Option<ExpressionAst<FixedEffectExpression>>,
 }
 
-impl<K: ExpressionKind> ExpressionAst<K> {
+impl<K: Layer> ExpressionAst<K> {
     fn is_inner(&self) -> bool {
         matches!(self, Self::Operand(operand) if operand.is_inner())
     }
@@ -514,7 +514,7 @@ mod layers {
             Ok(self.0)
         }
     }
-    type Enveloped = Layer<Envelope, FixedEffectExpression, FixedEffectOperations, Forbidden>;
+    type Enveloped = LayerSpec<Envelope, FixedEffectExpression, FixedEffectOperations, Forbidden>;
 
     #[test]
     fn new_layer_embeds_an_existing_layer_without_changing_the_ast() {

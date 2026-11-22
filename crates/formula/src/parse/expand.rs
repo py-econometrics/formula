@@ -1,5 +1,5 @@
 use crate::parse::ast::{
-    ExpressionAst, ExpressionKind, FixedEffectGroup, Forbidden, FormulaAst, StepwiseOperator,
+    ExpressionAst, FixedEffectGroup, Forbidden, FormulaAst, Layer, StepwiseOperator,
 };
 use crate::{Factor, formula};
 
@@ -137,7 +137,7 @@ impl OperandExpansion for Forbidden {
     }
 }
 
-impl<K: ExpressionKind> OperandExpansion for FixedEffectGroup<K>
+impl<K: Layer> OperandExpansion for FixedEffectGroup<K>
 where
     K::Operand: OperandExpansion,
     K::Nested: OperandExpansion,
@@ -163,7 +163,7 @@ impl OperandExpansion for FormulaAst {
     }
 }
 
-impl<K: ExpressionKind> OperandExpansion for ExpressionAst<K>
+impl<K: Layer> OperandExpansion for ExpressionAst<K>
 where
     K::Operand: OperandExpansion,
     K::Nested: OperandExpansion,
@@ -181,7 +181,7 @@ where
     }
 }
 
-impl<K: ExpressionKind> ExpressionAst<K>
+impl<K: Layer> ExpressionAst<K>
 where
     K::Operand: OperandExpansion,
     K::Nested: OperandExpansion,
@@ -266,7 +266,7 @@ where
     }
 }
 
-impl<I: ExpressionKind> OperandExpansion for super::ast::FixedEffect<I>
+impl<I: Layer> OperandExpansion for super::ast::FixedEffect<I>
 where
     I::Operand: OperandExpansion,
     I::Nested: OperandExpansion,
