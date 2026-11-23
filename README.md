@@ -233,6 +233,11 @@ or `transform()`:
 | `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`; the optional `omit` argument specifies the levels to omit. |
 | `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
 
+String, categorical, enum, and boolean columns written directly as terms are encoded
+as `C(...)` when fitting: `y ~ group + group:x` fits as `y ~ C(group) + C(group):x`.
+Fitted formulas spell out this encoding, so fitted models and their terms are looked up
+and selected as `C(group)`, while unfitted formulas keep the spelling as written.
+
 Numeric arguments are supported inside transformation calls:
 
 ```text
