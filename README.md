@@ -231,7 +231,7 @@ or `transform()`:
 | `pow(x, k)`                                                                   | Raise a numeric column to the power `k`, a scalar or another column.                                          |
 | `center(x)`<br>`scale(x)`                                                    | Subtract the fitted mean of `x`, and for `scale` divide by its fitted sample standard deviation. `transform()` reuses both. |
 | `C(group, omit=...)`                                                    | Create categorical indicator columns for `group`; the optional `omit` argument specifies the levels to omit. |
-| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`.                    |
+| `poly(x, degree=1, raw=false)`                                               | Expand a numeric input into orthonormal polynomial columns, or raw powers with `raw=true`. `poly(x, 2)` gives the degree by position. |
 
 String, categorical, enum, and boolean columns written directly as terms are encoded
 as `C(...)` when fitting: `y ~ group + group:x` fits as `y ~ C(group) + C(group):x`.

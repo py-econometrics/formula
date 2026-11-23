@@ -774,7 +774,38 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
             }
             "poly" => {
-                let degree = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
+                let keyword = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
+                let positional = match arguments.as_slice() {
+                    // No positional argument
+                    [_] => None,
+                    // A single positional literal can be interpreted as degree
+                    [_, second] if second.value().is_some() => second.value().cloned(),
+                    // All other cases (e.g., positional non-literal arguments) are not supported
+                    _ => {
+                        return Err(TransformCallError::InvalidParameter {
+                            transform: "poly",
+                            message: "expected one input and an optional positive integer degree"
+                                .into(),
+                        });
+                    }
+                };
+                let degree = match (positional, keyword) {
+                    // Cannot specify degree both positionally and as keyword
+                    (Some(_), Some(_)) => {
+                        return Err(TransformCallError::InvalidParameter {
+                            transform: "poly",
+                            message: "the degree is given both by position and as `degree`".into(),
+                        });
+                    }
+                    // Degree is specified positionally
+                    (Some(value), None) => {
+                        arguments.pop();
+                        Some(ParameterValue::Scalar(value))
+                    }
+                    // Degree is specified as keyword
+                    (None, keyword) => keyword,
+                };
+
                 let raw = keywords.remove(PolynomialDefinition::RAW_PARAMETER);
                 reject_keywords("poly", keywords)?;
 
@@ -838,6 +869,42 @@ mod tests {
         );
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn polynomial_degree_may_be_positional() {
+        for (source, expected) in [
+            ("y ~ poly(x, 2)", "y ~ poly(x, degree=2)"),
+            (
+                "y ~ poly(x, 3, raw=true)",
+                "y ~ poly(x, degree=3, raw=true)",
+            ),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(expected).unwrap(), "{source}");
+        }
+        for (source, message) in [
+            (
+                "y ~ poly(x, 2, degree=2)",
+                "both by position and as `degree`",
+            ),
+            ("y ~ poly(x, 2.5)", "`degree` must be a positive integer"),
+            (
+                "y ~ poly(x, z)",
+                "expected one input and an optional positive integer degree",
+            ),
+        ] {
+            let error = match parse(source) {
+                Err(error) => error.to_string(),
+                Ok(formulas) => formulas
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .validate()
+                    .unwrap_err()
+                    .to_string(),
+            };
+            assert!(error.contains(message), "{source}: {error}");
         }
     }
 
