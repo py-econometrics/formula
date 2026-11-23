@@ -123,6 +123,19 @@ def test_combined_frame_preserves_input_height_on_fitting_and_transformation(
         assert_frame_equal(model.frame(), input_data.select("y", "x"))
 
 
+def test_is_valid_marks_rows_without_dropping_them():
+    data = polars.DataFrame(
+        {"y": [1.0, None, 3.0], "x": [1.0, 2.0, 0.0], "z": [1.0, 2.0, 3.0]}
+    )
+    models = formula.parse("y ~ sw(log(x), z)").fit(data)
+
+    assert models[0].is_valid().to_list() == [True, False, False]
+    assert models.is_valid().to_list() == [True, False, False]
+    assert models[1].frame().filter(models[1].is_valid()).height == 2
+    with pytest.raises(ValueError):
+        models[0].children(formula.Role.Independent).is_valid()
+
+
 def test_model_indexing(data):
     models = formula.parse(["y ~ x - 1", "y ~ z - 1"]).fit(data)
 

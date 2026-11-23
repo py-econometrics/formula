@@ -5,8 +5,8 @@ use crate::formula::{
 use crate::parse::{ParseResult, parse_term};
 use crate::transform::TransformError;
 use crate::{Formula, FormulaColumn};
-use polars::error::PolarsResult;
-use polars::prelude::DataFrame;
+use polars::error::{PolarsError, PolarsResult};
+use polars::prelude::{BooleanChunked, ChunkFillNullValue, ChunkFull, Column, DataFrame};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -47,6 +47,20 @@ impl FittedFormula {
             .collect();
 
         DataFrame::new(self.height, columns)
+    }
+
+    /// Boolean mask indicating if all materialized values in a row are not null and finite
+    pub fn is_valid(&self) -> PolarsResult<BooleanChunked> {
+        let mut valid = BooleanChunked::full("is_valid".into(), true, self.height);
+        for expression in self.expressions.values() {
+            for column in expression.frame().columns() {
+                valid = &valid & &is_valid(column)?;
+            }
+            for child in expression.children() {
+                valid = &valid & &child.is_valid()?;
+            }
+        }
+        Ok(valid)
     }
 
     pub fn columns(
@@ -218,6 +232,35 @@ impl FittedFormulas {
 
         Ok(Self::new(entries))
     }
+
+    pub fn is_valid(&self) -> PolarsResult<BooleanChunked> {
+        let mut models = self.iter();
+        let first = models
+            .next()
+            .ok_or_else(|| PolarsError::NoData("no fitted formulas to check".into()))?;
+
+        models.try_fold(first.is_valid()?, |valid, model| {
+            if model.height != first.height {
+                return Err(PolarsError::ShapeMismatch(
+                    format!(
+                        "fitted formulas have {} and {} rows",
+                        first.height, model.height
+                    )
+                    .into(),
+                ));
+            }
+            Ok(&valid & &model.is_valid()?)
+        })
+    }
+}
+
+fn is_valid(column: &Column) -> PolarsResult<BooleanChunked> {
+    let valid = column.is_not_null();
+    if !column.dtype().is_float() {
+        return Ok(valid);
+    }
+    // Also check finiteness for float values
+    Ok(&valid & &column.is_finite()?.fill_null_with_values(false)?)
 }
 
 impl<'a> IntoIterator for &'a FittedFormulas {
@@ -1594,5 +1637,78 @@ mod tests {
         let error = models.get_by_str("y ~ sw(x, z)").unwrap_err();
         assert!(error.to_string().contains("expected exactly one formula"));
         assert!(models.get_by_str("y ~ sw(x, x)").unwrap().is_some());
+    }
+
+    mod valid_rows {
+        use super::*;
+        use crate::FittedFormulas;
+        use polars::error::PolarsError;
+        use polars::prelude::DataFrame;
+
+        fn data() -> DataFrame {
+            polars::df!(
+                "y" => [Some(1.0), None, Some(3.0), Some(4.0), Some(5.0), Some(6.0)],
+                "x" => [1.0, 2.0, 3.0, 0.0, 5.0, 6.0],
+                "d" => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                "z" => [1.0, 2.0, f64::NAN, 4.0, 5.0, 6.0],
+                "f" => [Some("a"), Some("b"), Some("a"), Some("b"), None, Some("a")],
+            )
+            .unwrap()
+        }
+
+        fn mask(valid: polars::prelude::BooleanChunked) -> Vec<Option<bool>> {
+            valid.iter().collect()
+        }
+
+        #[test]
+        fn valid_rows_cover_every_role_and_child_without_dropping_rows() {
+            let data = data();
+            let models = crate::parse("y ~ log(x) + [d ~ z] | f")
+                .unwrap()
+                .fit(&data)
+                .unwrap();
+            let model = models.iter().next().unwrap();
+
+            // A missing response, NaN instrument, log(0) and missing group each invalidate a row
+            let expected = [true, false, false, false, false, true].map(Some);
+            assert_eq!(mask(model.is_valid().unwrap()), expected);
+            assert_eq!(model.frame().unwrap().height(), data.height());
+
+            let independent = model.select(&[Role::Independent]).unwrap();
+            let expected = [true, true, false, false, true, true].map(Some);
+            assert_eq!(mask(independent.is_valid().unwrap()), expected);
+
+            let prediction = data.slice(2, 2);
+            let transformed = model.transform(&prediction).unwrap();
+            assert_eq!(mask(transformed.is_valid().unwrap()), [Some(false); 2]);
+        }
+
+        #[test]
+        fn models_are_valid_where_every_model_is_valid() {
+            let data = data();
+            let models = crate::parse("y ~ sw(log(x), z)")
+                .unwrap()
+                .fit(&data)
+                .unwrap();
+            let expected = [true, false, false, false, true, true].map(Some);
+            assert_eq!(mask(models.is_valid().unwrap()), expected);
+
+            let empty = FittedFormulas::from_iter([]);
+            assert!(matches!(empty.is_valid(), Err(PolarsError::NoData(_))));
+
+            let short = crate::parse("y ~ x")
+                .unwrap()
+                .fit(&data.head(Some(2)))
+                .unwrap();
+            let mixed = models
+                .iter()
+                .chain(&short)
+                .cloned()
+                .collect::<FittedFormulas>();
+            assert!(matches!(
+                mixed.is_valid(),
+                Err(PolarsError::ShapeMismatch(_))
+            ));
+        }
     }
 }

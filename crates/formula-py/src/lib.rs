@@ -1,4 +1,4 @@
-use polars::prelude::{Column, Scalar};
+use polars::prelude::{Column, IntoSeries, Scalar};
 use pyo3::exceptions::{PyIndexError, PyKeyError, PySyntaxError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyIterator, PyList, PyTuple};
@@ -142,6 +142,13 @@ impl FittedFormulas {
                 formula::SelectionError::Frame(_) => PyValueError::new_err(error.to_string()),
             })
     }
+
+    fn is_valid(&self) -> PyResult<PySeries> {
+        self.inner
+            .is_valid()
+            .map(|valid| PySeries(valid.into_series()))
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
 }
 
 #[pyclass(frozen, module = "formula")]
@@ -160,6 +167,13 @@ impl FittedFormula {
         self.inner
             .frame()
             .map(PyDataFrame)
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
+    fn is_valid(&self) -> PyResult<PySeries> {
+        self.inner
+            .is_valid()
+            .map(|valid| PySeries(valid.into_series()))
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
