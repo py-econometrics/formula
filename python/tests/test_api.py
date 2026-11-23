@@ -521,10 +521,10 @@ def test_transform_state_mapping_interface():
     model = formula.parse("y ~ 1 | group").fit(data)[0]
     (term,) = model.terms(formula.Role.FixedEffect)
     (factor,) = term.factors
-    assert factor.transform is not None
-    (encoder,) = factor.transform.inputs
-    assert encoder.transform is not None
-    state = encoder.transform.state
+    assert factor.call is not None
+    (encoder,) = factor.call.inputs
+    assert encoder.call is not None
+    state = encoder.call.state
     assert state is not None
     assert len(state) == 2
     assert set(state) == {"codes", "levels"}
@@ -557,7 +557,7 @@ def test_stateless_transform_has_an_empty_state():
     (term,) = model.terms(formula.Role.Independent)
     assert term.fixed_effect is None
     (factor,) = term.factors
-    call = factor.transform
+    call = factor.call
     assert call is not None
     state = call.state
     assert state is not None

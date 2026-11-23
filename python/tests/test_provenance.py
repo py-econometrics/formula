@@ -34,7 +34,7 @@ def test_categorical_omit_scalar_and_list(argument, parameter, remaining, dtype)
     )
     model = formula.parse(f"y ~ C(g, omit={argument}) - 1").fit(training)[0]
     (term,) = model.terms(formula.Role.Independent)
-    call = term.factors[0].transform
+    call = term.factors[0].call
     assert call is not None
     assert call.parameters == {"omit": parameter}
     assert [column.contributions[0].key for column in term.columns] == remaining
@@ -78,10 +78,10 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
 
     assert isinstance(term.factors, tuple)
     assert len(term.factors) == 2
-    call = term.factors[0].transform
+    call = term.factors[0].call
     assert call is not None
     assert call.name == "C"
-    assert term.factors[1].name == "x"
+    assert term.factors[1].column == "x"
     columns = term.columns
     assert isinstance(columns, tuple)
     del term
@@ -92,27 +92,27 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
     ):
         assert isinstance(column.term, tuple)
         assert len(column.term) == 2
-        term_call = column.term[0].transform
+        term_call = column.term[0].call
         assert term_call is not None
         assert term_call.name == "C"
-        assert column.term[1].name == "x"
+        assert column.term[1].column == "x"
         assert isinstance(column.contributions, tuple)
         assert len(column.contributions) == 2
         categorical_contribution, variable_contribution = column.contributions
         categorical = categorical_contribution.factor
         variable = variable_contribution.factor
-        assert categorical.name is None
-        assert categorical.value is None
-        call = categorical.transform
+        assert categorical.column is None
+        assert categorical.literal is None
+        call = categorical.call
         assert call is not None
         assert call.name == "C"
         assert call.parameters == {"omit": "a"}
         assert len(call.inputs) == 1
-        assert call.inputs[0].name == "g"
+        assert call.inputs[0].column == "g"
         assert categorical_contribution.key == level
-        assert variable.name == "x"
-        assert variable.value is None
-        assert variable.transform is None
+        assert variable.column == "x"
+        assert variable.literal is None
+        assert variable.call is None
         assert variable_contribution.key is None
         assert_series_equal(column.data, polars.Series(column.data.name, values))
 
@@ -159,20 +159,20 @@ def test_nested_transform_inputs_and_parameters():
         key = contribution.key
         assert type(key) is int
         assert key == basis
-        polynomial = factor.transform
+        polynomial = factor.call
         assert polynomial is not None
         assert polynomial.name == "poly"
         assert polynomial.parameters == {"degree": 2, "raw": True}
         assert type(polynomial.parameters["degree"]) is int
         assert type(polynomial.parameters["raw"]) is bool
         assert len(polynomial.inputs) == 1
-        logarithm = polynomial.inputs[0].transform
+        logarithm = polynomial.inputs[0].call
         assert logarithm is not None
         assert logarithm.name == "log"
         assert logarithm.parameters == {}
         assert len(logarithm.inputs) == 1
-        assert logarithm.inputs[0].name == "x"
-        assert logarithm.inputs[0].transform is None
+        assert logarithm.inputs[0].column == "x"
+        assert logarithm.inputs[0].call is None
         assert column.data.to_list() == pytest.approx([0.0, 1.0, 2.0**basis])
 
 
@@ -183,19 +183,19 @@ def test_literal_transform_inputs_preserve_python_types(data, literal, expected)
     contribution = column.contributions[0]
     factor = contribution.factor
     assert contribution.key is None
-    call = factor.transform
+    call = factor.call
     assert call is not None
     assert call.name == "add"
     assert call.parameters == {}
     assert len(call.inputs) == 2
     variable, constant = call.inputs
-    assert variable.name == "x"
-    assert variable.value is None
-    assert variable.transform is None
-    assert constant.name is None
-    assert constant.transform is None
-    assert type(constant.value) is type(expected)
-    assert constant.value == expected
+    assert variable.column == "x"
+    assert variable.literal is None
+    assert variable.call is None
+    assert constant.column is None
+    assert constant.call is None
+    assert type(constant.literal) is type(expected)
+    assert constant.literal == expected
     assert column.data.to_list() == [4.0, 5.0, 6.0]
 
 
@@ -205,7 +205,7 @@ def test_provenance_properties_are_read_only_and_containers_are_copies(data):
     column = term.columns[0]
     contribution = column.contributions[0]
     factor = contribution.factor
-    call = factor.transform
+    call = factor.call
     assert call is not None
     for target, attribute, value in [
         (term, "factors", ()),
@@ -230,7 +230,7 @@ def test_provenance_properties_are_read_only_and_containers_are_copies(data):
     parameters = call.parameters
     parameters["omit"] = "changed"
     assert len(call.inputs) == 1
-    assert call.inputs[0].name == "g"
+    assert call.inputs[0].column == "g"
     assert call.parameters == {"omit": "a"}
 
     exported = term.columns[0].data
@@ -245,8 +245,8 @@ def test_zero_column_term_has_empty_python_tuple():
     assert intercept.factors == ()
     assert categorical.columns == ()
     (factor,) = categorical.factors
-    assert factor.transform is not None
-    assert factor.transform.name == "C"
+    assert factor.call is not None
+    assert factor.call.name == "C"
 
 
 @pytest.mark.xfail(
@@ -316,10 +316,10 @@ def test_varying_slope_provenance_survives_owner_deletion():
             polars.UInt32 if role == "group" else polars.Float64
         )
         (term_factor,) = column.term
-        term_call = term_factor.transform
+        term_call = term_factor.call
         assert term_call is not None
 
-        call = contribution.factor.transform
+        call = contribution.factor.call
         assert call is not None
         assert call.parameters == {"intercept": True}
         assert type(call.parameters["intercept"]) is bool

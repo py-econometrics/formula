@@ -415,17 +415,17 @@ impl TransformState {
 #[pyclass(frozen, skip_from_py_object, module = "formula")]
 #[derive(Clone, Debug)]
 struct Factor {
-    name: Option<String>,
-    value: Option<Scalar>,
-    transform: Option<TransformCall>,
+    column: Option<String>,
+    literal: Option<Scalar>,
+    call: Option<TransformCall>,
 }
 
 impl From<&formula::Factor> for Factor {
     fn from(factor: &formula::Factor) -> Self {
         Self {
-            name: factor.name().map(str::to_owned),
-            value: factor.value().cloned(),
-            transform: factor.transform().map(TransformCall::from),
+            column: factor.column().map(str::to_owned),
+            literal: factor.literal().cloned(),
+            call: factor.call().map(TransformCall::from),
         }
     }
 }
@@ -437,21 +437,21 @@ impl Factor {
     }
 
     #[getter]
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+    fn column(&self) -> Option<&str> {
+        self.column.as_deref()
     }
 
     #[getter]
-    fn value(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        self.value
+    fn literal(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.literal
             .as_ref()
             .map(|value| scalar_to_python(py, value))
             .transpose()
     }
 
     #[getter]
-    fn transform(&self) -> Option<TransformCall> {
-        self.transform.clone()
+    fn call(&self) -> Option<TransformCall> {
+        self.call.clone()
     }
 }
 
