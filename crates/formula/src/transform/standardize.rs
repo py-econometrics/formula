@@ -54,30 +54,28 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         let input = input.as_materialized_series();
         let values = input.filter(&input.is_finite()?)?;
         let mean = values.mean().ok_or_else(|| {
-            TransformError::NumericalError(format!(
-                "{}: no finite values to compute the mean of",
-                self.name()
-            ))
+            TransformError::NumericalError("no finite values to compute the mean of".into())
         })?;
         if !mean.is_finite() {
-            return Err(TransformError::NumericalError(format!(
-                "{}: the mean must be finite",
-                self.name()
-            )));
+            return Err(TransformError::NumericalError(
+                "the mean must be finite".into(),
+            ));
         }
         let deviation = if self.scale {
             // Constant columns may end up with non-zero deviation due to rounding
             if values.min_reduce()? == values.max_reduce()? {
                 return Err(TransformError::NumericalError(
-                    "scale: the input is constant".into(),
+                    "the input is constant".into(),
                 ));
             }
-            let deviation = values.std(1).unwrap_or(f64::NAN);
-            if !(deviation.is_finite() && deviation > 0.0) {
-                return Err(TransformError::NumericalError(
-                    "scale: the standard deviation must be positive and finite".into(),
-                ));
-            }
+            let deviation = values
+                .std(1)
+                .filter(|deviation| deviation.is_finite() && *deviation > 0.0)
+                .ok_or_else(|| {
+                    TransformError::NumericalError(
+                        "the standard deviation must be positive and finite".into(),
+                    )
+                })?;
             Some(deviation)
         } else {
             None
@@ -95,6 +93,12 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         inputs: &PreparedInput,
     ) -> Result<(), TransformError> {
         let (field, _) = inputs.single()?;
+        if field.name() != state.field.name() {
+            return Err(TransformError::InputNamesMismatch {
+                expected: vec![state.field.name().clone()],
+                actual: vec![field.name().clone()],
+            });
+        }
         if field.dtype() != state.field.dtype() {
             return Err(TransformError::InputTypeMismatch {
                 name: field.name().clone(),
@@ -135,7 +139,7 @@ impl Definition<StandardizeState> for StandardizeDefinition {
 mod tests {
     use super::*;
     use crate::fit::Fitted;
-    use polars::prelude::{Column, DataType};
+    use polars::prelude::{Column, DataType, PlSmallStr};
 
     fn prepare(values: &[f64]) -> PreparedInput {
         PreparedInput::new(&[Column::new("x".into(), values)], false).unwrap()
@@ -274,6 +278,28 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(actual, expected);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prediction_rejects_changed_names_and_dtypes() -> Result<(), TransformError> {
+        for definition in [StandardizeDefinition::CENTER, StandardizeDefinition::SCALE] {
+            let fitted = Fitted::fit(definition, &prepare(&[1.0, 2.0, 3.0]))?;
+            let renamed = PreparedInput::new(&[Column::new("z".into(), [1.0])], false)?;
+            assert!(matches!(
+                fitted.transform(&renamed),
+                Err(TransformError::InputNamesMismatch { expected, actual })
+                    if expected == vec![PlSmallStr::from_static("x")]
+                        && actual == vec![PlSmallStr::from_static("z")]
+            ));
+            let retyped = PreparedInput::new(&[Column::new("x".into(), [1_i64])], false)?;
+            assert!(matches!(
+                fitted.transform(&retyped),
+                Err(TransformError::InputTypeMismatch { name, expected, actual })
+                    if name.as_str() == "x" && expected == DataType::Float64.to_string()
+                        && actual == DataType::Int64.to_string()
+            ));
         }
         Ok(())
     }
