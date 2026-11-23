@@ -1,13 +1,11 @@
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
-use crate::transform::input::{
-    PreparedInput, argument_column_name, finite_values, validate_numeric_field,
-};
+use crate::transform::input::{PreparedInput, argument_column_name, validate_numeric_field};
 use crate::transform::{ParameterValue, TransformDefinition, call_name};
 use crate::{ArgumentCount, TransformError};
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, Field, Float64Chunked, IntoColumn, IntoLazy, PlSmallStr,
-    Scalar, col,
+    AnyValue, Column, DataFrame, DataType, Expr, Field, Float64Chunked, IntoColumn, IntoLazy, NULL,
+    PlSmallStr, Scalar, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -138,7 +136,7 @@ struct RecurrenceStep {
 impl PolynomialBasis {
     fn transform(&self, frame: DataFrame, degree: usize) -> Result<Vec<Column>, TransformError> {
         let name = argument_column_name(0);
-        let argument = finite_values(col(name.clone()).cast(DataType::Float64));
+        let argument = finite_values(col(name.clone()));
 
         match self {
             Self::Raw => {
@@ -224,7 +222,7 @@ impl OrthogonalBasis {
             .frame
             .clone()
             .lazy()
-            .select([finite_values(col(name.clone()).cast(DataType::Float64))])
+            .select([finite_values(col(name.clone()))])
             .drop_nulls(None)
             .collect()?;
 
@@ -382,6 +380,14 @@ impl Definition<PolynomialState> for PolynomialDefinition {
         let frame = DataFrame::new(height, columns)?;
         Ok(MaterializedColumns::new(frame, metadata))
     }
+}
+
+fn finite_values(input: Expr) -> Expr {
+    let input = input.cast(DataType::Float64);
+
+    when(input.clone().is_finite())
+        .then(input)
+        .otherwise(lit(NULL))
 }
 
 // Use four partial sums so the CPU can overlap additions.

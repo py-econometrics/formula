@@ -1,11 +1,11 @@
 //! `center(x)` and `scale(x)`, which learn the mean (and standard deviation)
 //! of `x` when fitting and reuse them when transforming new data.
 
-use super::input::{PreparedInput, finite_values, validate_numeric_field};
+use super::input::{PreparedInput, validate_numeric_field};
 use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
-use polars::prelude::{Field, IntoLazy, col, lit};
+use polars::prelude::{Field, IntoLazy, NULL, col, lit, when};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StandardizeDefinition {
@@ -51,15 +51,8 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         let (field, input) = inputs.single()?;
         validate_numeric_field(field)?;
         // Skip non-finite values
-        let values = inputs
-            .frame
-            .clone()
-            .lazy()
-            .select([finite_values(col(input.name().clone()))])
-            .collect()?
-            .columns()[0]
-            .as_materialized_series()
-            .clone();
+        let input = input.as_materialized_series();
+        let values = input.filter(&input.is_finite()?)?;
         let mean = values.mean().ok_or_else(|| {
             TransformError::NumericalError(format!(
                 "{}: no finite values to compute the mean of",
@@ -119,7 +112,12 @@ impl Definition<StandardizeState> for StandardizeDefinition {
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
         let name = call_name(self.name(), [field.name().as_str()]);
-        let centered = finite_values(col(input.name().clone())) - lit(state.mean);
+        // Non-finite values become missing
+        let column = col(input.name().clone());
+        let finite = when(column.clone().is_finite())
+            .then(column)
+            .otherwise(lit(NULL));
+        let centered = finite - lit(state.mean);
         let expression = match state.deviation {
             Some(deviation) => centered / lit(deviation),
             None => centered,
