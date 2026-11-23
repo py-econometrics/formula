@@ -105,9 +105,8 @@ pub(super) enum ExpressionAst<L: Layer> {
     Interact(<L::Operators as Operations>::Interaction, Binary<Self>),
     InteractFully(<L::Operators as Operations>::FullInteraction, Binary<Self>),
     Nesting(<L::Operators as Operations>::Nesting, Binary<Self>),
-    /// `(a + b)^n`: the full interaction of `n` copies, so every interaction of
-    /// up to `n` distinct factors. Permitted wherever `*` is.
     Power(
+        // Support wherever full interaction is supported
         <L::Operators as Operations>::FullInteraction,
         Box<Self>,
         u32,
