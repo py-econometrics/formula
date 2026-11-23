@@ -4,8 +4,8 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, GroupedTransform, IntegerEncodingDefinition, IntegerEncodingState,
-    ParameterValue, Transform, TransformError, validate_numeric_field,
+    ArgumentCount, CategoricalDefinition, GroupedTransform, IntegerEncodingDefinition,
+    IntegerEncodingState, ParameterValue, Transform, TransformError, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -253,6 +253,27 @@ impl Factor {
         }
     }
 
+    /// Encodes a bare variable with a non-numeric column in `data` as `C(variable)`.
+    fn lower(factor: &Arc<Self>, data: &DataFrame) -> Result<Arc<Self>, TransformError> {
+        let FactorKind::Variable(variable) = &factor.kind else {
+            return Ok(Arc::clone(factor));
+        };
+        let column = data.column(variable.definition().name())?;
+        if !matches!(
+            column.dtype(),
+            DataType::String | DataType::Categorical(..) | DataType::Enum(..) | DataType::Boolean
+        ) {
+            return Ok(Arc::clone(factor));
+        }
+
+        Ok(Arc::new(Self {
+            kind: FactorKind::Call {
+                transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+                arguments: vec![Arc::clone(factor)],
+            },
+        }))
+    }
+
     fn render(&self) -> String {
         match &self.kind {
             FactorKind::Variable(variable) => render_column_name(&variable.definition().name),
@@ -430,6 +451,13 @@ impl Term {
         Ok(())
     }
 
+    fn lower(&self, data: &DataFrame) -> Result<Self, TransformError> {
+        self.factors
+            .iter()
+            .map(|factor| Factor::lower(factor, data))
+            .collect()
+    }
+
     fn assemble_columns(
         &self,
         height: usize,
@@ -596,6 +624,22 @@ impl Expression {
         Ok(())
     }
 
+    /// A bare non-numeric column `x` is lowered into `C(x)` if its dtype is compatible
+    fn lower(&self, data: &DataFrame) -> Result<Self, TransformError> {
+        let terms = self
+            .terms
+            .iter()
+            .map(|term| term.lower(data))
+            .collect::<Result<Vec<_>, _>>()?;
+        let children = self
+            .children
+            .iter()
+            .map(|child| child.lower(data))
+            .collect::<Result<_, _>>()?;
+
+        Ok(Self::new(terms, children))
+    }
+
     pub(crate) fn assemble(
         &self,
         height: usize,
@@ -684,6 +728,16 @@ impl Formula {
         self.expressions
             .iter()
             .try_for_each(|(_, expression)| expression.validate())
+    }
+
+    fn lower(&self, data: &DataFrame) -> Result<Self, TransformError> {
+        let expressions = self
+            .expressions
+            .iter()
+            .map(|(&role, expression)| Ok((role, expression.lower(data)?)))
+            .collect::<Result<_, TransformError>>()?;
+
+        Ok(Self { expressions })
     }
 
     fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<FittedFormula, ModelError> {
@@ -783,8 +837,13 @@ impl Formulas {
         for formula in &self.formulas {
             formula.validate()?;
         }
-        let expressions = self
+        // Lower bare non-numeric columns to categoricals
+        let lowered = self
             .formulas
+            .iter()
+            .map(|formula| formula.lower(data))
+            .collect::<Result<Vec<_>, _>>()?;
+        let expressions = lowered
             .iter()
             .flat_map(Formula::all_expressions)
             .collect::<Vec<_>>();
@@ -792,8 +851,7 @@ impl Formulas {
         // Fit factors and assemble terms once across every formula
         let terms = fit_and_transform_terms(&expressions, data)?;
 
-        let entries = self
-            .formulas
+        let entries = lowered
             .iter()
             .map(|formula| formula.assemble(data.height(), &terms))
             .collect::<Result<Vec<_>, ModelError>>()?;
@@ -2167,25 +2225,75 @@ mod tests {
     }
 
     #[test]
+    fn bare_nonnumeric_columns_encode_as_categoricals() {
+        use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+
+        let group = Column::new("group".into(), ["b", "a", "b"]);
+        let categorical = DataType::from_categories(Categories::random(
+            "formula-tests".into(),
+            CategoricalPhysical::U32,
+        ));
+        let enumeration =
+            DataType::from_frozen_categories(FrozenCategories::new(["a", "b"]).unwrap());
+
+        for group in [
+            group.clone(),
+            group.cast(&categorical).unwrap(),
+            group.cast(&enumeration).unwrap(),
+            Column::new("group".into(), [true, false, true]),
+        ] {
+            let data = DataFrame::new(
+                3,
+                vec![
+                    Column::new("y".into(), [1.0, 2.0, 3.0]),
+                    Column::new("x".into(), [2.0, 3.0, 4.0]),
+                    group,
+                ],
+            )
+            .unwrap();
+
+            for (bare, explicit) in [
+                // Bare and explicit spellings are one term
+                (
+                    "y ~ group + C(group) + group:x",
+                    "y ~ C(group) + C(group):x",
+                ),
+                ("group ~ x", "C(group) ~ x"),
+                ("y ~ group + [x ~ group]", "y ~ C(group) + [x ~ C(group)]"),
+            ] {
+                let model = fit(bare, &data);
+                let explicit = fit(explicit, &data);
+                let transformed = model.transform(&data).unwrap();
+                let frame = model.frame().unwrap();
+
+                // Fitted formulas spell out the encoding
+                assert_eq!(model.formula(), explicit.formula(), "{bare}");
+                assert_eq!(transformed.formula(), explicit.formula(), "{bare}");
+                assert!(frame.equals_missing(&explicit.frame().unwrap()), "{bare}");
+                assert!(
+                    frame.equals_missing(&transformed.frame().unwrap()),
+                    "{bare}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn bare_nonnumeric_columns_are_rejected_before_interaction_casting() {
+        // Binary columns are not encoded as categoricals
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "x" => [2.0, 3.0, 4.0],
-            "group" => ["a", "b", "a"],
-            "numeric_text" => ["2", "3", "2"],
-            "flag" => [true, false, true],
+            "bytes" => [&b"a"[..], &b"b"[..], &b"a"[..]],
         )
         .unwrap();
 
         for (source, column) in [
-            ("y ~ group", "group"),
-            ("group ~ x", "group"),
-            ("y ~ numeric_text:x", "numeric_text"),
-            ("y ~ x:numeric_text", "numeric_text"),
-            ("y ~ flag", "flag"),
-            ("flag ~ x", "flag"),
-            ("y ~ flag:x", "flag"),
-            ("y ~ x:flag", "flag"),
+            ("y ~ bytes", "bytes"),
+            ("bytes ~ x", "bytes"),
+            ("y ~ bytes:x", "bytes"),
+            ("y ~ x:bytes", "bytes"),
+            ("y ~ x + [bytes ~ x]", "bytes"),
         ] {
             let specification = crate::parse(source).unwrap();
             let Err(ModelError::Transform(TransformError::NonNumericInput { name, actual })) =
