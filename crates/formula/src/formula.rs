@@ -2299,7 +2299,7 @@ mod tests {
         let training = polars::df!(
             "y" => [1.0, 2.0, 3.0],
             "group" => ["a", "b", "a"],
-            "flag" => [true, false, true],
+            "flag" => [false, true, false],
         )
         .unwrap();
         let input = polars::df!(
