@@ -195,21 +195,21 @@ impl From<&str> for Factor {
 }
 
 impl Factor {
-    pub fn name(&self) -> Option<&str> {
+    pub fn column(&self) -> Option<&str> {
         match &self.kind {
             FactorKind::Variable(variable) => Some(variable.definition().name()),
             _ => None,
         }
     }
 
-    pub fn value(&self) -> Option<&Scalar> {
+    pub fn literal(&self) -> Option<&Scalar> {
         match &self.kind {
             FactorKind::Literal(value) => Some(value),
             _ => None,
         }
     }
 
-    pub fn transform(&self) -> Option<TransformCall<'_>> {
+    pub fn call(&self) -> Option<TransformCall<'_>> {
         match &self.kind {
             FactorKind::Call {
                 transform,
@@ -985,8 +985,8 @@ impl FittedTerm {
     pub fn as_fixed_effect(&self) -> Option<FittedFixedEffect> {
         let effect = self.term.as_fixed_effect()?;
 
-        let grouped = self.term.as_factor()?.transform()?;
-        let encoder = grouped.inputs().next()?.transform()?;
+        let grouped = self.term.as_factor()?.call()?;
+        let encoder = grouped.inputs().next()?.call()?;
         // Get specialized IntegerEncodingState instead of generic TransformState
         let Transform::F(integer) = encoder.transform else {
             return None;

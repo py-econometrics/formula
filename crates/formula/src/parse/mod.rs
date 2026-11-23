@@ -779,7 +779,7 @@ impl TryFrom<TransformCall> for Factor {
                     // No positional argument
                     [_] => None,
                     // A single positional literal can be interpreted as degree
-                    [_, second] if second.value().is_some() => second.value().cloned(),
+                    [_, second] if second.literal().is_some() => second.literal().cloned(),
                     // All other cases (e.g., positional non-literal arguments) are not supported
                     _ => {
                         return Err(TransformCallError::InvalidParameter {
@@ -988,7 +988,7 @@ mod tests {
                     panic!("expected varying slopes for {source}");
                 };
                 assert!(slopes.rest.is_empty());
-                let actual = slopes.first.value().expect("expected a numeric literal");
+                let actual = slopes.first.literal().expect("expected a numeric literal");
                 assert_eq!(actual.dtype(), value.dtype(), "{source}");
                 assert_eq!(actual, &value, "{source}");
                 assert_eq!(slopes.intercept, intercept, "{source}");

@@ -582,8 +582,8 @@ mod tests {
                 assert!(codes.equals_missing(&expected_codes));
                 assert!(levels.equals_missing(&training.select(["firm", "year"]).unwrap()));
 
-                let grouped = term.factors().next().unwrap().transform().unwrap();
-                let encoder = grouped.inputs().next().unwrap().transform().unwrap();
+                let grouped = term.factors().next().unwrap().call().unwrap();
+                let encoder = grouped.inputs().next().unwrap().call().unwrap();
                 let exported = encoder.state().unwrap();
                 let Some(crate::StateValue::DataFrame(exported_codes)) = exported.get("codes")
                 else {
@@ -743,28 +743,24 @@ mod tests {
                 let contributions = column.contributions().collect::<Vec<_>>();
                 assert_eq!(contributions.len(), 2);
                 let (categorical, key) = contributions[0];
-                assert!(categorical.name().is_none());
-                assert_eq!(categorical.transform().unwrap().name(), "C");
+                assert!(categorical.column().is_none());
+                assert_eq!(categorical.call().unwrap().name(), "C");
                 assert_eq!(
                     key,
                     &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level)))
                 );
                 assert_eq!(
-                    categorical.transform().unwrap().parameters()["omit"],
+                    categorical.call().unwrap().parameters()["omit"],
                     ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
                 );
-                let inputs = categorical
-                    .transform()
-                    .unwrap()
-                    .inputs()
-                    .collect::<Vec<_>>();
+                let inputs = categorical.call().unwrap().inputs().collect::<Vec<_>>();
                 assert_eq!(inputs.len(), 1);
-                assert_eq!(inputs[0].name(), Some("g"));
+                assert_eq!(inputs[0].column(), Some("g"));
 
                 let (variable, key) = contributions[1];
-                assert_eq!(variable.name(), Some("x"));
+                assert_eq!(variable.column(), Some("x"));
                 assert_eq!(key, &ComponentKey::None);
-                assert!(variable.transform().is_none());
+                assert!(variable.call().is_none());
                 assert_eq!(
                     column.term().factors().collect::<Vec<_>>(),
                     vec![categorical, variable],
@@ -795,12 +791,12 @@ mod tests {
             ]) {
                 let contributions = column.contributions().collect::<Vec<_>>();
                 assert_eq!(contributions.len(), 2);
-                assert_eq!(contributions[0].0.transform().unwrap().name(), "C");
+                assert_eq!(contributions[0].0.call().unwrap().name(), "C");
                 assert_eq!(
                     contributions[0].1,
                     &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level))),
                 );
-                assert_eq!(contributions[1].0.transform().unwrap().name(), "poly");
+                assert_eq!(contributions[1].0.call().unwrap().name(), "poly");
                 assert_eq!(
                     contributions[1].1,
                     &ComponentKey::Scalar(Scalar::from(basis))
@@ -837,19 +833,19 @@ mod tests {
                 };
                 let factors = term.factors().collect::<Vec<_>>();
                 assert_eq!(factors.len(), 2);
-                assert_eq!(factors[0].transform().unwrap().name(), "C");
-                assert_eq!(factors[1].name(), Some("x"));
+                assert_eq!(factors[0].call().unwrap().name(), "C");
+                assert_eq!(factors[1].column(), Some("x"));
                 let columns = term.columns().collect::<Vec<_>>();
                 assert_eq!(columns.len(), 2);
                 for (column, level) in columns.iter().zip(["b", "c"]) {
                     let contributions = column.contributions().collect::<Vec<_>>();
                     assert_eq!(contributions.len(), 2);
-                    assert_eq!(contributions[0].0.transform().unwrap().name(), "C");
+                    assert_eq!(contributions[0].0.call().unwrap().name(), "C");
                     assert_eq!(
                         contributions[0].1,
                         &ComponentKey::Scalar(Scalar::from(PlSmallStr::from(level))),
                     );
-                    assert_eq!(contributions[1].0.name(), Some("x"));
+                    assert_eq!(contributions[1].0.column(), Some("x"));
                     assert_eq!(contributions[1].1, &ComponentKey::None);
                 }
             }
@@ -881,10 +877,10 @@ mod tests {
                 let contributions = column.contributions().collect::<Vec<_>>();
                 assert_eq!(contributions.len(), 1);
                 let (polynomial, key) = contributions[0];
-                assert!(polynomial.name().is_none());
-                assert_eq!(polynomial.transform().unwrap().name(), "poly");
+                assert!(polynomial.column().is_none());
+                assert_eq!(polynomial.call().unwrap().name(), "poly");
                 assert_eq!(key, &ComponentKey::Scalar(Scalar::from(basis)));
-                let parameters = polynomial.transform().unwrap().parameters();
+                let parameters = polynomial.call().unwrap().parameters();
                 assert_eq!(parameters.len(), 2);
                 assert_eq!(
                     parameters["degree"],
@@ -895,16 +891,16 @@ mod tests {
                     ParameterValue::Scalar(Scalar::from(true))
                 );
 
-                let inputs = polynomial.transform().unwrap().inputs().collect::<Vec<_>>();
+                let inputs = polynomial.call().unwrap().inputs().collect::<Vec<_>>();
                 assert_eq!(inputs.len(), 1);
                 let logarithm = inputs[0];
-                assert!(logarithm.name().is_none());
-                assert_eq!(logarithm.transform().unwrap().name(), "log");
-                assert!(logarithm.transform().unwrap().parameters().is_empty());
-                let inputs = logarithm.transform().unwrap().inputs().collect::<Vec<_>>();
+                assert!(logarithm.column().is_none());
+                assert_eq!(logarithm.call().unwrap().name(), "log");
+                assert!(logarithm.call().unwrap().parameters().is_empty());
+                let inputs = logarithm.call().unwrap().inputs().collect::<Vec<_>>();
                 assert_eq!(inputs.len(), 1);
-                assert_eq!(inputs[0].name(), Some("x"));
-                assert!(inputs[0].transform().is_none());
+                assert_eq!(inputs[0].column(), Some("x"));
+                assert!(inputs[0].call().is_none());
 
                 for (actual, expected) in column.data().f64().unwrap().iter().zip([0.0, 1.0]) {
                     assert!((actual.unwrap() - expected).abs() < 1e-12);
@@ -924,20 +920,20 @@ mod tests {
                 let contributions = column.contributions().collect::<Vec<_>>();
                 assert_eq!(contributions.len(), 1);
                 let (factor, key) = contributions[0];
-                assert!(factor.name().is_none());
-                assert!(factor.value().is_none());
+                assert!(factor.column().is_none());
+                assert!(factor.literal().is_none());
                 assert_eq!(key, &ComponentKey::None);
-                let call = factor.transform().unwrap();
+                let call = factor.call().unwrap();
                 assert_eq!(call.name(), "add");
                 assert!(call.parameters().is_empty());
                 let inputs = call.inputs().collect::<Vec<_>>();
                 assert_eq!(inputs.len(), 2);
-                assert_eq!(inputs[0].name(), Some("x"));
-                assert!(inputs[0].value().is_none());
-                assert!(inputs[0].transform().is_none());
-                assert!(inputs[1].name().is_none());
-                assert_eq!(inputs[1].value(), Some(&expected));
-                assert!(inputs[1].transform().is_none());
+                assert_eq!(inputs[0].column(), Some("x"));
+                assert!(inputs[0].literal().is_none());
+                assert!(inputs[0].call().is_none());
+                assert!(inputs[1].column().is_none());
+                assert_eq!(inputs[1].literal(), Some(&expected));
+                assert!(inputs[1].call().is_none());
             }
         }
 
@@ -952,7 +948,7 @@ mod tests {
             assert_eq!(terms[1].columns().count(), 0);
             let factors = terms[1].factors().collect::<Vec<_>>();
             assert_eq!(factors.len(), 1);
-            assert_eq!(factors[0].transform().unwrap().name(), "C");
+            assert_eq!(factors[0].call().unwrap().name(), "C");
 
             let columns = fitted
                 .columns(Role::Independent)
@@ -1041,7 +1037,7 @@ mod tests {
                         .iter()
                         .map(|term| term
                             .factors()
-                            .map(|factor| factor.name().unwrap())
+                            .map(|factor| factor.column().unwrap())
                             .collect::<Vec<_>>())
                         .collect::<Vec<_>>(),
                     vec![vec!["z"], vec!["z", "x"], vec!["x"]],
