@@ -205,6 +205,9 @@ mod tests {
             (&[1.0, f64::INFINITY][..], "constant"),
             (&[f64::MAX, f64::MAX][..], "mean"),
             (&[f64::NAN, f64::INFINITY][..], "no finite values"),
+            // Distinct values whose variance overflows or underflows.
+            (&[-f64::MAX, f64::MAX][..], "standard deviation"),
+            (&[1e-200, 2e-200][..], "standard deviation"),
         ] {
             assert!(
                 matches!(
