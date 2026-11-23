@@ -387,7 +387,7 @@ fn finite_values(input: Expr) -> Expr {
 
     when(input.clone().is_finite())
         .then(input)
-        .otherwise(lit(NULL).cast(DataType::Float64))
+        .otherwise(lit(NULL))
 }
 
 // Use four partial sums so the CPU can overlap additions.

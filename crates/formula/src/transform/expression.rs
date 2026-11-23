@@ -130,6 +130,13 @@ impl ExpressionTransform {
         },
     };
 
+    pub(crate) const POW: Self = Self {
+        name: "pow",
+        argument_count: ArgumentCount::Exactly(2),
+        input_policy: InputPolicy::NumericFloat64,
+        build: |inputs| Ok(inputs[0].clone().pow(inputs[1].clone())),
+    };
+
     fn output_name(&self, inputs: &PreparedInput) -> PlSmallStr {
         call_name(
             self.name,
@@ -325,6 +332,19 @@ mod tests {
             "sqrt(x)",
             &[Some(3.0), Some(1.0), Some(2.0), None, Some(f64::NAN)],
         );
+    }
+
+    #[test]
+    fn pow_raises_to_scalar_and_column_powers() {
+        let data = polars::df!("x" => [2_i32, 3], "k" => [3.0, 0.5]).unwrap();
+        for (source, expected) in [
+            ("pow(x, 2)", [Some(4.0), Some(9.0)]),
+            ("pow(x, k)", [Some(8.0), Some(3.0_f64.sqrt())]),
+        ] {
+            let output = fit(source, &data);
+            let frame = output.expression(crate::Role::Independent).unwrap().frame();
+            assert_numeric_output(frame, source, &expected);
+        }
     }
 
     #[test]

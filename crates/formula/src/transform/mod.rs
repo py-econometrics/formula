@@ -4,6 +4,7 @@ mod grouped;
 mod input;
 mod integer;
 mod polynomial;
+mod standardize;
 pub mod state;
 
 pub(crate) use categorical::CategoricalDefinition;
@@ -14,6 +15,8 @@ use input::PreparedInput;
 pub(crate) use input::validate_numeric_field;
 pub(crate) use integer::IntegerEncodingDefinition;
 pub(crate) use polynomial::PolynomialDefinition;
+pub(crate) use standardize::StandardizeDefinition;
+use standardize::StandardizeState;
 pub use state::{StateValue, TransformState};
 use std::collections::BTreeMap;
 
@@ -42,6 +45,7 @@ pub(crate) enum Transform {
     Expression(ExpressionTransform),
     C(Fit<CategoricalDefinition, CategoricalState>),
     Poly(Fit<PolynomialDefinition, PolynomialState>),
+    Standardize(Fit<StandardizeDefinition, StandardizeState>),
     F(Fit<IntegerEncodingDefinition, IntegerEncodingState>),
     G(GroupedTransform),
 }
@@ -72,6 +76,7 @@ impl Transform {
             Self::Expression(expression) => expression,
             Self::C(categorical) => categorical.definition(),
             Self::Poly(polynomial) => polynomial.definition(),
+            Self::Standardize(standardize) => standardize.definition(),
             Self::F(integer) => integer.definition(),
             Self::G(grouped) => grouped,
         }
@@ -113,6 +118,10 @@ impl Transform {
                 let inputs = self.input(inputs)?;
                 Ok(Self::Poly(polynomial.fit(&inputs)?))
             }
+            Self::Standardize(standardize) => {
+                let inputs = self.input(inputs)?;
+                Ok(Self::Standardize(standardize.fit(&inputs)?))
+            }
             Self::F(integer) => {
                 let inputs = self.input(inputs)?;
                 Ok(Self::F(integer.fit(&inputs)?))
@@ -137,6 +146,7 @@ impl Transform {
             }
             Self::C(categorical) => categorical.transform(&inputs),
             Self::Poly(polynomial) => polynomial.transform(&inputs),
+            Self::Standardize(standardize) => standardize.transform(&inputs),
             Self::F(integer) => integer.transform(&inputs),
             Self::G(grouped) => grouped.transform(&inputs).map_err(FitError::Transform),
         }
@@ -146,6 +156,9 @@ impl Transform {
         match self {
             Self::C(categorical) => categorical.state().map(|_| TransformState::default()),
             Self::Poly(polynomial) => polynomial.state().map(|_| TransformState::default()),
+            Self::Standardize(standardize) => {
+                standardize.state().map(|_| TransformState::default())
+            }
             Self::F(integer) => integer.state().map(ExportState::export_state),
 
             Self::Expression(_) => Some(TransformState::default()),
