@@ -5,8 +5,8 @@ use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar, col,
-    lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar,
+    SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -177,7 +177,8 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 
     fn fit(&self, inputs: &PreparedInput) -> Result<CategoricalState, TransformError> {
         let (_, input) = inputs.single()?;
-        let levels = input.drop_nulls().unique_stable()?;
+        // Sort levels: numbers by value, strings and categoricals by label, enums by category
+        let levels = input.drop_nulls().unique()?.sort(SortOptions::default())?;
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
             levels.filter(&levels.is_finite()?)?
@@ -316,14 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn native_levels_preserve_observed_order_and_label_names() -> Result<(), TransformError> {
+    fn native_levels_keep_label_names() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = [Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?];
+            let training = [Column::new("x".into(), ["b", "d", "b"]).cast(&dtype)?];
             let prepared_training = prepare(&training);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared_training)?;
             let output = fitted.transform(&prepared_training)?;
 
-            assert_eq!(output.frame().get_column_names(), ["C(x)[d]", "C(x)[b]"]);
+            assert_eq!(output.frame().get_column_names(), ["C(x)[b]", "C(x)[d]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
@@ -339,9 +340,51 @@ mod tests {
     }
 
     #[test]
+    fn levels_sort_by_value_label_or_enum_category_order() -> Result<(), TransformError> {
+        // Dictionary order differs from label order
+        let categorical = DataType::from_categories(Categories::random(
+            "formula-tests".into(),
+            CategoricalPhysical::U32,
+        ));
+        for label in ["c", "b", "a"] {
+            categorical
+                .cat_mapping()
+                .unwrap()
+                .insert_cat(label)
+                .unwrap();
+        }
+        let enumeration =
+            DataType::from_frozen_categories(FrozenCategories::new(["c", "a", "b"]).unwrap());
+        let labels = Column::new("x".into(), ["b", "a", "c", "a"]);
+
+        for (input, expected) in [
+            (
+                Column::new("x".into(), [10_i64, 9, 2, 9]),
+                ["C(x)[2]", "C(x)[9]", "C(x)[10]"],
+            ),
+            (
+                labels.cast(&categorical)?,
+                ["C(x)[a]", "C(x)[b]", "C(x)[c]"],
+            ),
+            (
+                labels.cast(&enumeration)?,
+                ["C(x)[c]", "C(x)[a]", "C(x)[b]"],
+            ),
+        ] {
+            let prepared = prepare(&[input]);
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared)?;
+            assert_eq!(
+                fitted.transform(&prepared)?.frame().get_column_names(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_unknown_levels_and_nulls_produce_null_indicators() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
-            let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
+            let training = prepare(&[Column::new("x".into(), ["b", "d"]).cast(&dtype)?]);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
             let input = [Column::new(
                 "x".into(),
@@ -355,8 +398,8 @@ mod tests {
                 &input,
                 fitted.transform(&prepared_input)?.frame(),
                 &[
-                    &[Some(false), None, None, Some(true), None],
                     &[Some(true), None, None, Some(false), None],
+                    &[Some(false), None, None, Some(true), None],
                 ],
             );
         }
@@ -431,7 +474,7 @@ mod tests {
     #[test]
     fn categorical_dictionary_growth_preserves_fitted_schema() -> Result<(), TransformError> {
         let dtype = native_dtypes().remove(0);
-        let training = prepare(&[Column::new("x".into(), ["d", "b"]).cast(&dtype)?]);
+        let training = prepare(&[Column::new("x".into(), ["b", "d"]).cast(&dtype)?]);
         let fitted = Fitted::fit(CategoricalDefinition::new(None), &training)?;
         let original = fitted.transform(&training)?;
         let input = [Column::new("x".into(), ["new", "b", "a"]).cast(&dtype)?];
@@ -448,7 +491,7 @@ mod tests {
                 &fitted.state,
                 &input,
                 output.frame(),
-                &[&[None, Some(false), None], &[None, Some(true), None]],
+                &[&[None, Some(true), None], &[None, Some(false), None]],
             );
             assert!(
                 fitted
@@ -574,12 +617,12 @@ mod tests {
         let input = Column::new(
             "group".into(),
             [
-                Some(2.0_f64),
+                Some(1.0_f64),
                 Some(f64::NAN),
                 Some(f64::INFINITY),
-                Some(1.0),
-                Some(f64::NEG_INFINITY),
                 Some(2.0),
+                Some(f64::NEG_INFINITY),
+                Some(1.0),
                 None,
             ],
         );
@@ -591,7 +634,7 @@ mod tests {
             let levels = state.levels.cast(&DataType::Float64)?;
             assert_eq!(
                 levels.f64()?.iter().collect::<Vec<_>>(),
-                vec![Some(2.0), Some(1.0)]
+                vec![Some(1.0), Some(2.0)]
             );
             assert_eq!(state.levels.dtype(), &dtype);
             assert_output(
@@ -756,9 +799,9 @@ mod tests {
     #[test]
     fn categorical_preserves_fitted_order_and_schema() -> Result<(), TransformError> {
         // Exercise small sets and both sides of the eight-level lookup boundary.
-        let levels = ["b", "a", "c", "d", "e", "f", "g", "h", "i"];
+        let levels = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
         for count in [3, 8, 9] {
-            let mut values = vec![Some("b"), Some("a"), Some("b"), None];
+            let mut values = vec![Some("a"), Some("b"), Some("a"), None];
             values.extend(levels[2..count].iter().copied().map(Some));
             let training = prepare(&[Column::new("group".into(), values)]);
             // Prediction omits fitted levels, but their columns must remain.
@@ -771,8 +814,8 @@ mod tests {
             let fitted = Fitted::fit(definition, &training)?;
             let output = fitted.transform(&prepared_input)?;
             let mut expected = vec![
-                [Some(false), Some(true), None, None],
                 [Some(true), Some(false), None, None],
+                [Some(false), Some(true), None, None],
             ];
             expected.extend((2..count).map(|_| [Some(false), Some(false), None, None]));
             let expected = expected
