@@ -705,6 +705,11 @@ impl Expression {
         let interactions = self.interact(&other);
         self.add(other).add(interactions)
     }
+    pub(crate) fn power(self, exponent: u32) -> Self {
+        // Formula interactions are idempotent, so cap exponent at number of terms
+        let exponent = (exponent as usize).min(self.terms.len());
+        (1..exponent).fold(self.clone(), |power, _| power.interact_fully(self.clone()))
+    }
 
     pub(crate) fn nest(self, other: Self) -> Self {
         let factors = self

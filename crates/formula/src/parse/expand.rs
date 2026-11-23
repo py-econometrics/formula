@@ -245,6 +245,12 @@ where
                 |left, right| left.nest(right),
             ),
 
+            Self::Power(_, base, exponent) => base
+                .expand()
+                .into_iter()
+                .map(|base| base.power(*exponent))
+                .collect(),
+
             Self::Parenthesized(expression) => expression.expand(),
 
             Self::Stepwise(_, operator, first, rest) => {
