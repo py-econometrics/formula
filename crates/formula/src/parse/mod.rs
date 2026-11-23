@@ -774,20 +774,38 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
             }
             "poly" => {
-                let mut degree = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
-                // `poly(x, 2)`: a literal second argument is the degree, as in R.
-                if let [_, second] = arguments.as_slice()
-                    && let Some(value) = second.value()
-                {
-                    if degree.is_some() {
+                let keyword = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
+                let positional = match arguments.as_slice() {
+                    // No positional argument
+                    [_] => None,
+                    // A single positional literal can be interpreted as degree
+                    [_, second] if second.value().is_some() => second.value().cloned(),
+                    // All other cases (e.g., positional non-literal arguments) are not supported
+                    _ => {
+                        return Err(TransformCallError::InvalidParameter {
+                            transform: "poly",
+                            message: "expected one input and an optional positive integer degree"
+                                .into(),
+                        });
+                    }
+                };
+                let degree = match (positional, keyword) {
+                    // Cannot specify degree both positionally and as keyword
+                    (Some(_), Some(_)) => {
                         return Err(TransformCallError::InvalidParameter {
                             transform: "poly",
                             message: "the degree is given both by position and as `degree`".into(),
                         });
                     }
-                    degree = Some(ParameterValue::Scalar(value.clone()));
-                    arguments.pop();
-                }
+                    // Degree is specified positionally
+                    (Some(value), None) => {
+                        arguments.pop();
+                        Some(ParameterValue::Scalar(value))
+                    }
+                    // Degree is specified as keyword
+                    (None, keyword) => keyword,
+                };
+
                 let raw = keywords.remove(PolynomialDefinition::RAW_PARAMETER);
                 reject_keywords("poly", keywords)?;
 
@@ -871,7 +889,10 @@ mod tests {
                 "both by position and as `degree`",
             ),
             ("y ~ poly(x, 2.5)", "`degree` must be a positive integer"),
-            ("y ~ poly(x, z)", "expected exactly 1"),
+            (
+                "y ~ poly(x, z)",
+                "expected one input and an optional positive integer degree",
+            ),
         ] {
             let error = match parse(source) {
                 Err(error) => error.to_string(),

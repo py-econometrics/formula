@@ -2543,10 +2543,6 @@ mod tests {
                 "y ~ C(x, x, omit='a')",
                 "C(x, x, omit='a'): invalid argument count: expected exactly 1, received 2",
             ),
-            (
-                "y ~ poly(x, z)",
-                "poly(x, z, degree=1, raw=false): invalid argument count: expected exactly 1, received 2",
-            ),
         ] {
             let error = crate::parse(source).unwrap().fit(&data).err().unwrap();
             assert!(matches!(
