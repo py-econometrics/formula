@@ -1374,7 +1374,8 @@ mod tests {
     use crate::fit::Fit;
     use crate::parse::parse_expression;
     use crate::transform::{
-        CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, PolynomialDefinition,
+        CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, LevelSelection,
+        PolynomialDefinition,
     };
     use polars::prelude::Scalar;
     use winnow::Parser;
@@ -1742,6 +1743,7 @@ mod tests {
             "add(x, 2)",
             "add(x, 2.0)",
             "C(`group name`, omit='a')",
+            "C(`group name`, keep=['a', 'b'])",
         ] {
             let original = parse_expression.parse(source).unwrap();
             let label = original[0].terms[0].factors[0].render();
@@ -1761,6 +1763,7 @@ mod tests {
             "y ~ x - 1 + 1",
             "y ~ x - 1 + 1 + z",
             "y ~ C(`group name`, omit='a') + poly(x, degree=2)",
+            "y ~ C(g, keep='a') + C(h, keep=[1, 2])",
             "`outcome value` ~ log(`1`) + add(x, 2.0)",
             "y ~ x | firm:year",
             "y ~ sw(x, z) | `firm name`",
@@ -3471,7 +3474,7 @@ mod tests {
 
         assert_requires_one_argument(|| {
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                ParameterValue::Scalar(Scalar::from(1_i64)),
+                LevelSelection::Omit(ParameterValue::Scalar(Scalar::from(1_i64))),
             ))))
         });
     }

@@ -8,8 +8,8 @@ use crate::formula::{Factor, Formula, Formulas, push_unique};
 use crate::parse::ast::{Compose, StepwiseOperator};
 use crate::parse::expand::Expand;
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, ParameterValue, PolynomialDefinition,
-    StandardizeDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, LevelSelection, ParameterValue,
+    PolynomialDefinition, StandardizeDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -789,9 +789,21 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::Standardize(Fit::Unfitted(StandardizeDefinition::SCALE))
             }
             "C" => {
-                let reference = keywords.remove(CategoricalDefinition::OMIT_PARAMETER);
+                let omit = keywords.remove(CategoricalDefinition::OMIT_PARAMETER);
+                let keep = keywords.remove(CategoricalDefinition::KEEP_PARAMETER);
                 reject_keywords("C", keywords)?;
-                Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)))
+                let selection = match (omit, keep) {
+                    // `omit` and `keep` are mutually exclusive
+                    (Some(_), Some(_)) => {
+                        return Err(TransformCallError::InvalidParameter {
+                            transform: "C",
+                            message: "`omit` and `keep` are mutually exclusive".into(),
+                        });
+                    }
+                    (omit, None) => omit.map(LevelSelection::Omit),
+                    (None, keep) => keep.map(LevelSelection::Keep),
+                };
+                Transform::C(Fit::Unfitted(CategoricalDefinition::new(selection)))
             }
             "poly" => {
                 let keyword = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
@@ -960,6 +972,20 @@ mod tests {
                     .to_string(),
             };
             assert!(error.contains(message), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn categorical_omit_and_keep_are_mutually_exclusive() {
+        for source in [
+            "y ~ C(x, omit='a', keep=['b'])",
+            "y ~ C(x, keep=['b'], omit='a')",
+        ] {
+            let error = parse(source).unwrap_err().to_string();
+            assert!(
+                error.contains("`omit` and `keep` are mutually exclusive"),
+                "{source}: {error}"
+            );
         }
     }
 
@@ -1757,7 +1783,9 @@ mod tests {
         );
         let categorical = call(
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
+                LevelSelection::Omit(ParameterValue::Scalar(Scalar::from(
+                    PlSmallStr::from_static("a"),
+                ))),
             )))),
             vec![Factor::from("group name")],
         );
@@ -2080,8 +2108,11 @@ mod tests {
 
     #[test]
     fn transforms_preserve_arguments_order_and_allowed_whitespace() {
-        let categorical =
-            |reference| Transform::C(Fit::Unfitted(CategoricalDefinition::new(reference)));
+        let categorical = |reference: Option<ParameterValue>| {
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+                reference.map(LevelSelection::Omit),
+            )))
+        };
         let cases = [
             (
                 "log(x)",

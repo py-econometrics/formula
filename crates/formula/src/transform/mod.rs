@@ -7,7 +7,7 @@ mod polynomial;
 mod standardize;
 pub mod state;
 
-pub(crate) use categorical::CategoricalDefinition;
+pub(crate) use categorical::{CategoricalDefinition, LevelSelection};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
@@ -248,9 +248,9 @@ mod tests {
 
     #[test]
     fn fit_identity_depends_on_definition_not_fitted_state() -> Result<(), TransformError> {
-        let definition = CategoricalDefinition::new(Some(ParameterValue::Scalar(Scalar::from(
-            PlSmallStr::from_static("a"),
-        ))));
+        let definition = CategoricalDefinition::new(Some(LevelSelection::Omit(
+            ParameterValue::Scalar(Scalar::from(PlSmallStr::from_static("a"))),
+        )));
         let first_input = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let second_input = prepare(&[Column::new("group".into(), ["a", "c"])]);
         let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
