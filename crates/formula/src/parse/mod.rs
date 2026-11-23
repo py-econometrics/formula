@@ -902,6 +902,7 @@ mod tests {
                 "y ~ (a + b + c)*(a + b + c)*(a + b + c)",
             ),
             ("y ~ (a + b)^1", "y ~ a + b"),
+            ("y ~ (a + b)^4294967295", "y ~ a + b + a:b"),
             ("y ~ (a + b) ^ 2 + x", "y ~ a + b + a:b + x"),
             ("y ~ a^2", "y ~ a"),
             // `^` binds more tightly than `:` and `*`.

@@ -248,9 +248,7 @@ where
             Self::Power(_, base, exponent) => base
                 .expand()
                 .into_iter()
-                .map(|base| {
-                    (1..*exponent).fold(base.clone(), |power, _| power.interact_fully(base.clone()))
-                })
+                .map(|base| base.power(*exponent))
                 .collect(),
 
             Self::Parenthesized(expression) => expression.expand(),
