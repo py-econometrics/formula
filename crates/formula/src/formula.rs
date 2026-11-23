@@ -588,7 +588,15 @@ impl Expression {
         self.terms
             .iter()
             .map(Term::render)
-            .chain(self.children.iter().map(|child| format!("[{child}]")))
+            .chain(self.children.iter().map(|child| {
+                // Nested formulas always have a response
+                let response = if child.expressions[&Role::Dependent].is_empty() {
+                    "0 ~ "
+                } else {
+                    ""
+                };
+                format!("[{response}{child}]")
+            }))
             .collect::<Vec<_>>()
             .join(" + ")
     }
@@ -777,16 +785,11 @@ impl std::fmt::Display for Formula {
         let independent = &self.expressions[&Role::Independent];
         let fixed_effects = &self.expressions[&Role::FixedEffect];
 
-        write!(
-            f,
-            "{} {FORMULA_SEPARATOR} {}",
-            if dependent.is_empty() {
-                "0".to_owned()
-            } else {
-                dependent.render()
-            },
-            independent.render()
-        )?;
+        // A formula without a response is written as its right-hand side
+        if !dependent.is_empty() {
+            write!(f, "{} {FORMULA_SEPARATOR} ", dependent.render())?;
+        }
+        write!(f, "{}", independent.render())?;
 
         if independent.is_empty() {
             write!(f, "-1")?;
@@ -1760,6 +1763,9 @@ mod tests {
             "y ~ x - 1 + [a ~ z - 1]",
             "y ~ [a ~ 0] - 1",
             "0 ~ x + [a ~ z]",
+            "0 + log(z)",
+            "0 ~ 0 | firm",
+            "y ~ x + [0 ~ z]",
             "[a ~ z] ~ x",
             "y ~ x + [a ~ z] + [b ~ w]",
             "y ~ x + [a ~ z + [b ~ w - 1]]",

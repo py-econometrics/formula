@@ -18,7 +18,11 @@ fn cartesian_product_with<L: Clone, R: Clone, O>(
 
 impl FormulaAst {
     pub(in crate::parse) fn expand(&self) -> Vec<crate::Formula> {
-        let left = self.left.expand();
+        let left = self
+            .left
+            .as_ref()
+            .map(|expression| expression.expand())
+            .unwrap_or_else(|| vec![formula::Expression::from_iter([])]);
 
         let right = self
             .right

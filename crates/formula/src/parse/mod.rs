@@ -502,7 +502,7 @@ impl ParseAtom for Box<ast::FormulaAst> {
         preceded(
             '[',
             cut_err(terminated(
-                parse_formula_ast,
+                parse_nested_formula_ast,
                 ']'.context(StrContext::Expected(StrContextValue::Description(
                     "']' to close the nested formula",
                 ))),
@@ -610,26 +610,22 @@ fn postfix<'i, L: ParseLayer>(
 }
 
 fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
-    let left = preceded(
-        multispace0,
-        parse_node::<ast::MultistageFormula>.context(StrContext::Label("left-hand expression")),
-    )
-    .parse_next(cursor)?;
+    let first = preceded(multispace0, parse_node::<ast::MultistageFormula>).parse_next(cursor)?;
 
-    FORMULA_SEPARATOR
-        .context(StrContext::Expected(StrContextValue::CharLiteral(
-            FORMULA_SEPARATOR,
-        )))
+    // Without `~`, the first expression is the right-hand side and there is no response
+    let (left, right) = if opt(FORMULA_SEPARATOR).parse_next(cursor)?.is_some() {
+        let right = preceded(
+            multispace0,
+            cut_err(
+                parse_node::<ast::MultistageFormula>
+                    .context(StrContext::Label("right-hand expression")),
+            ),
+        )
         .parse_next(cursor)?;
-
-    let right = preceded(
-        multispace0,
-        cut_err(
-            parse_node::<ast::MultistageFormula>
-                .context(StrContext::Label("right-hand expression")),
-        ),
-    )
-    .parse_next(cursor)?;
+        (Some(first), right)
+    } else {
+        (None, first)
+    };
 
     let fixed_effects = opt(preceded(
         PIPE_SEPARATOR,
@@ -644,6 +640,18 @@ fn parse_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
         right,
         fixed_effects,
     })
+}
+
+fn parse_nested_formula_ast(cursor: &mut &str) -> ModalResult<ast::FormulaAst> {
+    let formula = parse_formula_ast(cursor)?;
+    if formula.left.is_none() {
+        return fail
+            .context(StrContext::Expected(StrContextValue::CharLiteral(
+                FORMULA_SEPARATOR,
+            )))
+            .parse_next(cursor);
+    }
+    Ok(formula)
 }
 
 pub(crate) type ParseResult<'i, T> = Result<T, ParseError<&'i str, ContextError>>;
@@ -831,6 +839,19 @@ mod tests {
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
         }
+    }
+
+    #[test]
+    fn right_hand_sides_alone_have_no_response() {
+        for (source, expected) in [
+            ("0 + log(z)", "0 ~ 0 + log(z)"),
+            ("x | f", "0 ~ x | f"),
+            ("sw(x, z)", "0 ~ sw(x, z)"),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(expected).unwrap(), "{source}");
+        }
+        let formulas = parse("0 + log(z)").unwrap();
+        assert!(formulas.get_by_str("log(z) - 1").unwrap().is_some());
     }
 
     #[test]
@@ -1199,7 +1220,7 @@ mod tests {
         #[test]
         fn parsing_preserves_formula_sections_and_default_group_settings() {
             let formula = parse_formula_ast.parse("y ~ x | firm").unwrap();
-            assert_term(&inner(formula.left), "y");
+            assert_term(&inner(formula.left.unwrap()), "y");
             assert_term(&inner(formula.right), "x");
             let Ast::Atom(column) = inner(formula.fixed_effects.unwrap()) else {
                 panic!("expected a grouping column")
@@ -2367,10 +2388,16 @@ mod tests {
         #[test]
         fn formula_boundaries_report_context_and_offsets() {
             for (source, expected, offset) in [
-                ("~ x", StrContext::Label("left-hand expression"), 0),
+                (
+                    "~ x",
+                    StrContext::Expected(StrContextValue::Description("an expression")),
+                    0,
+                ),
                 (
                     "y x",
-                    StrContext::Expected(StrContextValue::CharLiteral('~')),
+                    StrContext::Expected(StrContextValue::Description(
+                        "a formula operator or end of input",
+                    )),
                     2,
                 ),
                 ("y ~", StrContext::Label("right-hand expression"), 3),
@@ -2705,7 +2732,6 @@ mod tests {
             for source in [
                 "",
                 " ",
-                "x",
                 "y ~",
                 "~ x",
                 "y ~ x ~ z",
