@@ -299,7 +299,7 @@ mod tests {
             "formula-tests".into(),
             CategoricalPhysical::U32,
         ));
-        for label in ["d", "c", "b", "a"] {
+        for label in ["a", "b", "c", "d"] {
             categorical
                 .cat_mapping()
                 .unwrap()
@@ -317,7 +317,7 @@ mod tests {
     }
 
     #[test]
-    fn native_levels_are_sorted_and_keep_label_names() -> Result<(), TransformError> {
+    fn native_levels_keep_label_names() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
             let training = [Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?];
             let prepared_training = prepare(&training);
@@ -334,6 +334,48 @@ mod tests {
                     &[Some(false), Some(true), Some(false)],
                     &[Some(true), Some(false), Some(true)],
                 ],
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn levels_sort_by_value_label_or_enum_category_order() -> Result<(), TransformError> {
+        // Dictionary order differs from label order
+        let categorical = DataType::from_categories(Categories::random(
+            "formula-tests".into(),
+            CategoricalPhysical::U32,
+        ));
+        for label in ["c", "b", "a"] {
+            categorical
+                .cat_mapping()
+                .unwrap()
+                .insert_cat(label)
+                .unwrap();
+        }
+        let enumeration =
+            DataType::from_frozen_categories(FrozenCategories::new(["c", "a", "b"]).unwrap());
+        let labels = Column::new("x".into(), ["b", "a", "c", "a"]);
+
+        for (input, expected) in [
+            (
+                Column::new("x".into(), [10_i64, 9, 2, 9]),
+                ["C(x)[2]", "C(x)[9]", "C(x)[10]"],
+            ),
+            (
+                labels.cast(&categorical)?,
+                ["C(x)[a]", "C(x)[b]", "C(x)[c]"],
+            ),
+            (
+                labels.cast(&enumeration)?,
+                ["C(x)[c]", "C(x)[a]", "C(x)[b]"],
+            ),
+        ] {
+            let prepared = prepare(&[input]);
+            let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared)?;
+            assert_eq!(
+                fitted.transform(&prepared)?.frame().get_column_names(),
+                expected
             );
         }
         Ok(())
