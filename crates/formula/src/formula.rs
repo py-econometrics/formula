@@ -2320,8 +2320,8 @@ mod tests {
             (
                 "C(flag)",
                 polars::df!(
-                    "C(flag)[True]" => [false, true, false],
                     "C(flag)[False]" => [true, false, true],
+                    "C(flag)[True]" => [false, true, false],
                 )
                 .unwrap(),
             ),

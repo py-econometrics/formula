@@ -120,7 +120,7 @@ def test_selected_term_and_columns_survive_prediction_and_owner_deletion(data):
 @pytest.mark.parametrize(
     ("values", "dtype", "key_type"),
     [
-        ([True, False], polars.Boolean, bool),
+        ([False, True], polars.Boolean, bool),
         ([1, 2], polars.Int32, int),
         ([1.5, 2.5], polars.Float32, float),
         (["a", "b"], polars.String, str),

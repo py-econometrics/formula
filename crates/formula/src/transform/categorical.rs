@@ -5,8 +5,8 @@ use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar, col,
-    lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar,
+    SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -177,7 +177,8 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 
     fn fit(&self, inputs: &PreparedInput) -> Result<CategoricalState, TransformError> {
         let (_, input) = inputs.single()?;
-        let levels = input.drop_nulls().unique_stable()?;
+        // Sort levels: numbers by value, strings and categoricals by label, enums by category
+        let levels = input.drop_nulls().unique()?.sort(SortOptions::default())?;
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
             levels.filter(&levels.is_finite()?)?
@@ -298,7 +299,7 @@ mod tests {
             "formula-tests".into(),
             CategoricalPhysical::U32,
         ));
-        for label in ["a", "b", "c", "d"] {
+        for label in ["d", "c", "b", "a"] {
             categorical
                 .cat_mapping()
                 .unwrap()
@@ -316,22 +317,22 @@ mod tests {
     }
 
     #[test]
-    fn native_levels_preserve_observed_order_and_label_names() -> Result<(), TransformError> {
+    fn native_levels_are_sorted_and_keep_label_names() -> Result<(), TransformError> {
         for dtype in native_dtypes() {
             let training = [Column::new("x".into(), ["d", "b", "d"]).cast(&dtype)?];
             let prepared_training = prepare(&training);
             let fitted = Fitted::fit(CategoricalDefinition::new(None), &prepared_training)?;
             let output = fitted.transform(&prepared_training)?;
 
-            assert_eq!(output.frame().get_column_names(), ["C(x)[d]", "C(x)[b]"]);
+            assert_eq!(output.frame().get_column_names(), ["C(x)[b]", "C(x)[d]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &training,
                 output.frame(),
                 &[
-                    &[Some(true), Some(false), Some(true)],
                     &[Some(false), Some(true), Some(false)],
+                    &[Some(true), Some(false), Some(true)],
                 ],
             );
         }
@@ -355,8 +356,8 @@ mod tests {
                 &input,
                 fitted.transform(&prepared_input)?.frame(),
                 &[
-                    &[Some(false), None, None, Some(true), None],
                     &[Some(true), None, None, Some(false), None],
+                    &[Some(false), None, None, Some(true), None],
                 ],
             );
         }
@@ -448,7 +449,7 @@ mod tests {
                 &fitted.state,
                 &input,
                 output.frame(),
-                &[&[None, Some(false), None], &[None, Some(true), None]],
+                &[&[None, Some(true), None], &[None, Some(false), None]],
             );
             assert!(
                 fitted
@@ -591,7 +592,7 @@ mod tests {
             let levels = state.levels.cast(&DataType::Float64)?;
             assert_eq!(
                 levels.f64()?.iter().collect::<Vec<_>>(),
-                vec![Some(2.0), Some(1.0)]
+                vec![Some(1.0), Some(2.0)]
             );
             assert_eq!(state.levels.dtype(), &dtype);
             assert_output(
@@ -600,8 +601,8 @@ mod tests {
                 &inputs,
                 definition.transform(&state, &prepared_inputs)?.frame(),
                 &[
-                    &[Some(true), None, None, Some(false), None, Some(true), None],
                     &[Some(false), None, None, Some(true), None, Some(false), None],
+                    &[Some(true), None, None, Some(false), None, Some(true), None],
                 ],
             );
         }
@@ -771,8 +772,8 @@ mod tests {
             let fitted = Fitted::fit(definition, &training)?;
             let output = fitted.transform(&prepared_input)?;
             let mut expected = vec![
-                [Some(false), Some(true), None, None],
                 [Some(true), Some(false), None, None],
+                [Some(false), Some(true), None, None],
             ];
             expected.extend((2..count).map(|_| [Some(false), Some(false), None, None]));
             let expected = expected
@@ -786,7 +787,9 @@ mod tests {
                 output.frame(),
                 &expected,
             );
-            let names = levels[..count]
+            let mut sorted = levels[..count].to_vec();
+            sorted.sort_unstable();
+            let names = sorted
                 .iter()
                 .map(|level| format!("C(group)[{level}]"))
                 .collect::<Vec<_>>();
