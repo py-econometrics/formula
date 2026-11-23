@@ -263,7 +263,7 @@ impl Layer for SingleFixedEffects {
 
 /// A formula before expansion into estimation alternatives.
 pub(super) struct FormulaAst {
-    pub(super) left: ExpressionAst<MultistageFormula>,
+    pub(super) left: Option<ExpressionAst<MultistageFormula>>,
     pub(super) right: ExpressionAst<MultistageFormula>,
     pub(super) fixed_effects: Option<ExpressionAst<FixedEffects>>,
 }
