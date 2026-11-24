@@ -1,4 +1,5 @@
 mod categorical;
+mod codes;
 mod expression;
 mod grouped;
 mod input;

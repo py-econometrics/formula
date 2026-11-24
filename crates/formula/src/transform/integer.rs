@@ -3,11 +3,10 @@ use super::{ArgumentCount, StateValue, TransformDefinition, TransformError};
 use crate::TransformState;
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
+use crate::transform::codes::{CODE_COLUMN, map_codes, tuple_codes};
 use crate::transform::state::ExportState;
-use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
-    DataFrame, DataType, Field, IntoColumn, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin,
-    NULL, Series, all_horizontal, col, dtype_cols, lit, when,
+    DataFrame, DataType, Field, IntoColumn, IntoLazy, IntoSeries, NULL, Series, col, lit, when,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -23,10 +22,6 @@ pub struct IntegerEncodingState {
 enum IntegerEncoding {
     Mapping(DataFrame),
     Native(Series),
-}
-
-impl IntegerEncodingDefinition {
-    const CODE_COLUMN: &'static str = "__code";
 }
 
 impl TransformDefinition for IntegerEncodingDefinition {
@@ -122,27 +117,9 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
             });
         }
 
-        // Prevent encoding nonfinite floats as a category
-        let finite = dtype_cols([DataType::Float32, DataType::Float64])
-            .as_selector()
-            .as_expr()
-            .is_finite();
-        let mapping = inputs
-            .frame
-            .clone()
-            .lazy()
-            .drop_nulls(None)
-            .filter(all_horizontal([finite])?)
-            .unique_stable(None, UniqueKeepStrategy::First);
-
         Ok(IntegerEncodingState {
             fields: inputs.fields.clone(),
-            encoding: IntegerEncoding::Mapping(
-                mapping
-                    .with_row_index(Self::CODE_COLUMN, None)
-                    .with_columns([col(Self::CODE_COLUMN).strict_cast(DataType::UInt32)])
-                    .collect()?,
-            ),
+            encoding: IntegerEncoding::Mapping(tuple_codes(&inputs.frame)?),
         })
     }
 
@@ -175,29 +152,9 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
                         .alias(output_name)])
                     .collect()?
             }
-            IntegerEncoding::Mapping(mapping) => {
-                // Collect level combinations observed during fitting
-                let level_keys = inputs
-                    .frame
-                    .columns()
-                    .iter()
-                    .map(|column| col(column.name().clone()))
-                    .collect::<Vec<_>>();
-                // Join observed levels in input frame on to fitted levels
-                inputs
-                    .frame
-                    .clone()
-                    .lazy()
-                    .join_builder()
-                    .with(mapping.clone().lazy())
-                    .how(JoinType::Left)
-                    .on(level_keys)
-                    .join_nulls(false)
-                    .maintain_order(MaintainOrderJoin::Left)
-                    .finish()
-                    .select([col(IntegerEncodingDefinition::CODE_COLUMN).alias(output_name)])
-                    .collect()?
-            }
+            IntegerEncoding::Mapping(mapping) => map_codes(&inputs.frame, mapping)?
+                .with_name(output_name.into())
+                .into_frame(),
         };
 
         Ok(MaterializedColumns::single_column(
@@ -211,7 +168,7 @@ impl IntegerEncodingState {
     pub fn codes(&self) -> DataFrame {
         let codes = match &self.encoding {
             IntegerEncoding::Mapping(mapping) => mapping
-                .column(IntegerEncodingDefinition::CODE_COLUMN)
+                .column(CODE_COLUMN)
                 .expect("fitted mapping contains its code column")
                 .clone(),
 
@@ -263,6 +220,7 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
+    use crate::transform::codes::CODE_COLUMN;
     use polars::error::PolarsError;
     use polars::prelude::{CategoricalPhysical, Categories, Column, FrozenCategories};
 
@@ -945,10 +903,7 @@ mod tests {
     #[test]
     fn integer_encoding_accepts_repeated_arguments_and_reserved_input_names()
     -> Result<(), TransformError> {
-        let column = Column::new(
-            IntegerEncodingDefinition::CODE_COLUMN.into(),
-            ["a", "b", "a"],
-        );
+        let column = Column::new(CODE_COLUMN.into(), ["a", "b", "a"]);
         let cases = [
             (
                 [column.clone(), column.clone()],
