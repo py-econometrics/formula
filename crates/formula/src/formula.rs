@@ -530,6 +530,7 @@ impl Term {
         &self,
         height: usize,
         transformed: &[FittedFactor],
+        fitting: bool,
     ) -> Result<(Self, MaterializedColumns<ColumnMetadata>), TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
@@ -567,14 +568,17 @@ impl Term {
         }
 
         let combinations = if codes.len() < 2 {
-            // No need to check seen combinations if there are fewer than 2 categorical factors
+            // A term with fewer than two categorical factors encodes no combinations
             None
-        } else if let Some(combinations) = &self.combinations {
-            // If term is fitted, combinations are `Some`
-            Some(combinations.clone())
-        } else {
-            // Otherwise fit
+        } else if fitting {
+            // Fitting ignores any fitted combinations, as `Fit::fit` ignores a fitted state
             Some(Combinations::fit(&codes, counts)?)
+        } else {
+            Some(
+                self.combinations
+                    .clone()
+                    .expect("a fitted term with two or more categorical factors has combinations"),
+            )
         };
         let columns = match &combinations {
             None => self.assemble_columns(height, factor_columns)?,
@@ -1386,6 +1390,7 @@ fn assemble_terms(
     expressions: &[&Expression],
     height: usize,
     factors: &[FittedFactor],
+    fitting: bool,
 ) -> Result<Vec<FittedTerm>, TransformError> {
     let mut transformed: Vec<FittedTerm> = Vec::new();
 
@@ -1394,7 +1399,7 @@ fn assemble_terms(
             if transformed.iter().any(|entry| &entry.term == term) {
                 continue;
             }
-            let (term, columns) = term.assemble(height, factors)?;
+            let (term, columns) = term.assemble(height, factors, fitting)?;
             transformed.push(FittedTerm { term, columns });
         }
     }
@@ -1408,7 +1413,7 @@ pub(crate) fn transform_terms(
 ) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
     let factors = transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors)?)
+    Ok(assemble_terms(expressions, data.height(), &factors, false)?)
 }
 
 fn fit_and_transform_terms(
@@ -1417,7 +1422,7 @@ fn fit_and_transform_terms(
 ) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
     let factors = fit_and_transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors)?)
+    Ok(assemble_terms(expressions, data.height(), &factors, true)?)
 }
 
 fn lookup_factor<'a>(transformed: &'a [FittedFactor], factor: &Arc<Factor>) -> &'a FittedFactor {
