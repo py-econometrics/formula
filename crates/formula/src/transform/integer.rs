@@ -1,5 +1,5 @@
 use super::input::{PreparedInput, argument_column_name};
-use super::{ArgumentCount, StateValue, TransformDefinition, TransformError};
+use super::{ArgumentCount, StateValue, TransformDefinition, TransformError, TransformOutput};
 use crate::TransformState;
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
@@ -44,7 +44,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
 
 impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
     type Input = PreparedInput;
-    type Output = MaterializedColumns<ComponentKey>;
+    type Output = TransformOutput;
     type Error = TransformError;
 
     fn validate(
@@ -157,9 +157,8 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
                 .into_frame(),
         };
 
-        Ok(MaterializedColumns::single_column(
-            frame,
-            ComponentKey::None,
+        Ok(TransformOutput::Columns(
+            MaterializedColumns::single_column(frame, ComponentKey::None),
         ))
     }
 }

@@ -5,7 +5,8 @@ use crate::parse::{
 };
 use crate::transform::{
     ArgumentCount, CategoricalDefinition, GroupedTransform, IntegerEncodingDefinition,
-    IntegerEncodingState, ParameterValue, Transform, TransformError, validate_numeric_field,
+    IntegerEncodingState, ParameterValue, Transform, TransformError, TransformOutput,
+    validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
@@ -527,7 +528,7 @@ impl Term {
         for factor in &self.factors {
             let result = lookup_factor(transformed, factor);
             if let FactorKind::Variable(_) = &factor.kind {
-                let [column] = result.columns.frame.columns() else {
+                let [column] = result.output.frame().columns() else {
                     unreachable!("a variable transforms to exactly one column");
                 };
                 validate_numeric_field(&column.field())?;
@@ -535,7 +536,8 @@ impl Term {
             factors.push(Arc::clone(&result.factor));
             factor_columns.push(
                 result
-                    .columns
+                    .output
+                    .columns()
                     .clone()
                     .with_factor(Arc::clone(&result.factor)),
             );
@@ -963,7 +965,7 @@ impl MaterializedColumns<ComponentKey> {
 
 struct FittedFactor {
     factor: Arc<Factor>,
-    columns: MaterializedColumns<ComponentKey>,
+    output: TransformOutput,
 }
 
 #[derive(Clone, Debug)]
@@ -1120,10 +1122,10 @@ fn fit_and_transform_factors(
         let result = match &factor.kind {
             FactorKind::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
-                columns: MaterializedColumns::single_column(
+                output: TransformOutput::Columns(MaterializedColumns::single_column(
                     literal_column(value, data.height()).into_frame(),
                     ComponentKey::None,
-                ),
+                )),
             },
             FactorKind::Variable(variable) => {
                 let column = data
@@ -1136,10 +1138,12 @@ fn fit_and_transform_factors(
                 let factor = Arc::new(Factor {
                     kind: FactorKind::Variable(fitted),
                 });
-                let columns =
-                    MaterializedColumns::single_column(output.into_frame(), ComponentKey::None);
+                let output = TransformOutput::Columns(MaterializedColumns::single_column(
+                    output.into_frame(),
+                    ComponentKey::None,
+                ));
 
-                FittedFactor { factor, columns }
+                FittedFactor { factor, output }
             }
             FactorKind::Call {
                 transform,
@@ -1150,13 +1154,13 @@ fn fit_and_transform_factors(
                 for argument in arguments {
                     let result = lookup_factor(&transformed, argument);
                     fitted_arguments.push(Arc::clone(&result.factor));
-                    inputs.extend(result.columns.frame.columns().iter().cloned());
+                    inputs.extend(result.output.frame().columns().iter().cloned());
                 }
 
                 let transform = transform.fit(&inputs).map_err(|error| {
                     ModelError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
-                let columns = transform.transform(&inputs).map_err(|error| {
+                let output = transform.transform(&inputs).map_err(|error| {
                     ModelError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
                 let factor = Arc::new(Factor {
@@ -1166,7 +1170,7 @@ fn fit_and_transform_factors(
                     },
                 });
 
-                FittedFactor { factor, columns }
+                FittedFactor { factor, output }
             }
         };
         transformed.push(result)
@@ -1181,20 +1185,22 @@ fn transform_factors(
     let mut transformed = Vec::with_capacity(scheduled.len());
 
     for factor in scheduled {
-        let columns = match &factor.kind {
-            FactorKind::Literal(value) => MaterializedColumns::single_column(
-                literal_column(value, data.height()).into_frame(),
-                ComponentKey::None,
-            ),
+        let output = match &factor.kind {
+            FactorKind::Literal(value) => {
+                TransformOutput::Columns(MaterializedColumns::single_column(
+                    literal_column(value, data.height()).into_frame(),
+                    ComponentKey::None,
+                ))
+            }
             FactorKind::Variable(variable) => {
                 let column = data
                     .column(&variable.definition().name)
                     .map_err(TransformError::from)?;
 
-                MaterializedColumns::single_column(
+                TransformOutput::Columns(MaterializedColumns::single_column(
                     variable.transform(column)?.into_frame(),
                     ComponentKey::None,
-                )
+                ))
             }
             FactorKind::Call {
                 transform,
@@ -1203,7 +1209,7 @@ fn transform_factors(
                 let mut inputs = Vec::new();
                 for argument in arguments {
                     let result = lookup_factor(&transformed, argument);
-                    inputs.extend(result.columns.frame.columns().iter().cloned());
+                    inputs.extend(result.output.frame().columns().iter().cloned());
                 }
                 transform.transform(&inputs).map_err(|error| {
                     ModelError::TransformCall(format!("{}: {error}", factor.render()))
@@ -1212,7 +1218,7 @@ fn transform_factors(
         };
         transformed.push(FittedFactor {
             factor: Arc::clone(factor),
-            columns,
+            output,
         });
     }
     Ok(transformed)
@@ -1392,7 +1398,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            output.metadata,
+            output.columns().metadata,
             vec![
                 ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
                     "group",
@@ -2174,7 +2180,7 @@ mod tests {
                 for entry in entries {
                     if let FactorKind::Literal(value) = &entry.factor.kind {
                         literal_count += 1;
-                        let [Column::Scalar(column)] = entry.columns.frame().columns() else {
+                        let [Column::Scalar(column)] = entry.output.frame().columns() else {
                             panic!("literal must retain scalar storage");
                         };
                         assert_eq!(column.scalar(), value);

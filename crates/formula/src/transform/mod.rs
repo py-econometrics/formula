@@ -30,7 +30,7 @@ pub use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use crate::transform::state::ExportState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, PlSmallStr, Scalar};
+use polars::prelude::{Column, DataFrame, PlSmallStr, Scalar};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -42,6 +42,28 @@ pub enum ParameterValue {
     Scalar(Scalar),
     List(Vec<Scalar>),
     Map(Vec<(PlSmallStr, ParameterValue)>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TransformOutput {
+    Columns(MaterializedColumns<ComponentKey>),
+    /// Indicator columns, each true where a row's code is the code of its column
+    Indicator {
+        columns: MaterializedColumns<ComponentKey>,
+        codes: Column,
+    },
+}
+
+impl TransformOutput {
+    pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
+        match self {
+            Self::Columns(columns) | Self::Indicator { columns, .. } => columns,
+        }
+    }
+
+    pub(crate) fn frame(&self) -> &DataFrame {
+        self.columns().frame()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -139,7 +161,7 @@ impl Transform {
     pub(crate) fn transform(
         &self,
         inputs: &[Column],
-    ) -> Result<MaterializedColumns<ComponentKey>, FitError<TransformError>> {
+    ) -> Result<TransformOutput, FitError<TransformError>> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 

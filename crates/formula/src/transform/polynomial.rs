@@ -1,7 +1,7 @@
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::input::{PreparedInput, argument_column_name, validate_numeric_field};
-use crate::transform::{ParameterValue, TransformDefinition, call_name};
+use crate::transform::{ParameterValue, TransformDefinition, TransformOutput, call_name};
 use crate::{ArgumentCount, TransformError};
 use polars::prelude::{
     AnyValue, Column, DataFrame, DataType, Expr, Field, Float64Chunked, IntoColumn, IntoLazy, NULL,
@@ -310,7 +310,7 @@ pub(crate) struct PolynomialState {
 
 impl Definition<PolynomialState> for PolynomialDefinition {
     type Input = PreparedInput;
-    type Output = MaterializedColumns<ComponentKey>;
+    type Output = TransformOutput;
     type Error = TransformError;
 
     fn validate(
@@ -378,7 +378,9 @@ impl Definition<PolynomialState> for PolynomialDefinition {
             .unzip();
 
         let frame = DataFrame::new(height, columns)?;
-        Ok(MaterializedColumns::new(frame, metadata))
+        Ok(TransformOutput::Columns(MaterializedColumns::new(
+            frame, metadata,
+        )))
     }
 }
 

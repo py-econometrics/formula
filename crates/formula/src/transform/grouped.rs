@@ -1,5 +1,5 @@
 use super::input::{PreparedInput, validate_numeric_field};
-use super::{ArgumentCount, ParameterValue, TransformDefinition, call_name};
+use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformOutput, call_name};
 use crate::formula::MaterializedColumns;
 use crate::{ComponentKey, TransformError};
 use polars::prelude::{Column, DataFrame, DataType, PlSmallStr, Scalar};
@@ -77,7 +77,7 @@ impl GroupedTransform {
     pub(crate) fn transform(
         &self,
         inputs: &PreparedInput,
-    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+    ) -> Result<TransformOutput, TransformError> {
         let (group, loadings) = self.validate_inputs(inputs)?;
         let arguments = inputs
             .fields
@@ -111,7 +111,9 @@ impl GroupedTransform {
 
         let frame = DataFrame::new(height, columns)?;
 
-        Ok(MaterializedColumns::new(frame, keys))
+        Ok(TransformOutput::Columns(MaterializedColumns::new(
+            frame, keys,
+        )))
     }
 }
 

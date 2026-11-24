@@ -1,5 +1,5 @@
 use super::input::{PreparedInput, validate_numeric_field};
-use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use super::{ArgumentCount, TransformDefinition, TransformError, TransformOutput, call_name};
 use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::error::PolarsError;
 use polars::prelude::{DataType, Expr, Field, IntoLazy, PlSmallStr, col, lit};
@@ -159,7 +159,7 @@ impl ExpressionTransform {
     pub(crate) fn transform(
         &self,
         inputs: &PreparedInput,
-    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+    ) -> Result<TransformOutput, TransformError> {
         self.validate_inputs(inputs)?;
         let frame = inputs.frame.clone();
         let height = frame.height();
@@ -181,9 +181,8 @@ impl ExpressionTransform {
             )
             .into());
         }
-        Ok(MaterializedColumns::single_column(
-            output,
-            ComponentKey::None,
+        Ok(TransformOutput::Columns(
+            MaterializedColumns::single_column(output, ComponentKey::None),
         ))
     }
 }

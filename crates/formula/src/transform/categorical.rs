@@ -1,5 +1,7 @@
 use super::input::PreparedInput;
-use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name};
+use super::{
+    ArgumentCount, ParameterValue, TransformDefinition, TransformError, TransformOutput, call_name,
+};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::codes::{CODE_COLUMN, map_codes};
@@ -471,7 +473,7 @@ impl TransformDefinition for CategoricalDefinition {
 
 impl Definition<CategoricalState> for CategoricalDefinition {
     type Input = PreparedInput;
-    type Output = MaterializedColumns<ComponentKey>;
+    type Output = TransformOutput;
     type Error = TransformError;
 
     fn validate(
@@ -572,7 +574,8 @@ impl Definition<CategoricalState> for CategoricalDefinition {
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
         let codes = Self::codes(state, input)?;
-        self.indicators(state, &codes, field.name())
+        let columns = self.indicators(state, &codes, field.name())?;
+        Ok(TransformOutput::Indicator { columns, codes })
     }
 }
 
