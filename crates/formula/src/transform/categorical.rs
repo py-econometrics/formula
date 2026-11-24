@@ -176,7 +176,7 @@ impl CategoricalDefinition {
         Ok(level)
     }
 
-    /// Casts `value` to `parameter`'s dtype and returns its position in `levels`
+    /// Return `value`'s position in `levels`
     fn level_index(
         parameter: &str,
         value: &Scalar,
@@ -208,7 +208,7 @@ impl CategoricalDefinition {
             .collect()
     }
 
-    /// Builds the one-hot encoding: one per unbinned level or one per bin
+    /// Builds the one-hot encoding: one column per unbinned level or bin
     fn bin_levels(
         bins: &[(PlSmallStr, Levels)],
         levels: &Series,
@@ -373,7 +373,6 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         };
 
         let Some(selection) = &self.selection else {
-            // Without a selection, every column is encoded
             return Ok(CategoricalState {
                 levels,
                 columns,
