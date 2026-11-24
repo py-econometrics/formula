@@ -3,13 +3,13 @@ use super::{
     ArgumentCount, ParameterValue, TransformDefinition, TransformError, TransformOutput, call_name,
 };
 use crate::fit::Definition;
-use crate::formula::{ComponentKey, MaterializedColumns};
-use crate::transform::codes::{CODE_COLUMN, map_codes};
+use crate::formula::ComponentKey;
+use crate::transform::codes::{CODE_COLUMN, Indicators, map_codes};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, IntoLazy, NULL, PlSmallStr,
-    Scalar, Series, SortOptions, col, lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoColumn, IntoLazy, NULL, PlSmallStr, Scalar, Series,
+    SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -330,29 +330,23 @@ impl CategoricalDefinition {
         map_codes(&input.clone().into_frame(), &mapping)
     }
 
-    /// The indicator columns for [`Self::codes`]
-    ///
-    /// Each is true where a row's code is its column's index, and null where the code is null.
+    /// The indicators for [`Self::codes`]: a column for each kept level or bin
     pub(super) fn indicators(
         &self,
         state: &CategoricalState,
-        codes: &Column,
+        codes: Column,
         input_name: &str,
-    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+    ) -> Result<Indicators, TransformError> {
         let fitted_levels = Self::fitted_levels(&state.levels)?;
-        let mut columns = Vec::new();
-        let mut keys = Vec::new();
-        for (index, column) in state.columns[..state.kept].iter().enumerate() {
+        let columns = state.columns[..state.kept].iter().map(|column| {
             let key = column.key(&fitted_levels);
-            let indicator = codes
-                .as_materialized_series()
-                .equal(index as u32)?
-                .with_name(self.output_name(input_name, &key));
-            columns.push(indicator.into_column());
-            keys.push(ComponentKey::Scalar(key));
-        }
-        let frame = DataFrame::new(codes.len(), columns)?;
-        Ok(MaterializedColumns::new(frame, keys))
+            (
+                self.output_name(input_name, &key),
+                ComponentKey::Scalar(key),
+            )
+        });
+        let omitted = (state.columns.len() - state.kept) as u32;
+        Ok(Indicators::new(codes, columns, omitted)?)
     }
 
     /// Builds the one-hot encoding: one column per unbinned level or bin
@@ -573,12 +567,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
         let codes = Self::codes(state, input)?;
-        let columns = self.indicators(state, &codes, field.name())?;
-        Ok(TransformOutput::Indicator {
-            columns,
+        Ok(TransformOutput::Indicator(self.indicators(
+            state,
             codes,
-            count: state.columns.len() as u32,
-        })
+            field.name(),
+        )?))
     }
 }
 

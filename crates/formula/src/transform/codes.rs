@@ -1,7 +1,8 @@
+use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::prelude::{
-    Column, DataFrame, DataType, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin, NULL,
-    PolarsResult, Series, UniqueKeepStrategy, all_horizontal, col, dtype_cols, lit, polars_ensure,
-    when,
+    ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, IntoLazy, IntoSeries, JoinType,
+    MaintainOrderJoin, NULL, PlSmallStr, PolarsResult, Series, UniqueKeepStrategy, all_horizontal,
+    col, dtype_cols, lit, polars_ensure, when,
 };
 
 /// The column of a mapping frame that holds each tuple's code
@@ -47,6 +48,73 @@ pub(super) fn map_codes(frame: &DataFrame, mapping: &DataFrame) -> PolarsResult<
         .select([col(CODE_COLUMN)])
         .collect()?;
     Ok(codes.column(CODE_COLUMN)?.clone())
+}
+
+/// Each row's code, and an indicator column for each kept code
+///
+/// Codes `0..kept()` are kept, and indicator column `i` is true where a row's code is `i`. Codes
+/// `kept()..count()` were omitted, so their rows are `false` in every column.
+#[derive(Clone, Debug)]
+pub(crate) struct Indicators {
+    columns: MaterializedColumns<ComponentKey>,
+    codes: Column,
+    omitted: u32,
+}
+
+impl Indicators {
+    /// Builds indicator column `i` with the name and key `columns` gives at position `i`
+    ///
+    /// Each indicator column is true where a row's code is its position, and null where the code
+    /// is null. The `omitted` codes that follow the last column's position have no column.
+    pub(super) fn new(
+        codes: Column,
+        columns: impl IntoIterator<Item = (PlSmallStr, ComponentKey)>,
+        omitted: u32,
+    ) -> PolarsResult<Self> {
+        let mut indicators = Vec::new();
+        let mut keys = Vec::new();
+        for (code, (name, key)) in columns.into_iter().enumerate() {
+            let indicator = codes
+                .as_materialized_series()
+                .equal(code as u32)?
+                .with_name(name);
+            indicators.push(indicator.into_column());
+            keys.push(key);
+        }
+        let indicators = Self {
+            columns: MaterializedColumns::new(DataFrame::new(codes.len(), indicators)?, keys),
+            codes,
+            omitted,
+        };
+        let count = indicators.count();
+        assert!(
+            indicators
+                .codes
+                .as_materialized_series()
+                .max::<u32>()?
+                .is_none_or(|code| code < count),
+            "each code must be less than the number of kept and omitted codes",
+        );
+        Ok(indicators)
+    }
+
+    pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
+        &self.columns
+    }
+
+    pub(crate) fn codes(&self) -> &Column {
+        &self.codes
+    }
+
+    /// The number of kept codes (equals number of indicator columns)
+    pub(crate) fn kept(&self) -> u32 {
+        self.columns.frame().width() as u32
+    }
+
+    /// The number of kept and omitted codes
+    pub(crate) fn count(&self) -> u32 {
+        self.kept() + self.omitted
+    }
 }
 
 /// The combinations of codes observd during fitting
@@ -159,5 +227,27 @@ mod tests {
         let second = Column::new("second".into(), [Some(0_u32), None]);
         let combinations = Combinations::fit(&[&first, &second], vec![0, 1]).unwrap();
         assert!(combinations.observed(&[0, 1]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indicators_mark_kept_codes_and_leave_omitted_codes_false() {
+        let codes = Column::new("codes".into(), [Some(0_u32), Some(1), Some(2), None]);
+        let columns = ["a", "b"].map(|name| (PlSmallStr::from(name), ComponentKey::None));
+        let indicators = Indicators::new(codes, columns, 1).unwrap();
+        assert_eq!((indicators.kept(), indicators.count()), (2, 3));
+        let expected = polars::df!(
+            "a" => [Some(true), Some(false), Some(false), None],
+            "b" => [Some(false), Some(true), Some(false), None],
+        )
+        .unwrap();
+        assert!(indicators.columns().frame().equals_missing(&expected));
+    }
+
+    #[test]
+    #[should_panic(expected = "each code must be less than the number of kept and omitted codes")]
+    fn indicators_reject_codes_beyond_the_omitted_ones() {
+        let codes = Column::new("codes".into(), [0_u32, 2]);
+        let columns = [(PlSmallStr::from("a"), ComponentKey::None)];
+        let _ = Indicators::new(codes, columns, 1);
     }
 }

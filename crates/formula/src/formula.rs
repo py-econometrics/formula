@@ -537,6 +537,7 @@ impl Term {
         let mut categorical = Vec::with_capacity(self.factors.len());
         let mut codes = Vec::new();
         let mut counts = Vec::new();
+        let mut kept = Vec::new();
         for factor in &self.factors {
             let result = lookup_factor(transformed, factor);
             if let FactorKind::Variable(_) = &factor.kind {
@@ -554,13 +555,10 @@ impl Term {
                     .with_factor(Arc::clone(&result.factor)),
             );
             categorical.push(match &result.output {
-                TransformOutput::Indicator {
-                    codes: factor_codes,
-                    count,
-                    ..
-                } => {
-                    codes.push(factor_codes);
-                    counts.push(*count);
+                TransformOutput::Indicator(indicators) => {
+                    codes.push(indicators.codes());
+                    counts.push(indicators.count());
+                    kept.push(indicators.kept());
                     true
                 }
                 TransformOutput::Columns(_) => false,
@@ -586,6 +584,7 @@ impl Term {
                 height,
                 &factor_columns,
                 &categorical,
+                &kept,
                 &combinations.transform(&codes)?,
                 combinations,
             )?,
@@ -603,6 +602,7 @@ impl Term {
         height: usize,
         factor_columns: &[MaterializedColumns<ColumnMetadata>],
         categorical: &[bool],
+        kept: &[u32],
         combination: &Column,
         combinations: &Combinations,
     ) -> Result<MaterializedColumns<ColumnMetadata>, TransformError> {
@@ -611,11 +611,7 @@ impl Term {
             .enumerate()
             .filter_map(|(position, &is_categorical)| is_categorical.then_some(position))
             .collect();
-        let kept_counts: Vec<_> = categorical_positions
-            .iter()
-            .map(|&position| factor_columns[position].metadata.len() as u32)
-            .collect();
-        let observed = combinations.observed(&kept_counts)?;
+        let observed = combinations.observed(kept)?;
         let has_empty_factor = factor_columns
             .iter()
             .any(|factor| factor.metadata.is_empty());

@@ -11,7 +11,7 @@ pub mod state;
 pub(crate) use categorical::CategoricalDefinition;
 #[cfg(test)]
 pub(crate) use categorical::{LevelSelection, Levels};
-pub(crate) use codes::Combinations;
+pub(crate) use codes::{Combinations, Indicators};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
@@ -48,18 +48,14 @@ pub enum ParameterValue {
 #[derive(Clone, Debug)]
 pub(crate) enum TransformOutput {
     Columns(MaterializedColumns<ComponentKey>),
-    /// Indicator columns, each true where a row's code is the code of its column
-    Indicator {
-        columns: MaterializedColumns<ComponentKey>,
-        codes: Column,
-        count: u32,
-    },
+    Indicator(Indicators),
 }
 
 impl TransformOutput {
     pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
         match self {
-            Self::Columns(columns) | Self::Indicator { columns, .. } => columns,
+            Self::Columns(columns) => columns,
+            Self::Indicator(indicators) => indicators.columns(),
         }
     }
 
