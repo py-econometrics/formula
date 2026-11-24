@@ -6,8 +6,8 @@ use crate::transform::codes::{CODE_COLUMN, map_codes};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PlSmallStr, Scalar, Series,
-    SortOptions,
+    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, IntoLazy, NULL, PlSmallStr,
+    Scalar, Series, SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -293,6 +293,27 @@ impl CategoricalDefinition {
             .into_iter()
             .map(|column| column as u32)
             .collect::<Vec<_>>();
+        // For a small number of levels comparing each row with each level is cheaper than a join's
+        // single hash lookup per row; there's no hard evidence for choosing 8
+        if codes.len() <= 8 {
+            let argument = col(input.name().clone());
+            let levels = Self::fitted_levels(&state.levels)?;
+            let expression = levels.into_iter().zip(&codes).rev().fold(
+                lit(NULL).cast(DataType::UInt32),
+                |otherwise, (level, code)| {
+                    when(argument.clone().eq(lit(level)))
+                        .then(lit(*code))
+                        .otherwise(otherwise)
+                },
+            );
+            let frame = input
+                .clone()
+                .into_frame()
+                .lazy()
+                .with_column(expression.alias(CODE_COLUMN))
+                .collect()?;
+            return Ok(frame.column(CODE_COLUMN)?.clone());
+        }
         let mapping = DataFrame::new(
             state.levels.len(),
             vec![
