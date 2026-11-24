@@ -87,7 +87,9 @@ impl Indicators {
             omitted,
         };
         let count = indicators.count();
-        assert!(
+        // Only debug builds check, as scanning every row's code costs about as much as
+        // transforming a factor with few levels
+        debug_assert!(
             indicators
                 .codes
                 .as_materialized_series()
@@ -244,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "each code must be less than the number of kept and omitted codes")]
     fn indicators_reject_codes_beyond_the_omitted_ones() {
         let codes = Column::new("codes".into(), [0_u32, 2]);
