@@ -725,6 +725,37 @@ mod tests {
         }
 
         #[test]
+        fn categorical_bins_are_keyed_by_name() {
+            let data = polars::df!("y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"]).unwrap();
+            let fitted = fit("y ~ C(g, bin={'ab': ['a', 'b']}) - 1", &data);
+            let columns = fitted
+                .columns(Role::Independent)
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert_eq!(columns.len(), 2);
+
+            for (column, key) in columns.iter().zip(["ab", "c"]) {
+                let contributions = column.contributions().collect::<Vec<_>>();
+                assert_eq!(contributions.len(), 1);
+                let (categorical, actual) = contributions[0];
+                assert_eq!(
+                    actual,
+                    &ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static(key)))
+                );
+                assert_eq!(
+                    categorical.call().unwrap().parameters()["bin"],
+                    ParameterValue::Map(vec![(
+                        PlSmallStr::from_static("ab"),
+                        ParameterValue::List(vec![
+                            Scalar::from(PlSmallStr::from_static("a")),
+                            Scalar::from(PlSmallStr::from_static("b")),
+                        ]),
+                    )]),
+                );
+            }
+        }
+
+        #[test]
         fn categorical_interactions_identify_factors_and_levels() {
             let data =
                 polars::df!("y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [2.0, 3.0, 4.0])
