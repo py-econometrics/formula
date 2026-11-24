@@ -43,7 +43,7 @@ struct TransformCall {
 
 #[derive(Debug)]
 enum TransformCallArgument {
-    Positional(Factor),
+    Positional(Arc<Factor>),
     Keyword { name: String, value: ParameterValue },
 }
 
@@ -289,6 +289,15 @@ fn parse_column(cursor: &mut &str) -> ModalResult<Factor> {
     .parse_next(cursor)
 }
 
+/// Parses fixest's `i` syntax: https://lrberge.github.io/fixest/reference/i.html
+fn parse_i_call(cursor: &mut &str) -> ModalResult<Term> {
+    preceded(
+        ('i', '('),
+        cut_err(parse_transform_arguments.try_map(lower_i_call)),
+    )
+    .parse_next(cursor)
+}
+
 fn parse_transform_call(cursor: &mut &str) -> ModalResult<Factor> {
     let name = terminated(take_while(1.., is_identifier_character), '(').parse_next(cursor)?;
 
@@ -331,7 +340,8 @@ fn parse_transform_arguments(cursor: &mut &str) -> ModalResult<Vec<TransformCall
 fn parse_transform_argument(cursor: &mut &str) -> ModalResult<TransformCallArgument> {
     alt((
         parse_transform_argument_keyword,
-        parse_transform_argument_positional.map(TransformCallArgument::Positional),
+        parse_transform_argument_positional
+            .map(|factor| TransformCallArgument::Positional(Arc::new(factor))),
         fail.context(StrContext::Expected(StrContextValue::Description(
             "a transform argument",
         ))),
@@ -544,6 +554,7 @@ impl ParseAtom for Term {
             take_while(1.., is_identifier_character)
                 .verify(|name: &str| matches!(name, "0" | "1"))
                 .map(|name| (Term::intercept(), name == "0")),
+            parse_i_call.map(|term| (term, false)),
             parse_factor.map(|factor| (Term::from(factor), false)),
         ))
         .parse_next(cursor)
@@ -889,6 +900,13 @@ impl TryFrom<TransformCall> for Factor {
 
                 Transform::Poly(Fit::Unfitted(definition))
             }
+            // `i` is lowered where a term is parsed, so here it is nested in a transform
+            "i" => {
+                return Err(TransformCallError::InvalidParameter {
+                    transform: "i",
+                    message: "`i` can only be used as a term".into(),
+                });
+            }
             _ => return Err(TransformCallError::UnknownTransform(call.name)),
         };
 
@@ -916,7 +934,7 @@ fn split_arguments(
     for (index, argument) in arguments.into_iter().enumerate() {
         match argument {
             TransformCallArgument::Positional(argument) if !saw_keyword => {
-                positional.push(Arc::new(argument));
+                positional.push(argument);
             }
             TransformCallArgument::Positional(_) => {
                 return Err(TransformCallError::PositionalAfterKeyword {
@@ -933,6 +951,90 @@ fn split_arguments(
     Ok(CallArguments {
         positional,
         keywords,
+    })
+}
+
+/// Lowers fixest's `i` syntax into native categorical interactions
+fn lower_i_call(arguments: Vec<TransformCallArgument>) -> Result<Term, TransformCallError> {
+    let CallArguments {
+        positional,
+        keywords,
+    } = split_arguments(arguments)?;
+    let mut first = BTreeMap::new();
+    let mut second = BTreeMap::new();
+    for (name, value) in keywords.mapping {
+        match name.strip_suffix('2') {
+            // A keyword ending in `2` applies to `i`'s second positional argument
+            Some(name) => second.insert(name.to_owned(), value),
+            None => first.insert(name, value),
+        };
+    }
+    let invalid = |message: String| TransformCallError::InvalidParameter {
+        transform: "i",
+        message,
+    };
+
+    match positional.as_slice() {
+        [factor] => {
+            // Providing a keyword for the optional second positional argument is invalid here
+            if let Some(name) = second.keys().next() {
+                return Err(invalid(format!("`{name}2` needs a second argument")));
+            }
+            Ok(Term::from(categorical(Arc::clone(factor), first)?))
+        }
+        [_, var] if var.literal().is_some() => {
+            let literal = var.render();
+            Err(invalid(format!(
+                "the second argument must be a variable, received a literal: {literal}"
+            )))
+        }
+        [factor, var] => {
+            let var = if second.is_empty() {
+                Arc::clone(var)
+            } else {
+                Arc::new(categorical(Arc::clone(var), second)?)
+            };
+            Ok([Arc::new(categorical(Arc::clone(factor), first)?), var]
+                .into_iter()
+                .collect())
+        }
+        _ => Err(invalid("expected one or two arguments".into())),
+    }
+}
+
+/// Builds a categorically encoded factor `C(f, ...)` and adds its keywords
+fn categorical(
+    factor: Arc<Factor>,
+    keywords: BTreeMap<String, ParameterValue>,
+) -> Result<Factor, TransformCallError> {
+    let (inputs, parameters) = match &factor.kind {
+        FactorKind::Call {
+            transform: transform @ Transform::C(_),
+            arguments,
+        } => (arguments.clone(), transform.parameters()),
+        _ => (vec![Arc::clone(&factor)], BTreeMap::new()),
+    };
+    let arguments = inputs
+        .into_iter()
+        .map(TransformCallArgument::Positional)
+        .chain(
+            parameters
+                .into_iter()
+                .map(|(name, value)| TransformCallArgument::Keyword {
+                    name: name.to_owned(),
+                    value,
+                }),
+        )
+        .chain(
+            keywords
+                .into_iter()
+                .map(|(name, value)| TransformCallArgument::Keyword { name, value }),
+        )
+        .collect();
+
+    Factor::try_from(TransformCall {
+        name: "C".to_owned(),
+        arguments,
     })
 }
 
@@ -1175,6 +1277,52 @@ mod tests {
             assert_eq!(formulas, parse(expected).unwrap(), "{source}");
             let rendered = formulas.iter().map(ToString::to_string).collect::<Vec<_>>();
             assert_eq!(rendered, [expected], "{source}");
+        }
+    }
+
+    #[test]
+    fn i_calls_lower_to_categorical_interactions() {
+        for (source, expected) in [
+            ("y ~ i(f)", "y ~ C(f)"),
+            ("y ~ i(f, x)", "y ~ C(f):x"),
+            ("y ~ i(f, x, omit='a')", "y ~ C(f, omit='a'):x"),
+            ("y ~ i(f, g, keep2=['b'])", "y ~ C(f):C(g, keep=['b'])"),
+            ("y ~ i(f, C(g), omit2='b')", "y ~ C(f):C(g, omit='b')"),
+            (
+                "y ~ i(C(f, bin={'ab': ['a', 'b']}), x, omit='ab')",
+                "y ~ C(f, bin={'ab': ['a', 'b']}, omit='ab'):x",
+            ),
+            (
+                "y ~ i(f, log(x), omit2=1.0)",
+                "y ~ C(f):C(log(x), omit=1.0)",
+            ),
+            (
+                "y ~ i(f, x):z + sw(i(f, x), w)",
+                "y ~ C(f):x:z + sw(C(f):x, w)",
+            ),
+        ] {
+            assert_eq!(parse(source).unwrap(), parse(expected).unwrap(), "{source}");
+        }
+    }
+
+    #[test]
+    fn i_calls_reject_invalid_arguments() {
+        for (source, message) in [
+            ("y ~ i()", "expected one or two arguments"),
+            ("y ~ i(f, x, z)", "expected one or two arguments"),
+            (
+                "y ~ i(f, -1)",
+                "the second argument must be a variable, received a literal: -1",
+            ),
+            ("y ~ i(f, omit2='b')", "`omit2` needs a second argument"),
+            (
+                "y ~ i(C(f, omit='a'), x, omit='b')",
+                "duplicate keyword `omit`",
+            ),
+            ("y ~ log(i(f))", "`i` can only be used as a term"),
+        ] {
+            let error = parse(source).unwrap_err().to_string();
+            assert!(error.contains(message), "{source}: {error}");
         }
     }
 

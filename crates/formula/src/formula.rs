@@ -277,7 +277,7 @@ impl Factor {
         }))
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match &self.kind {
             FactorKind::Variable(variable) => render_column_name(&variable.definition().name),
             FactorKind::Literal(value) => match value.as_any_value() {
