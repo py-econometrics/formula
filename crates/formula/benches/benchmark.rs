@@ -122,6 +122,7 @@ fn main() {
         ("integer", "y ~ a | g1"),
         ("integer_native", "y ~ a | g_cat"),
         ("interaction", "y ~ a:C(g1)"),
+        ("categorical_interaction", "y ~ C(g1):C(year)"),
         ("fixed_effects", "y ~ a*b + log(a) | firm + year:g1"),
     ] {
         results.samples.extend(measure_samples(
