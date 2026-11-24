@@ -10,8 +10,7 @@ use crate::transform::{
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PlSmallStr, PolarsResult,
-    Scalar,
+    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PolarsResult, Scalar,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -553,16 +552,18 @@ impl Term {
                     .clone()
                     .with_factor(Arc::clone(&result.factor)),
             );
-            if let TransformOutput::Indicator {
-                codes: factor_codes,
-                count,
-                ..
-            } = &result.output
-            {
-                codes.push(factor_codes);
-                counts.push(*count);
-            }
-            categorical.push(matches!(&result.output, TransformOutput::Indicator { .. }));
+            categorical.push(match &result.output {
+                TransformOutput::Indicator {
+                    codes: factor_codes,
+                    count,
+                    ..
+                } => {
+                    codes.push(factor_codes);
+                    counts.push(*count);
+                    true
+                }
+                TransformOutput::Columns(_) => false,
+            });
         }
 
         let combinations = if codes.len() < 2 {
@@ -601,44 +602,60 @@ impl Term {
         combination: &Column,
         combinations: &Combinations,
     ) -> Result<MaterializedColumns<ColumnMetadata>, TransformError> {
-        // Every interaction of one column from each factor, in the order of
-        // `Self::assemble_columns`. An interaction holds, for each factor, the index of its column
-        // among the factor's columns.
-        let mut interactions = vec![Vec::new()];
-        for columns in factor_columns {
-            interactions = interactions
-                .iter()
-                .flat_map(|interaction: &Vec<usize>| {
-                    (0..columns.metadata.len())
-                        .map(move |index| [interaction.as_slice(), &[index]].concat())
-                })
-                .collect();
-        }
-
-        // Each interaction's combination code, null if its combination wasn't observed when
-        // fitting. A categorical column's code is its index.
-        let interaction_codes = categorical
+        let categorical_positions: Vec<_> = categorical
             .iter()
             .enumerate()
-            .filter(|(_, is_categorical)| **is_categorical)
-            .map(|(factor, _)| {
-                let codes = interactions
-                    .iter()
-                    .map(|interaction| interaction[factor] as u32);
-                Column::new(PlSmallStr::EMPTY, codes.collect::<Vec<_>>())
-            })
-            .collect::<Vec<_>>();
-        let interaction_codes =
-            combinations.transform(&interaction_codes.iter().collect::<Vec<_>>())?;
+            .filter_map(|(position, &is_categorical)| is_categorical.then_some(position))
+            .collect();
+        let kept_counts: Vec<_> = categorical_positions
+            .iter()
+            .map(|&position| factor_columns[position].metadata.len() as u32)
+            .collect();
+        let observed = combinations.observed(&kept_counts)?;
+        let has_empty_factor = factor_columns
+            .iter()
+            .any(|factor| factor.metadata.is_empty());
+        if observed.is_empty() || has_empty_factor {
+            return Ok(MaterializedColumns::new(
+                DataFrame::empty_with_height(height),
+                Vec::new(),
+            ));
+        }
+
+        let mut numeric_choices = vec![vec![0; factor_columns.len()]];
+        for (position, factor) in factor_columns.iter().enumerate() {
+            if categorical[position] {
+                continue;
+            }
+            let mut choices = Vec::new();
+            for choice in &numeric_choices {
+                for index in 0..factor.metadata.len() {
+                    let mut indices = choice.clone();
+                    indices[position] = index;
+                    choices.push(indices);
+                }
+            }
+            numeric_choices = choices;
+        }
+
+        let mut interactions = Vec::new();
+        for (codes, joint_code) in observed {
+            for choice in &numeric_choices {
+                let mut indices = choice.clone();
+                for (&position, &code) in categorical_positions.iter().zip(&codes) {
+                    indices[position] = code as usize;
+                }
+                interactions.push((indices, joint_code));
+            }
+        }
+        // Order the interactions as `Self::assemble_columns` does
+        interactions.sort_unstable();
 
         let combination = combination.as_materialized_series();
         let mut columns = Vec::new();
         let mut metadata = Vec::new();
-        for (interaction, code) in interactions.iter().zip(interaction_codes.u64()?.iter()) {
-            let Some(code) = code else {
-                continue;
-            };
-            let mut column = combination.equal(code)?.into_column();
+        for (interaction, code) in &interactions {
+            let mut column = combination.equal(*code)?.into_column();
             let mut names = Vec::new();
             let mut contributions = Vec::new();
             for ((factor, index), is_categorical) in
@@ -2637,6 +2654,32 @@ mod tests {
                     "C(f)[a]:x:C(g)[v]" => [Some(5.0), None, None, None],
                     "C(f)[b]:x:C(g)[u]" => [Some(0.0), None, None, None],
                     "C(f)[c]:x:C(g)[v]" => [Some(0.0), None, None, None],
+                )
+                .unwrap(),
+            ),
+            // The columns of a numeric factor between categorical ones keep the product's order
+            (
+                "C(f):poly(x, 2, raw=true):C(g)",
+                polars::df!(
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [0.0, 4.0, 0.0, 0.0],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [0.0, 0.0, 9.0, 0.0],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [0.0, 0.0, 0.0, 4.0],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [0.0, 0.0, 0.0, 16.0],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [Some(5.0), None, None, None],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [Some(25.0), None, None, None],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [Some(0.0), None, None, None],
                 )
                 .unwrap(),
             ),

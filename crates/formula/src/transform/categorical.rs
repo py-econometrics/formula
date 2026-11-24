@@ -522,7 +522,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             });
         };
         let (parameter, selected) = selection.parameter();
-        let mut selected_indices = Vec::new();
+        let mut selected_columns = vec![false; columns.len()];
         for value in selected.as_slice() {
             let named_bin = columns.iter().position(|column| {
                 matches!(column, EncodedColumn::Bin { name, .. }
@@ -543,33 +543,26 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 }
             };
 
-            if !selected_indices.contains(&column) {
-                selected_indices.push(column);
-            }
+            selected_columns[column] = true;
         }
 
-        // `keep` omits every column it doesn't name
-        let omitted_indices = if let LevelSelection::Keep(_) = selection {
-            (0..columns.len())
-                .filter(|index| !selected_indices.contains(index))
-                .collect()
-        } else {
-            selected_indices
-        };
+        let keep_selected = matches!(selection, LevelSelection::Keep(_));
         // Move omitted columns after the kept ones, so a kept column's index is its output position
-        let (kept, omitted): (Vec<_>, Vec<_>) = columns
-            .into_iter()
-            .enumerate()
-            .partition(|(index, _)| !omitted_indices.contains(index));
+        let (mut kept, mut omitted) = (Vec::new(), Vec::new());
+        for (column, selected) in columns.into_iter().zip(selected_columns) {
+            if selected == keep_selected {
+                kept.push(column);
+            } else {
+                omitted.push(column);
+            }
+        }
+        let kept_count = kept.len();
+        kept.extend(omitted);
 
         Ok(CategoricalState {
             levels,
-            kept: kept.len(),
-            columns: kept
-                .into_iter()
-                .chain(omitted)
-                .map(|(_, column)| column)
-                .collect(),
+            kept: kept_count,
+            columns: kept,
         })
     }
 

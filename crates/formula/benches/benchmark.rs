@@ -20,6 +20,17 @@ fn sample_data(rows: usize) -> PolarsResult<DataFrame> {
         _ => Some(value),
     };
 
+    // Cycle through 1,000 distinct triples. Each factor spans all 100 levels.
+    let triple = |row: usize| {
+        let code = ((row % 1_000) * 613) % 1_000;
+        let level = (code % 100) as i32;
+        let offset = (code / 100) as i32;
+        (
+            level,
+            (level + offset) % 100,
+            (3 * level + 7 * offset) % 100,
+        )
+    };
     let mut data = df!(
         "y" => (0..rows).map(|i| numeric(i, i as f64)).collect::<Vec<_>>(),
         "a" => (0..rows).map(|i| numeric(i, 1.0 + (i % 100) as f64)).collect::<Vec<_>>(),
@@ -35,6 +46,9 @@ fn sample_data(rows: usize) -> PolarsResult<DataFrame> {
         }).collect::<Vec<_>>(),
         "firm" => (0..rows).map(|i| format!("firm_{}", i % 10_000)).collect::<Vec<_>>(),
         "year" => (0..rows).map(|i| 2000 + ((i / 10_000) % 20) as i32).collect::<Vec<_>>(),
+        "g_a" => (0..rows).map(|i| triple(i).0).collect::<Vec<_>>(),
+        "g_b" => (0..rows).map(|i| triple(i).1).collect::<Vec<_>>(),
+        "g_c" => (0..rows).map(|i| triple(i).2).collect::<Vec<_>>(),
     )?;
     let categorical = data
         .column("g1")?
@@ -123,6 +137,10 @@ fn main() {
         ("integer_native", "y ~ a | g_cat"),
         ("interaction", "y ~ a:C(g1)"),
         ("categorical_interaction", "y ~ C(g1):C(year)"),
+        (
+            "categorical_interaction_three_way_sparse",
+            "y ~ C(g_a):C(g_b):C(g_c) - 1",
+        ),
         ("fixed_effects", "y ~ a*b + log(a) | firm + year:g1"),
     ] {
         results.samples.extend(measure_samples(
