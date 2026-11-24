@@ -59,14 +59,11 @@ as a fixed effect using pipe syntax. Their `_native` counterparts use a
 categorical copy of the same column.
 Categorical conversion happens during data construction, outside timing.
 
-The thirteen workloads cover numeric interactions, expression transforms, raw and
+The twelve workloads cover numeric interactions, expression transforms, raw and
 orthogonal degree-3 polynomials, categorical encoding, integer encoding,
 numeric-by-categorical interactions, and categorical-by-categorical interactions.
 Categorical and integer encoding each retain string and native-categorical inputs
-because they exercise different code paths. The `categorical_interaction_three_way_sparse`
-workload uses three factors with 100 levels each. For runs with at least 1,000 rows,
-the input contains 1,000 distinct triples out of 1,000,000 possible combinations,
-so the interaction emits 1,000 columns.
+because they exercise different code paths.
 The `fixed_effects` workload combines numeric controls, their interaction, and a
 log transform with firm and year-by-group fixed effects:
 `y ~ a*b + log(a) | firm + year:g1`. The panel-like inputs contain up to 10,000
