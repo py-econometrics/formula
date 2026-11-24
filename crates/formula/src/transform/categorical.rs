@@ -5,7 +5,7 @@ use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar,
+    AnyValue, DataFrame, DataType, IntoLazy, IntoSeries, NULL, PlSmallStr, Scalar, Series,
     SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
@@ -178,7 +178,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
     fn fit(&self, inputs: &PreparedInput) -> Result<CategoricalState, TransformError> {
         let (_, input) = inputs.single()?;
         // Sort levels: numbers by value, strings and categoricals by label, enums by category
-        let levels = input.drop_nulls().unique()?.sort(SortOptions::default())?;
+        let levels = input
+            .drop_nulls()
+            .unique()?
+            .sort(SortOptions::default())?
+            .take_materialized_series();
         // Prevent encoding nonfinite floats as a category
         let levels = if levels.dtype().is_float() {
             levels.filter(&levels.is_finite()?)?
@@ -283,7 +287,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
 
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
-    levels: Column,
+    levels: Series,
     reference_indices: Vec<usize>,
 }
 
@@ -292,7 +296,7 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
-    use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+    use polars::prelude::{CategoricalPhysical, Categories, Column, FrozenCategories};
 
     fn native_dtypes() -> Vec<DataType> {
         let categorical = DataType::from_categories(Categories::random(

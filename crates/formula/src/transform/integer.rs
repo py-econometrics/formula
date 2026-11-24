@@ -6,8 +6,8 @@ use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::state::ExportState;
 use polars::frame::UniqueKeepStrategy;
 use polars::prelude::{
-    Column, DataFrame, DataType, Field, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin, NULL,
-    all_horizontal, col, dtype_cols, lit, when,
+    DataFrame, DataType, Field, IntoColumn, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin,
+    NULL, Series, all_horizontal, col, dtype_cols, lit, when,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub struct IntegerEncodingState {
 #[derive(Clone, Debug)]
 enum IntegerEncoding {
     Mapping(DataFrame),
-    Native(Column),
+    Native(Series),
 }
 
 impl IntegerEncodingDefinition {
@@ -113,7 +113,12 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
         {
             return Ok(IntegerEncodingState {
                 fields: inputs.fields.clone(),
-                encoding: IntegerEncoding::Native(input.drop_nulls().unique_stable()?),
+                encoding: IntegerEncoding::Native(
+                    input
+                        .drop_nulls()
+                        .unique_stable()?
+                        .take_materialized_series(),
+                ),
             });
         }
 
@@ -213,7 +218,8 @@ impl IntegerEncodingState {
             IntegerEncoding::Native(levels) => levels
                 .to_physical_repr()
                 .cast(&DataType::UInt32)
-                .expect("categorical codes can be widened to UInt32"),
+                .expect("categorical codes can be widened to UInt32")
+                .into_column(),
         };
 
         codes.with_name("code".into()).into_frame()
@@ -258,7 +264,7 @@ mod tests {
     use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
     use polars::error::PolarsError;
-    use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+    use polars::prelude::{CategoricalPhysical, Categories, Column, FrozenCategories};
 
     fn prepare(inputs: &[Column]) -> PreparedInput {
         PreparedInput::new(inputs, true).unwrap()
