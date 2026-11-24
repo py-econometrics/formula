@@ -860,8 +860,6 @@ impl TryFrom<TransformCall> for Factor {
                 reject_keywords("C", keywords)?;
                 let bins = match bins {
                     None => None,
-                    // `bin={}` merges nothing, so it is normalised away
-                    Some(ParameterValue::Map(bins)) if bins.is_empty() => None,
                     Some(ParameterValue::Map(bins)) => Some(
                         bins.into_iter()
                             .map(|(name, members)| match Levels::try_from(members) {

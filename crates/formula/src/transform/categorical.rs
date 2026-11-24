@@ -76,6 +76,8 @@ impl CategoricalDefinition {
         selection: Option<LevelSelection>,
         bins: Option<Vec<(PlSmallStr, Levels)>>,
     ) -> Self {
+        // `bin={}` merges nothing, so an empty dict means no `bin`
+        let bins = bins.filter(|bins| !bins.is_empty());
         Self { selection, bins }
     }
 
