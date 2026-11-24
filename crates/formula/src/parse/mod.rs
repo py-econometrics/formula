@@ -781,9 +781,9 @@ pub(crate) fn parse_term(source: &str, role: Role) -> ParseResult<'_, Expression
 impl TryFrom<TransformCall> for Factor {
     type Error = TransformCallError;
 
-    fn try_from(call: TransformCall) -> std::result::Result<Self, Self::Error> {
+    fn try_from(call: TransformCall) -> Result<Self, Self::Error> {
         let mut arguments = Vec::new();
-        let mut keywords = BTreeMap::new();
+        let mut keywords = Keywords::default();
         let mut saw_keyword = false;
 
         for (index, argument) in call.arguments.into_iter().enumerate() {
@@ -798,53 +798,50 @@ impl TryFrom<TransformCall> for Factor {
                 }
                 TransformCallArgument::Keyword { name, value } => {
                     saw_keyword = true;
-                    if keywords.contains_key(&name) {
-                        return Err(TransformCallError::DuplicateKeyword { name });
-                    }
-                    keywords.insert(name, value);
+                    keywords.insert(name, value)?;
                 }
             }
         }
 
         let transform = match call.name.as_str() {
             "log" => {
-                reject_keywords("log", keywords)?;
+                keywords.reject_unexpected("log")?;
                 Transform::Expression(ExpressionTransform::LOG)
             }
             "exp" => {
-                reject_keywords("exp", keywords)?;
+                keywords.reject_unexpected("exp")?;
                 Transform::Expression(ExpressionTransform::EXP)
             }
             "sqrt" => {
-                reject_keywords("sqrt", keywords)?;
+                keywords.reject_unexpected("sqrt")?;
                 Transform::Expression(ExpressionTransform::SQRT)
             }
             "add" => {
-                reject_keywords("add", keywords)?;
+                keywords.reject_unexpected("add")?;
                 Transform::Expression(ExpressionTransform::ADD)
             }
             "sub" => {
-                reject_keywords("sub", keywords)?;
+                keywords.reject_unexpected("sub")?;
                 Transform::Expression(ExpressionTransform::SUB)
             }
             "mul" => {
-                reject_keywords("mul", keywords)?;
+                keywords.reject_unexpected("mul")?;
                 Transform::Expression(ExpressionTransform::MUL)
             }
             "div" => {
-                reject_keywords("div", keywords)?;
+                keywords.reject_unexpected("div")?;
                 Transform::Expression(ExpressionTransform::DIV)
             }
             "pow" => {
-                reject_keywords("pow", keywords)?;
+                keywords.reject_unexpected("pow")?;
                 Transform::Expression(ExpressionTransform::POW)
             }
             "center" => {
-                reject_keywords("center", keywords)?;
+                keywords.reject_unexpected("center")?;
                 Transform::Standardize(Fit::Unfitted(StandardizeDefinition::CENTER))
             }
             "scale" => {
-                reject_keywords("scale", keywords)?;
+                keywords.reject_unexpected("scale")?;
                 Transform::Standardize(Fit::Unfitted(StandardizeDefinition::SCALE))
             }
             "C" => {
@@ -857,7 +854,7 @@ impl TryFrom<TransformCall> for Factor {
                     );
                 let keep = keywords.remove(CategoricalDefinition::KEEP_PARAMETER);
                 let bins = keywords.remove(CategoricalDefinition::BIN_PARAMETER);
-                reject_keywords("C", keywords)?;
+                keywords.reject_unexpected("C")?;
                 let bins = match bins {
                     None => None,
                     Some(ParameterValue::Map(bins)) => Some(
@@ -957,7 +954,7 @@ impl TryFrom<TransformCall> for Factor {
                 };
 
                 let raw = keywords.remove(PolynomialDefinition::RAW_PARAMETER);
-                reject_keywords("poly", keywords)?;
+                keywords.reject_unexpected("poly")?;
 
                 let definition = PolynomialDefinition::new(degree, raw).map_err(|error| {
                     TransformCallError::InvalidParameter {
@@ -980,17 +977,33 @@ impl TryFrom<TransformCall> for Factor {
     }
 }
 
-fn reject_keywords(
-    transform: &'static str,
-    keywords: BTreeMap<String, ParameterValue>,
-) -> Result<(), TransformCallError> {
-    if keywords.is_empty() {
+#[derive(Default)]
+struct Keywords {
+    mapping: BTreeMap<String, ParameterValue>,
+}
+
+impl Keywords {
+    fn insert(&mut self, name: String, value: ParameterValue) -> Result<(), TransformCallError> {
+        if self.mapping.contains_key(&name) {
+            return Err(TransformCallError::DuplicateKeyword { name });
+        }
+        self.mapping.insert(name, value);
         Ok(())
-    } else {
-        Err(TransformCallError::UnexpectedKeywords {
-            transform,
-            keywords: keywords.into_keys().collect(),
-        })
+    }
+
+    fn remove(&mut self, name: &str) -> Option<ParameterValue> {
+        self.mapping.remove(name)
+    }
+
+    fn reject_unexpected(self, transform: &'static str) -> Result<(), TransformCallError> {
+        if self.mapping.is_empty() {
+            Ok(())
+        } else {
+            Err(TransformCallError::UnexpectedKeywords {
+                transform,
+                keywords: self.mapping.into_keys().collect(),
+            })
+        }
     }
 }
 
