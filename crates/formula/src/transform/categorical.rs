@@ -130,7 +130,7 @@ impl CategoricalDefinition {
         // Get the dtype of the level provided
         let source = level.dtype();
         // Check compatibility with and convert to dtype
-        let level = match (source, dtype) {
+        let converted = match (source, dtype) {
             // Source and target dtype match
             (source, target) if source == target => level.clone(),
             // Target is Categorical/Enum; check if level is in observed levels
@@ -139,7 +139,8 @@ impl CategoricalDefinition {
                 let label = value.str_value();
                 let code = mapping.get_cat(label.as_ref()).ok_or_else(|| {
                     TransformError::InvalidParameter(format!(
-                        "`{parameter}` value is not among the fitted levels"
+                        "`{parameter}` value {} is not among the fitted levels",
+                        Self::value_name(level),
                     ))
                 })?;
 
@@ -164,18 +165,22 @@ impl CategoricalDefinition {
             // Level not compatible with target dtype
             _ => {
                 return Err(TransformError::InvalidParameter(format!(
-                    "`{parameter}` dtype {source:?} is incompatible with input dtype {dtype:?}"
+                    "`{parameter}` value {} has dtype {source:?}, which is incompatible with input dtype {dtype:?}",
+                    Self::value_name(level),
                 )));
             }
         };
 
-        if level.dtype().is_float() && !level.as_any_value().try_extract::<f64>()?.is_finite() {
+        if converted.dtype().is_float()
+            && !converted.as_any_value().try_extract::<f64>()?.is_finite()
+        {
             return Err(TransformError::InvalidParameter(format!(
-                "`{parameter}` must be finite after conversion to the input dtype"
+                "`{parameter}` value {} must be finite after conversion to the input dtype",
+                Self::value_name(level),
             )));
         }
 
-        Ok(level)
+        Ok(converted)
     }
 
     /// Return `value`'s position in `levels`
@@ -184,17 +189,18 @@ impl CategoricalDefinition {
         value: &Scalar,
         levels: &Series,
     ) -> Result<usize, TransformError> {
-        let value = Self::convert_level(parameter, value, levels.dtype())?;
+        let converted = Self::convert_level(parameter, value, levels.dtype())?;
         (0..levels.len())
             .find_map(|index| match levels.get(index) {
-                Ok(level) if level == value.as_any_value() => Some(Ok(index)),
+                Ok(level) if level == converted.as_any_value() => Some(Ok(index)),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             })
             .transpose()?
             .ok_or_else(|| {
                 TransformError::InvalidParameter(format!(
-                    "`{parameter}` value is not among the fitted levels"
+                    "`{parameter}` value {} is not among the fitted levels",
+                    Self::value_name(value),
                 ))
             })
     }
@@ -229,7 +235,7 @@ impl CategoricalDefinition {
                         let (other_name, _) = &bins[other];
                         return Err(TransformError::InvalidParameter(format!(
                             "level {} is in bins '{other_name}' and '{name}'",
-                            Self::level_name(&fitted_levels[index]),
+                            Self::value_name(member),
                         )));
                     }
                 }
@@ -395,7 +401,8 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                     let column = level_columns[Self::level_index(parameter, value, &levels)?];
                     if let EncodedColumn::Bin { name, .. } = &columns[column] {
                         return Err(TransformError::InvalidParameter(format!(
-                            "`{parameter}` value is merged into bin '{name}'"
+                            "`{parameter}` value {} is merged into bin '{name}'",
+                            Self::value_name(value),
                         )));
                     }
                     column
@@ -683,7 +690,7 @@ mod tests {
             assert!(matches!(error, TransformError::InvalidParameter(_)));
             assert_eq!(
                 error.to_string(),
-                "`omit` value is not among the fitted levels"
+                "`omit` value 'a' is not among the fitted levels"
             );
         }
         Ok(())
@@ -1229,7 +1236,7 @@ mod tests {
         assert!(matches!(error, TransformError::InvalidParameter(_)));
         assert_eq!(
             error.to_string(),
-            "`keep` value is not among the fitted levels"
+            "`keep` value 'missing' is not among the fitted levels"
         );
     }
 
@@ -1589,7 +1596,7 @@ mod tests {
         )
         .fit(&training)
         .unwrap_err();
-        assert_eq!(error.to_string(), "`omit` value is merged into bin '1'");
+        assert_eq!(error.to_string(), "`omit` value 1 is merged into bin '1'");
         Ok(())
     }
 
@@ -1606,12 +1613,12 @@ mod tests {
             (
                 vec![bin("ab", &["a", "missing"])],
                 None,
-                "`bin` value is not among the fitted levels",
+                "`bin` value 'missing' is not among the fitted levels",
             ),
             (
                 vec![bin("ab", &["a", "b"]), bin("bc", &["b", "c"])],
                 None,
-                "level b is in bins 'ab' and 'bc'",
+                "level 'b' is in bins 'ab' and 'bc'",
             ),
             (
                 vec![bin("c", &["a", "b"])],
@@ -1621,7 +1628,7 @@ mod tests {
             (
                 vec![bin("ab", &["a", "b"])],
                 Some(LevelSelection::Keep(Levels::Scalar(text("b")))),
-                "`keep` value is merged into bin 'ab'",
+                "`keep` value 'b' is merged into bin 'ab'",
             ),
         ] {
             let error = CategoricalDefinition::new(selection, Some(bins))

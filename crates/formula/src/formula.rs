@@ -2354,7 +2354,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "C(`group name`, omit='missing'): `omit` value is not among the fitted levels",
+            "C(`group name`, omit='missing'): `omit` value 'missing' is not among the fitted levels",
         );
     }
 
