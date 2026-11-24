@@ -2585,6 +2585,86 @@ mod tests {
     }
 
     #[test]
+    fn categorical_interactions_encode_only_observed_combinations() {
+        // (b, v) and (c, u) aren't observed when fitting
+        let training = polars::df!(
+            "y" => [1.0, 2.0, 3.0, 4.0],
+            "f" => ["a", "a", "b", "c"],
+            "g" => ["u", "v", "u", "v"],
+            "x" => [1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        // (a, v) was observed when fitting, (b, v) and (c, u) weren't, and `d` is an unseen level
+        let input = polars::df!(
+            "y" => [1.0, 2.0, 3.0, 4.0],
+            "f" => ["a", "b", "c", "d"],
+            "g" => ["v", "v", "u", "u"],
+            "x" => [5.0, 6.0, 7.0, 8.0],
+        )
+        .unwrap();
+
+        for (source, expected_fit, expected_transform) in [
+            // Categorical columns combine into boolean columns
+            (
+                "C(f):C(g)",
+                polars::df!(
+                    "C(f)[a]:C(g)[u]" => [true, false, false, false],
+                    "C(f)[a]:C(g)[v]" => [false, true, false, false],
+                    "C(f)[b]:C(g)[u]" => [false, false, true, false],
+                    "C(f)[c]:C(g)[v]" => [false, false, false, true],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f)[a]:C(g)[u]" => [Some(false), None, None, None],
+                    "C(f)[a]:C(g)[v]" => [Some(true), None, None, None],
+                    "C(f)[b]:C(g)[u]" => [Some(false), None, None, None],
+                    "C(f)[c]:C(g)[v]" => [Some(false), None, None, None],
+                )
+                .unwrap(),
+            ),
+            // A numeric factor multiplies them into float columns
+            (
+                "C(f):x:C(g)",
+                polars::df!(
+                    "C(f)[a]:x:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:x:C(g)[v]" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[b]:x:C(g)[u]" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[c]:x:C(g)[v]" => [0.0, 0.0, 0.0, 4.0],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f)[a]:x:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:x:C(g)[v]" => [Some(5.0), None, None, None],
+                    "C(f)[b]:x:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:x:C(g)[v]" => [Some(0.0), None, None, None],
+                )
+                .unwrap(),
+            ),
+            // Omitted levels keep distinct codes: (c, u) is unseen although (a, u) was observed
+            (
+                "C(f, omit=['a', 'c']):C(g)",
+                polars::df!(
+                    "C(f, omit=['a', 'c'])[b]:C(g)[u]" => [false, false, true, false],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f, omit=['a', 'c'])[b]:C(g)[u]" => [Some(false), None, None, None],
+                )
+                .unwrap(),
+            ),
+        ] {
+            let fitted = fit(&format!("y ~ {source} - 1"), &training);
+            let transformed = fitted.transform(&input).unwrap();
+
+            for (model, expected) in [(&fitted, expected_fit), (&transformed, expected_transform)] {
+                let frame = model.expression(Role::Independent).unwrap().frame();
+                assert!(frame.equals_missing(&expected), "{source}");
+                assert_eq!(frame.dtypes(), expected.dtypes(), "{source}");
+            }
+        }
+    }
+
+    #[test]
     fn transformation_requires_exact_dtypes_for_bare_and_transformed_inputs() {
         let training = polars::df!("y" => [1.0, 2.0], "x" => [2_i32, 3]).unwrap();
         let changed = [

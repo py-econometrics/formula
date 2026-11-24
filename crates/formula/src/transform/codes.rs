@@ -1,7 +1,7 @@
 use polars::prelude::{
     Column, DataFrame, DataType, IntoLazy, IntoSeries, JoinType, MaintainOrderJoin, NULL,
-    PolarsResult, Series, SortOptions, UniqueKeepStrategy, all_horizontal, col, dtype_cols, lit,
-    polars_ensure, when,
+    PolarsResult, Series, UniqueKeepStrategy, all_horizontal, col, dtype_cols, lit, polars_ensure,
+    when,
 };
 
 /// The column of a mapping frame that holds each tuple's code
@@ -85,9 +85,7 @@ impl Combinations {
         let observed = combine_codes(codes, &counts)?
             .drop_nulls()
             .unique()?
-            .take_materialized_series()
-            .sort(SortOptions::default())?
-            .rechunk();
+            .take_materialized_series();
         Ok(Self { counts, observed })
     }
 
