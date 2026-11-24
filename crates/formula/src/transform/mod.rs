@@ -7,7 +7,9 @@ mod polynomial;
 mod standardize;
 pub mod state;
 
-pub(crate) use categorical::{CategoricalDefinition, LevelSelection, Levels};
+pub(crate) use categorical::CategoricalDefinition;
+#[cfg(test)]
+pub(crate) use categorical::{LevelSelection, Levels};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
@@ -308,7 +310,7 @@ mod tests {
         let inputs = [Column::new("x".into(), [1.0, 2.0, 1.0])];
         for transform in [
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(None, None))),
-            Transform::Poly(Fit::Unfitted(PolynomialDefinition::new(
+            Transform::Poly(Fit::Unfitted(PolynomialDefinition::from_parameters(
                 None,
                 Some(ParameterValue::Scalar(Scalar::from(true))),
             )?)),

@@ -81,6 +81,72 @@ impl CategoricalDefinition {
         Self { selection, bins }
     }
 
+    pub(crate) fn from_parameters(
+        omit: Option<ParameterValue>,
+        keep: Option<ParameterValue>,
+        bins: Option<ParameterValue>,
+    ) -> Result<Self, TransformError> {
+        // `omit=[]` omits nothing, so it is normalised away; we do this here to support
+        // a non-empty `keep` with an `empty` omit
+        let omit =
+            omit.filter(|omit| !matches!(omit, ParameterValue::List(levels) if levels.is_empty()));
+        let bins = match bins {
+            None => None,
+            Some(ParameterValue::Map(bins)) => Some(
+                bins.into_iter()
+                    .map(|(name, members)| match Levels::try_from(members) {
+                        // An empty bin would encode a column without any levels
+                        Ok(Levels::List(levels)) if levels.is_empty() => {
+                            Err(TransformError::InvalidParameter(format!(
+                                "bin '{name}' must name at least one level"
+                            )))
+                        }
+                        Ok(members) => Ok((name, members)),
+                        Err(_) => Err(TransformError::InvalidParameter(format!(
+                            "bin '{name}' must be a scalar or a list"
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Some(_) => {
+                return Err(TransformError::InvalidParameter(
+                    "`bin` must be a dict".into(),
+                ));
+            }
+        };
+        let selection = match (omit, keep) {
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(TransformError::InvalidParameter(
+                    "`omit` and `keep` are mutually exclusive".into(),
+                ));
+            }
+            (Some(omit), None) => match Levels::try_from(omit) {
+                Ok(omit) => Some(LevelSelection::Omit(omit)),
+                Err(_) => {
+                    return Err(TransformError::InvalidParameter(
+                        "`omit` must be a scalar or a list".into(),
+                    ));
+                }
+            },
+            (None, Some(keep)) => match Levels::try_from(keep) {
+                // Keeping no levels would leave a term without columns
+                Ok(Levels::List(levels)) if levels.is_empty() => {
+                    return Err(TransformError::InvalidParameter(
+                        "`keep` must name at least one level".into(),
+                    ));
+                }
+                Ok(keep) => Some(LevelSelection::Keep(keep)),
+                Err(_) => {
+                    return Err(TransformError::InvalidParameter(
+                        "`keep` must be a scalar or a list".into(),
+                    ));
+                }
+            },
+        };
+        Ok(Self::new(selection, bins))
+    }
+
     fn levels_name(levels: &Levels) -> String {
         match levels {
             Levels::Scalar(level) => Self::value_name(level),

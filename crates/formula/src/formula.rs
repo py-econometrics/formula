@@ -3462,7 +3462,7 @@ mod tests {
     fn polynomial_requires_exactly_one_argument() {
         assert_requires_one_argument(|| {
             Transform::Poly(Fit::Unfitted(
-                PolynomialDefinition::new(None, None).unwrap(),
+                PolynomialDefinition::from_parameters(None, None).unwrap(),
             ))
         });
     }
