@@ -4,12 +4,15 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, CategoricalDefinition, GroupedTransform, IntegerEncodingDefinition,
-    IntegerEncodingState, ParameterValue, Transform, TransformError, TransformOutput,
-    validate_numeric_field,
+    ArgumentCount, CategoricalDefinition, Combinations, GroupedTransform,
+    IntegerEncodingDefinition, IntegerEncodingState, ParameterValue, Transform, TransformError,
+    TransformOutput, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
-use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
+use polars::prelude::{
+    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PlSmallStr, PolarsResult,
+    Scalar,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use winnow::Parser;
@@ -325,6 +328,8 @@ impl<'a> TransformCall<'a> {
 #[derive(Clone, Debug)]
 pub struct Term {
     factors: Vec<Arc<Factor>>,
+    /// Interactions of categorical factor codes observed during fitting
+    combinations: Option<Combinations>,
 }
 
 // Interaction identity ignores factor order: a:b equals b:a.
@@ -344,6 +349,7 @@ impl FromIterator<Arc<Factor>> for Term {
     fn from_iter<T: IntoIterator<Item = Arc<Factor>>>(factors: T) -> Self {
         Self {
             factors: collect_unique(factors),
+            combinations: None,
         }
     }
 }
@@ -411,7 +417,10 @@ impl Term {
     }
 
     pub(crate) fn intercept() -> Self {
-        Self { factors: vec![] }
+        Self {
+            factors: vec![],
+            combinations: None,
+        }
     }
 
     pub(crate) fn as_factor(&self) -> Option<&Factor> {
@@ -525,6 +534,9 @@ impl Term {
     ) -> Result<(Self, MaterializedColumns<ColumnMetadata>), TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
+        let mut categorical = Vec::with_capacity(self.factors.len());
+        let mut codes = Vec::new();
+        let mut counts = Vec::new();
         for factor in &self.factors {
             let result = lookup_factor(transformed, factor);
             if let FactorKind::Variable(_) = &factor.kind {
@@ -541,12 +553,113 @@ impl Term {
                     .clone()
                     .with_factor(Arc::clone(&result.factor)),
             );
+            if let TransformOutput::Indicator {
+                codes: factor_codes,
+                count,
+                ..
+            } = &result.output
+            {
+                codes.push(factor_codes);
+                counts.push(*count);
+            }
+            categorical.push(matches!(&result.output, TransformOutput::Indicator { .. }));
         }
 
-        let columns = self.assemble_columns(height, factor_columns)?;
-        let term = Self { factors };
+        let combinations = if codes.len() < 2 {
+            // No need to check seen combinations if there are fewer than 2 categorical factors
+            None
+        } else if let Some(combinations) = &self.combinations {
+            // If term is fitted, combinations are `Some`
+            Some(combinations.clone())
+        } else {
+            // Otherwise fit
+            Some(Combinations::fit(&codes, counts)?)
+        };
+        let columns = match &combinations {
+            None => self.assemble_columns(height, factor_columns)?,
+            Some(combinations) => Self::assemble_combinations(
+                height,
+                &factor_columns,
+                &categorical,
+                &combinations.transform(&codes)?,
+                combinations,
+            )?,
+        };
+        let term = Self {
+            factors,
+            combinations,
+        };
 
         Ok((term, columns))
+    }
+
+    /// The columns of a term with two or more categorical factors
+    fn assemble_combinations(
+        height: usize,
+        factor_columns: &[MaterializedColumns<ColumnMetadata>],
+        categorical: &[bool],
+        combination: &Column,
+        combinations: &Combinations,
+    ) -> Result<MaterializedColumns<ColumnMetadata>, TransformError> {
+        // Every interaction of one column from each factor, in the order of
+        // `Self::assemble_columns`. An interaction holds, for each factor, the index of its column
+        // among the factor's columns.
+        let mut interactions = vec![Vec::new()];
+        for columns in factor_columns {
+            interactions = interactions
+                .iter()
+                .flat_map(|interaction: &Vec<usize>| {
+                    (0..columns.metadata.len())
+                        .map(move |index| [interaction.as_slice(), &[index]].concat())
+                })
+                .collect();
+        }
+
+        // Each interaction's combination code, null if its combination wasn't observed when
+        // fitting. A categorical column's code is its index.
+        let interaction_codes = categorical
+            .iter()
+            .enumerate()
+            .filter(|(_, is_categorical)| **is_categorical)
+            .map(|(factor, _)| {
+                let codes = interactions
+                    .iter()
+                    .map(|interaction| interaction[factor] as u32);
+                Column::new(PlSmallStr::EMPTY, codes.collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        let interaction_codes =
+            combinations.transform(&interaction_codes.iter().collect::<Vec<_>>())?;
+
+        let combination = combination.as_materialized_series();
+        let mut columns = Vec::new();
+        let mut metadata = Vec::new();
+        for (interaction, code) in interactions.iter().zip(interaction_codes.u64()?.iter()) {
+            let Some(code) = code else {
+                continue;
+            };
+            let mut column = combination.equal(code)?.into_column();
+            let mut names = Vec::new();
+            let mut contributions = Vec::new();
+            for ((factor, index), is_categorical) in
+                factor_columns.iter().zip(interaction).zip(categorical)
+            {
+                let factor_column = &factor.frame().columns()[*index];
+                if !is_categorical {
+                    column = (&column.cast(&DataType::Float64)?
+                        * &factor_column.cast(&DataType::Float64)?)?;
+                }
+                names.push(factor_column.name().as_str());
+                contributions.extend(factor.metadata[*index].contributions.iter().cloned());
+            }
+            columns.push(column.with_name(names.join(":").into()));
+            metadata.push(ColumnMetadata { contributions });
+        }
+
+        Ok(MaterializedColumns::new(
+            DataFrame::new(height, columns)?,
+            metadata,
+        ))
     }
 }
 

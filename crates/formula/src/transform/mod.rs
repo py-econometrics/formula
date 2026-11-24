@@ -11,6 +11,7 @@ pub mod state;
 pub(crate) use categorical::CategoricalDefinition;
 #[cfg(test)]
 pub(crate) use categorical::{LevelSelection, Levels};
+pub(crate) use codes::Combinations;
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
