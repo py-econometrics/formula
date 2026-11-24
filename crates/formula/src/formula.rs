@@ -1375,7 +1375,7 @@ mod tests {
     use crate::parse::parse_expression;
     use crate::transform::{
         CategoricalDefinition, ExpressionTransform, IntegerEncodingDefinition, LevelSelection,
-        PolynomialDefinition,
+        Levels, PolynomialDefinition,
     };
     use polars::prelude::Scalar;
     use winnow::Parser;
@@ -3474,7 +3474,7 @@ mod tests {
 
         assert_requires_one_argument(|| {
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                LevelSelection::Omit(ParameterValue::Scalar(Scalar::from(1_i64))),
+                LevelSelection::Omit(Levels::Scalar(Scalar::from(1_i64))),
             ))))
         });
     }

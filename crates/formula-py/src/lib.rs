@@ -357,18 +357,7 @@ impl TransformCall {
         let parameters = PyDict::new(py);
 
         for (name, value) in &self.parameters {
-            match value {
-                formula::ParameterValue::Scalar(value) => {
-                    parameters.set_item(name, scalar_to_python(py, value)?)?;
-                }
-                formula::ParameterValue::List(values) => {
-                    let values = values
-                        .iter()
-                        .map(|value| scalar_to_python(py, value))
-                        .collect::<PyResult<Vec<_>>>()?;
-                    parameters.set_item(name, PyList::new(py, values)?)?;
-                }
-            }
+            parameters.set_item(name, parameter_to_python(py, value)?)?;
         }
 
         Ok(parameters)
@@ -631,6 +620,26 @@ impl FactorContribution {
     #[getter]
     fn key(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         component_key_to_python(py, &self.key)
+    }
+}
+
+fn parameter_to_python(py: Python<'_>, value: &formula::ParameterValue) -> PyResult<Py<PyAny>> {
+    match value {
+        formula::ParameterValue::Scalar(value) => scalar_to_python(py, value),
+        formula::ParameterValue::List(values) => {
+            let values = values
+                .iter()
+                .map(|value| scalar_to_python(py, value))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, values)?.into_any().unbind())
+        }
+        formula::ParameterValue::Map(entries) => {
+            let map = PyDict::new(py);
+            for (name, value) in entries {
+                map.set_item(name.as_str(), parameter_to_python(py, value)?)?;
+            }
+            Ok(map.into_any().unbind())
+        }
     }
 }
 

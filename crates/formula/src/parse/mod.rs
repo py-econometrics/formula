@@ -8,11 +8,11 @@ use crate::formula::{Factor, Formula, Formulas, push_unique};
 use crate::parse::ast::{Compose, StepwiseOperator};
 use crate::parse::expand::Expand;
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, LevelSelection, ParameterValue,
+    CategoricalDefinition, ExpressionTransform, LevelSelection, Levels, ParameterValue,
     PolynomialDefinition, StandardizeDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use winnow::ascii::{Caseless, multispace0};
 use winnow::combinator::Infix::{Left, Right};
@@ -53,6 +53,9 @@ enum TransformCallError {
     DuplicateKeyword {
         name: String,
     },
+    DuplicateName {
+        name: String,
+    },
     PositionalAfterKeyword {
         position: usize,
     },
@@ -71,6 +74,9 @@ impl std::fmt::Display for TransformCallError {
         match self {
             Self::DuplicateKeyword { name } => {
                 write!(f, "duplicate keyword `{name}`")
+            }
+            Self::DuplicateName { name } => {
+                write!(f, "duplicate name '{name}'")
             }
             Self::PositionalAfterKeyword { position } => {
                 write!(
@@ -104,7 +110,7 @@ pub(crate) fn is_identifier_character(c: char) -> bool {
 }
 
 fn is_argument_boundary(c: char) -> bool {
-    c.is_whitespace() || matches!(c, ',' | ')' | ']')
+    c.is_whitespace() || matches!(c, ',' | ')' | ']' | '}')
 }
 
 fn parse_bare_token<'i>(cursor: &mut &'i str) -> ModalResult<&'i str> {
@@ -129,20 +135,68 @@ pub(crate) fn parse_scalar(cursor: &mut &str) -> ModalResult<Scalar> {
 
 fn parse_parameter_value(cursor: &mut &str) -> ModalResult<ParameterValue> {
     alt((
-        preceded(
-            ('[', multispace0),
-            cut_err(terminated(
-                separated(0.., parse_scalar, (multispace0, ',', multispace0)),
-                (multispace0, ']'),
-            )),
-        )
-        .map(ParameterValue::List),
+        parse_parameter_map.map(ParameterValue::Map),
+        parse_parameter_list.map(ParameterValue::List),
         parse_scalar.map(ParameterValue::Scalar),
     ))
     .parse_next(cursor)
 }
 
-fn parse_literal_string(cursor: &mut &str) -> ModalResult<Scalar> {
+fn parse_parameter_list(cursor: &mut &str) -> ModalResult<Vec<Scalar>> {
+    preceded(
+        ('[', multispace0),
+        cut_err(terminated(
+            separated(0.., parse_scalar, (multispace0, ',', multispace0)),
+            (multispace0, ']'),
+        )),
+    )
+    .parse_next(cursor)
+}
+
+fn parse_parameter_map(cursor: &mut &str) -> ModalResult<Vec<(PlSmallStr, ParameterValue)>> {
+    let entry = (
+        parse_single_quoted.context(StrContext::Expected(StrContextValue::Description(
+            "a single-quoted name",
+        ))),
+        cut_err(preceded(
+            (
+                multispace0,
+                ':'.context(StrContext::Expected(StrContextValue::CharLiteral(':'))),
+                multispace0,
+            ),
+            parse_parameter_value,
+        )),
+    )
+        .map(|(name, value)| (PlSmallStr::from(name), value));
+
+    preceded(
+        ('{', multispace0),
+        cut_err(
+            alt((
+                '}'.value(Vec::new()),
+                terminated(
+                    separated(1.., entry, (multispace0, ',', multispace0)),
+                    (
+                        multispace0,
+                        '}'.context(StrContext::Expected(StrContextValue::CharLiteral('}'))),
+                    ),
+                ),
+            ))
+            .try_map(|entries: Vec<(PlSmallStr, ParameterValue)>| {
+                let mut names = BTreeSet::new();
+                match entries.iter().find(|(name, _)| !names.insert(name)) {
+                    Some((name, _)) => Err(TransformCallError::DuplicateName {
+                        name: name.to_string(),
+                    }),
+                    None => Ok(entries),
+                }
+            }),
+        ),
+    )
+    .parse_next(cursor)
+}
+
+fn parse_single_quoted<'i>(cursor: &mut &'i str) -> ModalResult<&'i str> {
     preceded(
         '\'',
         cut_err(terminated(
@@ -152,8 +206,13 @@ fn parse_literal_string(cursor: &mut &str) -> ModalResult<Scalar> {
             ))),
         )),
     )
-    .map(|text: &str| Scalar::from(PlSmallStr::from(text)))
     .parse_next(cursor)
+}
+
+fn parse_literal_string(cursor: &mut &str) -> ModalResult<Scalar> {
+    parse_single_quoted
+        .map(|text: &str| Scalar::from(PlSmallStr::from(text)))
+        .parse_next(cursor)
 }
 
 fn parse_quoted(cursor: &mut &str) -> ModalResult<String> {
@@ -798,22 +857,38 @@ impl TryFrom<TransformCall> for Factor {
                 let keep = keywords.remove(CategoricalDefinition::KEEP_PARAMETER);
                 reject_keywords("C", keywords)?;
                 let selection = match (omit, keep) {
-                    // `omit` and `keep` are mutually exclusive
+                    (None, None) => None,
                     (Some(_), Some(_)) => {
                         return Err(TransformCallError::InvalidParameter {
                             transform: "C",
                             message: "`omit` and `keep` are mutually exclusive".into(),
                         });
                     }
-                    (omit, None) => omit.map(LevelSelection::Omit),
-                    // Keeping no levels would leave a term without columns
-                    (None, Some(ParameterValue::List(levels))) if levels.is_empty() => {
-                        return Err(TransformCallError::InvalidParameter {
-                            transform: "C",
-                            message: "`keep` must name at least one level".into(),
-                        });
-                    }
-                    (None, keep) => keep.map(LevelSelection::Keep),
+                    (Some(omit), None) => match Levels::try_from(omit) {
+                        Ok(omit) => Some(LevelSelection::Omit(omit)),
+                        Err(_) => {
+                            return Err(TransformCallError::InvalidParameter {
+                                transform: "C",
+                                message: "`omit` must be a scalar or a list".into(),
+                            });
+                        }
+                    },
+                    (None, Some(keep)) => match Levels::try_from(keep) {
+                        // Keeping no levels would leave a term without columns
+                        Ok(Levels::List(levels)) if levels.is_empty() => {
+                            return Err(TransformCallError::InvalidParameter {
+                                transform: "C",
+                                message: "`keep` must name at least one level".into(),
+                            });
+                        }
+                        Ok(keep) => Some(LevelSelection::Keep(keep)),
+                        Err(_) => {
+                            return Err(TransformCallError::InvalidParameter {
+                                transform: "C",
+                                message: "`keep` must be a scalar or a list".into(),
+                            });
+                        }
+                    },
                 };
                 Transform::C(Fit::Unfitted(CategoricalDefinition::new(selection)))
             }
@@ -913,6 +988,73 @@ mod tests {
         );
         for source in ["['a'", "['a',]", "[, 'a']", "[['a']]", "['a' 'b']"] {
             assert!(parse_parameter_value.parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn parameter_map_parser_preserves_written_order() {
+        let text = |value| Scalar::from(PlSmallStr::from_static(value));
+        assert_eq!(
+            parse_parameter_value
+                .parse("{ 'b' : [ 1 ], 'a': 'x', 'c': [], 'd': {'e': 2.5} }")
+                .unwrap(),
+            ParameterValue::Map(vec![
+                (
+                    PlSmallStr::from_static("b"),
+                    ParameterValue::List(vec![Scalar::from(1_i64)])
+                ),
+                (
+                    PlSmallStr::from_static("a"),
+                    ParameterValue::Scalar(text("x"))
+                ),
+                (PlSmallStr::from_static("c"), ParameterValue::List(vec![])),
+                (
+                    PlSmallStr::from_static("d"),
+                    ParameterValue::Map(vec![(
+                        PlSmallStr::from_static("e"),
+                        ParameterValue::Scalar(Scalar::from(2.5_f64))
+                    )])
+                ),
+            ])
+        );
+        assert_eq!(
+            parse_parameter_value.parse("{ }").unwrap(),
+            ParameterValue::Map(vec![])
+        );
+        for (source, message) in [
+            ("{'a': ['b']", "expected `}`"),
+            ("{'a': ['b'],}", "expected `}`"),
+            ("{'a' ['b']}", "expected `:`"),
+            ("{'a': }", "expected a scalar value"),
+            ("{1: ['a']}", "expected a single-quoted name"),
+            ("{a: ['b']}", "expected a single-quoted name"),
+            ("{'a': ['b'], 'a': ['c']}", "duplicate name 'a'"),
+            ("{'a': {'b': 1, 'b': 2}}", "duplicate name 'b'"),
+        ] {
+            let error = parse_parameter_value.parse(source).unwrap_err().to_string();
+            assert!(error.contains(message), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn transform_keywords_reject_dict_values() {
+        for (source, message) in [
+            (
+                "y ~ C(x, omit={'a': ['b']})",
+                "`omit` must be a scalar or a list",
+            ),
+            (
+                "y ~ C(x, keep={'a': ['b']})",
+                "`keep` must be a scalar or a list",
+            ),
+            (
+                "y ~ poly(x, degree={'a': [1]})",
+                "`degree` must be a positive integer",
+            ),
+            ("y ~ poly(x, raw={'a': [true]})", "`raw` must be a boolean"),
+        ] {
+            let error = parse(source).unwrap_err().to_string();
+            assert!(error.contains(message), "{source}: {error}");
         }
     }
 
@@ -1820,9 +1962,7 @@ mod tests {
         );
         let categorical = call(
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                LevelSelection::Omit(ParameterValue::Scalar(Scalar::from(
-                    PlSmallStr::from_static("a"),
-                ))),
+                LevelSelection::Omit(Levels::Scalar(Scalar::from(PlSmallStr::from_static("a")))),
             )))),
             vec![Factor::from("group name")],
         );
@@ -2145,7 +2285,7 @@ mod tests {
 
     #[test]
     fn transforms_preserve_arguments_order_and_allowed_whitespace() {
-        let categorical = |reference: Option<ParameterValue>| {
+        let categorical = |reference: Option<Levels>| {
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(
                 reference.map(LevelSelection::Omit),
             )))
@@ -2182,7 +2322,7 @@ mod tests {
                 "C(group, omit='a')",
                 Factor {
                     kind: FactorKind::Call {
-                        transform: categorical(Some(ParameterValue::Scalar(Scalar::from(
+                        transform: categorical(Some(Levels::Scalar(Scalar::from(
                             PlSmallStr::from_static("a"),
                         )))),
                         arguments: vec![Arc::new(Factor::from("group"))],
@@ -2201,7 +2341,7 @@ mod tests {
 
         let expected = Expression::from(Term::from(Factor {
             kind: FactorKind::Call {
-                transform: categorical(Some(ParameterValue::Scalar(Scalar::from(1_i64)))),
+                transform: categorical(Some(Levels::Scalar(Scalar::from(1_i64)))),
                 arguments: vec![Arc::new(Factor::from("x"))],
             },
         }));
