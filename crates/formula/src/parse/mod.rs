@@ -782,26 +782,10 @@ impl TryFrom<TransformCall> for Factor {
     type Error = TransformCallError;
 
     fn try_from(call: TransformCall) -> Result<Self, Self::Error> {
-        let mut arguments = Vec::new();
-        let mut keywords = Keywords::default();
-        let mut saw_keyword = false;
-
-        for (index, argument) in call.arguments.into_iter().enumerate() {
-            match argument {
-                TransformCallArgument::Positional(argument) if !saw_keyword => {
-                    arguments.push(Arc::new(argument));
-                }
-                TransformCallArgument::Positional(_) => {
-                    return Err(TransformCallError::PositionalAfterKeyword {
-                        position: index + 1,
-                    });
-                }
-                TransformCallArgument::Keyword { name, value } => {
-                    saw_keyword = true;
-                    keywords.insert(name, value)?;
-                }
-            }
-        }
+        let CallArguments {
+            positional: mut arguments,
+            mut keywords,
+        } = split_arguments(call.arguments)?;
 
         let transform = match call.name.as_str() {
             "log" => {
@@ -975,6 +959,41 @@ impl TryFrom<TransformCall> for Factor {
             },
         })
     }
+}
+
+struct CallArguments {
+    positional: Vec<Arc<Factor>>,
+    keywords: Keywords,
+}
+
+fn split_arguments(
+    arguments: Vec<TransformCallArgument>,
+) -> Result<CallArguments, TransformCallError> {
+    let mut positional = Vec::new();
+    let mut keywords = Keywords::default();
+    let mut saw_keyword = false;
+
+    for (index, argument) in arguments.into_iter().enumerate() {
+        match argument {
+            TransformCallArgument::Positional(argument) if !saw_keyword => {
+                positional.push(Arc::new(argument));
+            }
+            TransformCallArgument::Positional(_) => {
+                return Err(TransformCallError::PositionalAfterKeyword {
+                    position: index + 1,
+                });
+            }
+            TransformCallArgument::Keyword { name, value } => {
+                saw_keyword = true;
+                keywords.insert(name, value)?;
+            }
+        }
+    }
+
+    Ok(CallArguments {
+        positional,
+        keywords,
+    })
 }
 
 #[derive(Default)]
