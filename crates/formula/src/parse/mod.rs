@@ -848,14 +848,47 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::Standardize(Fit::Unfitted(StandardizeDefinition::SCALE))
             }
             "C" => {
-                // `omit=[]` omits nothing, so it is normalised away
+                // `omit=[]` omits nothing, so it is normalised away; we do this here to support
+                // a non-empty `keep` with an `empty` omit
                 let omit = keywords
                     .remove(CategoricalDefinition::OMIT_PARAMETER)
                     .filter(
                         |omit| !matches!(omit, ParameterValue::List(levels) if levels.is_empty()),
                     );
                 let keep = keywords.remove(CategoricalDefinition::KEEP_PARAMETER);
+                let bins = keywords.remove(CategoricalDefinition::BIN_PARAMETER);
                 reject_keywords("C", keywords)?;
+                let bins = match bins {
+                    None => None,
+                    // `bin={}` merges nothing, so it is normalised away
+                    Some(ParameterValue::Map(bins)) if bins.is_empty() => None,
+                    Some(ParameterValue::Map(bins)) => Some(
+                        bins.into_iter()
+                            .map(|(name, members)| match Levels::try_from(members) {
+                                // An empty bin would encode a column without any levels
+                                Ok(Levels::List(levels)) if levels.is_empty() => {
+                                    Err(TransformCallError::InvalidParameter {
+                                        transform: "C",
+                                        message: format!(
+                                            "bin '{name}' must name at least one level"
+                                        ),
+                                    })
+                                }
+                                Ok(members) => Ok((name, members)),
+                                Err(_) => Err(TransformCallError::InvalidParameter {
+                                    transform: "C",
+                                    message: format!("bin '{name}' must be a scalar or a list"),
+                                }),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                    Some(_) => {
+                        return Err(TransformCallError::InvalidParameter {
+                            transform: "C",
+                            message: "`bin` must be a dict".into(),
+                        });
+                    }
+                };
                 let selection = match (omit, keep) {
                     (None, None) => None,
                     (Some(_), Some(_)) => {
@@ -890,7 +923,7 @@ impl TryFrom<TransformCall> for Factor {
                         }
                     },
                 };
-                Transform::C(Fit::Unfitted(CategoricalDefinition::new(selection)))
+                Transform::C(Fit::Unfitted(CategoricalDefinition::new(selection, bins)))
             }
             "poly" => {
                 let keyword = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
@@ -1154,6 +1187,42 @@ mod tests {
             assert_eq!(formulas, parse(expected).unwrap(), "{source}");
             let rendered = formulas.iter().map(ToString::to_string).collect::<Vec<_>>();
             assert_eq!(rendered, [expected], "{source}");
+        }
+    }
+
+    #[test]
+    fn categorical_bins_display_first_and_normalise_empty_dicts_away() {
+        for (source, expected) in [
+            (
+                "y ~ C(x, omit='a', bin={'bc': ['b', 'c'], 'd': 'd'})",
+                "y ~ 1 + C(x, bin={'bc': ['b', 'c'], 'd': 'd'}, omit='a')",
+            ),
+            ("y ~ C(x, bin={})", "y ~ 1 + C(x)"),
+            ("y ~ C(x, bin={}, omit=[])", "y ~ 1 + C(x)"),
+        ] {
+            let formulas = parse(source).unwrap();
+            assert_eq!(formulas, parse(expected).unwrap(), "{source}");
+            let rendered = formulas.iter().map(ToString::to_string).collect::<Vec<_>>();
+            assert_eq!(rendered, [expected], "{source}");
+        }
+    }
+
+    #[test]
+    fn categorical_rejects_malformed_bins() {
+        for (source, message) in [
+            ("y ~ C(x, bin='a')", "`bin` must be a dict"),
+            ("y ~ C(x, bin=['a'])", "`bin` must be a dict"),
+            (
+                "y ~ C(x, bin={'b': []})",
+                "bin 'b' must name at least one level",
+            ),
+            (
+                "y ~ C(x, bin={'b': {'c': 'a'}})",
+                "bin 'b' must be a scalar or a list",
+            ),
+        ] {
+            let error = parse(source).unwrap_err().to_string();
+            assert!(error.contains(message), "{source}: {error}");
         }
     }
 
@@ -1961,9 +2030,12 @@ mod tests {
             )],
         );
         let categorical = call(
-            Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                LevelSelection::Omit(Levels::Scalar(Scalar::from(PlSmallStr::from_static("a")))),
-            )))),
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+                Some(LevelSelection::Omit(Levels::Scalar(Scalar::from(
+                    PlSmallStr::from_static("a"),
+                )))),
+                None,
+            ))),
             vec![Factor::from("group name")],
         );
 
@@ -2288,6 +2360,7 @@ mod tests {
         let categorical = |reference: Option<Levels>| {
             Transform::C(Fit::Unfitted(CategoricalDefinition::new(
                 reference.map(LevelSelection::Omit),
+                None,
             )))
         };
         let cases = [
@@ -2552,7 +2625,7 @@ mod tests {
                         arguments: vec![Arc::new(Factor {
                             kind: FactorKind::Call {
                                 transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(
-                                    None,
+                                    None, None,
                                 ))),
                                 arguments: vec![Arc::new(Factor::from("x"))],
                             },
@@ -2564,7 +2637,9 @@ mod tests {
                 "C(log(x))",
                 Factor {
                     kind: FactorKind::Call {
-                        transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+                        transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+                            None, None,
+                        ))),
                         arguments: vec![Arc::new(Factor {
                             kind: FactorKind::Call {
                                 transform: Transform::Expression(ExpressionTransform::LOG),

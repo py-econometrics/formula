@@ -268,7 +268,7 @@ impl Factor {
 
         Ok(Arc::new(Self {
             kind: FactorKind::Call {
-                transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+                transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None, None))),
                 arguments: vec![Arc::clone(factor)],
             },
         }))
@@ -1764,6 +1764,7 @@ mod tests {
             "y ~ x - 1 + 1 + z",
             "y ~ C(`group name`, omit='a') + poly(x, degree=2)",
             "y ~ C(g, keep='a') + C(h, keep=[1, 2])",
+            "y ~ C(g, bin={'ab': ['a', 'b'], 'c': 'c'}, keep='ab')",
             "`outcome value` ~ log(`1`) + add(x, 2.0)",
             "y ~ x | firm:year",
             "y ~ sw(x, z) | `firm name`",
@@ -3469,13 +3470,14 @@ mod tests {
     #[test]
     fn categorical_requires_exactly_one_argument() {
         assert_requires_one_argument(|| {
-            Transform::C(Fit::Unfitted(CategoricalDefinition::new(None)))
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(None, None)))
         });
 
         assert_requires_one_argument(|| {
-            Transform::C(Fit::Unfitted(CategoricalDefinition::new(Some(
-                LevelSelection::Omit(Levels::Scalar(Scalar::from(1_i64))),
-            ))))
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(
+                Some(LevelSelection::Omit(Levels::Scalar(Scalar::from(1_i64)))),
+                None,
+            )))
         });
     }
 
@@ -3510,7 +3512,7 @@ mod tests {
             let mut arguments: Vec<_> = (0..3).map(|_| Arc::new(Factor::from("x"))).collect();
             arguments[position] = Arc::new(Factor {
                 kind: FactorKind::Call {
-                    transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+                    transform: Transform::C(Fit::Unfitted(CategoricalDefinition::new(None, None))),
                     arguments: vec![Arc::new(Factor::from("group"))],
                 },
             });

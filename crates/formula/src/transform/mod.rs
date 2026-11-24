@@ -249,9 +249,12 @@ mod tests {
 
     #[test]
     fn fit_identity_depends_on_definition_not_fitted_state() -> Result<(), TransformError> {
-        let definition = CategoricalDefinition::new(Some(LevelSelection::Omit(Levels::Scalar(
-            Scalar::from(PlSmallStr::from_static("a")),
-        ))));
+        let definition = CategoricalDefinition::new(
+            Some(LevelSelection::Omit(Levels::Scalar(Scalar::from(
+                PlSmallStr::from_static("a"),
+            )))),
+            None,
+        );
         let first_input = prepare(&[Column::new("group".into(), ["a", "b"])]);
         let second_input = prepare(&[Column::new("group".into(), ["a", "c"])]);
         let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
@@ -259,7 +262,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first, Fit::Unfitted(definition));
-        assert_ne!(first, Fit::Unfitted(CategoricalDefinition::new(None)));
+        assert_ne!(first, Fit::Unfitted(CategoricalDefinition::new(None, None)));
 
         let definition = IntegerEncodingDefinition;
         let first = Fit::Fitted(Fitted::fit(definition.clone(), &first_input)?);
@@ -304,7 +307,7 @@ mod tests {
     {
         let inputs = [Column::new("x".into(), [1.0, 2.0, 1.0])];
         for transform in [
-            Transform::C(Fit::Unfitted(CategoricalDefinition::new(None))),
+            Transform::C(Fit::Unfitted(CategoricalDefinition::new(None, None))),
             Transform::Poly(Fit::Unfitted(PolynomialDefinition::new(
                 None,
                 Some(ParameterValue::Scalar(Scalar::from(true))),

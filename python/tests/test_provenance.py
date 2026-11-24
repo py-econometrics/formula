@@ -52,6 +52,14 @@ def test_categorical_omit_scalar_and_list(argument, parameter, remaining, dtype)
         ] + [None]
 
 
+def test_categorical_bin_parameters_convert_to_a_dict(data):
+    model = formula.parse("y ~ C(g, bin={'ab': ['a', 'b']}) - 1").fit(data)[0]
+    (term,) = model.terms(formula.Role.Independent)
+    call = term.factors[0].call
+    assert call is not None
+    assert call.parameters == {"bin": {"ab": ["a", "b"]}}
+
+
 @pytest.mark.parametrize("argument", ["['a', 'missing']", "['a', 1]"])
 def test_categorical_omit_validates_every_list_element(data, argument):
     with pytest.raises(ValueError):
