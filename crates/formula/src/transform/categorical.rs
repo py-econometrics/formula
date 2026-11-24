@@ -342,10 +342,7 @@ impl CategoricalDefinition {
         let fitted_levels = Self::fitted_levels(&state.levels)?;
         let mut columns = Vec::new();
         let mut keys = Vec::new();
-        for (index, column) in state.columns.iter().enumerate() {
-            if state.omitted_indices.contains(&index) {
-                continue;
-            }
+        for (index, column) in state.columns[..state.kept].iter().enumerate() {
             let key = column.key(&fitted_levels);
             let indicator = codes
                 .as_materialized_series()
@@ -520,8 +517,8 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let Some(selection) = &self.selection else {
             return Ok(CategoricalState {
                 levels,
+                kept: columns.len(),
                 columns,
-                omitted_indices: Vec::new(),
             });
         };
         let (parameter, selected) = selection.parameter();
@@ -559,11 +556,20 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         } else {
             selected_indices
         };
+        // Move omitted columns after the kept ones, so a kept column's index is its output position
+        let (kept, omitted): (Vec<_>, Vec<_>) = columns
+            .into_iter()
+            .enumerate()
+            .partition(|(index, _)| !omitted_indices.contains(index));
 
         Ok(CategoricalState {
             levels,
-            columns,
-            omitted_indices,
+            kept: kept.len(),
+            columns: kept
+                .into_iter()
+                .chain(omitted)
+                .map(|(_, column)| column)
+                .collect(),
         })
     }
 
@@ -575,7 +581,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let (field, input) = inputs.single()?;
         let codes = Self::codes(state, input)?;
         let columns = self.indicators(state, &codes, field.name())?;
-        Ok(TransformOutput::Indicator { columns, codes })
+        Ok(TransformOutput::Indicator {
+            columns,
+            codes,
+            count: state.columns.len() as u32,
+        })
     }
 }
 
@@ -618,8 +628,10 @@ fn level_columns(columns: &[EncodedColumn], level_count: usize) -> Vec<usize> {
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
     levels: Series,
+    /// The kept columns, then the omitted ones
     columns: Vec<EncodedColumn>,
-    omitted_indices: Vec<usize>,
+    /// The number of kept columns
+    kept: usize,
 }
 
 #[cfg(test)]
@@ -1040,12 +1052,9 @@ mod tests {
         assert_eq!(actual.shape(), (height, expected.len()));
 
         let fitted_levels = CategoricalDefinition::fitted_levels(&transform.levels).unwrap();
-        let names = transform
-            .columns
+        let names = transform.columns[..transform.kept]
             .iter()
-            .enumerate()
-            .filter(|(index, _)| !transform.omitted_indices.contains(index))
-            .map(|(_, column)| definition.output_name(input[0].name(), &column.key(&fitted_levels)))
+            .map(|column| definition.output_name(input[0].name(), &column.key(&fitted_levels)))
             .collect::<Vec<_>>();
 
         for (index, (column, expected_values)) in actual.columns().iter().zip(expected).enumerate()

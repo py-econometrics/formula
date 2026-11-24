@@ -51,6 +51,7 @@ pub(crate) enum TransformOutput {
     Indicator {
         columns: MaterializedColumns<ComponentKey>,
         codes: Column,
+        count: u32,
     },
 }
 
