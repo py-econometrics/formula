@@ -2,7 +2,7 @@
 //! of `x` when fitting and reuse them when transforming new data.
 
 use super::input::{PreparedInput, validate_numeric_field};
-use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
+use super::{ArgumentCount, TransformDefinition, TransformError, TransformOutput, call_name};
 use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::prelude::{Field, IntoLazy, NULL, col, lit, when};
@@ -44,7 +44,7 @@ impl TransformDefinition for StandardizeDefinition {
 
 impl Definition<StandardizeState> for StandardizeDefinition {
     type Input = PreparedInput;
-    type Output = MaterializedColumns<ComponentKey>;
+    type Output = TransformOutput;
     type Error = TransformError;
 
     fn fit(&self, inputs: &PreparedInput) -> Result<StandardizeState, TransformError> {
@@ -128,9 +128,8 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         }
         .alias(name);
         let output = inputs.frame.clone().lazy().select([expression]).collect()?;
-        Ok(MaterializedColumns::single_column(
-            output,
-            ComponentKey::None,
+        Ok(TransformOutput::Columns(
+            MaterializedColumns::single_column(output, ComponentKey::None),
         ))
     }
 }

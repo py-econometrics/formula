@@ -1,13 +1,15 @@
 use super::input::PreparedInput;
-use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name};
+use super::{
+    ArgumentCount, ParameterValue, TransformDefinition, TransformError, TransformOutput, call_name,
+};
 use crate::fit::Definition;
-use crate::formula::{ComponentKey, MaterializedColumns};
-use crate::transform::codes::{CODE_COLUMN, map_codes};
+use crate::formula::ComponentKey;
+use crate::transform::codes::{CODE_COLUMN, Indicators, map_codes};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, IntoLazy, NULL, PlSmallStr,
-    Scalar, Series, SortOptions, col, lit, when,
+    AnyValue, Column, DataFrame, DataType, IntoColumn, IntoLazy, NULL, PlSmallStr, Scalar, Series,
+    SortOptions, col, lit, when,
 };
 use std::collections::BTreeMap;
 
@@ -328,32 +330,23 @@ impl CategoricalDefinition {
         map_codes(&input.clone().into_frame(), &mapping)
     }
 
-    /// The indicator columns for [`Self::codes`]
-    ///
-    /// Each is true where a row's code is its column's index, and null where the code is null.
+    /// The indicators for [`Self::codes`]: a column for each kept level or bin
     pub(super) fn indicators(
         &self,
         state: &CategoricalState,
-        codes: &Column,
+        codes: Column,
         input_name: &str,
-    ) -> Result<MaterializedColumns<ComponentKey>, TransformError> {
+    ) -> Result<Indicators, TransformError> {
         let fitted_levels = Self::fitted_levels(&state.levels)?;
-        let mut columns = Vec::new();
-        let mut keys = Vec::new();
-        for (index, column) in state.columns.iter().enumerate() {
-            if state.omitted_indices.contains(&index) {
-                continue;
-            }
+        let columns = state.columns[..state.kept].iter().map(|column| {
             let key = column.key(&fitted_levels);
-            let indicator = codes
-                .as_materialized_series()
-                .equal(index as u32)?
-                .with_name(self.output_name(input_name, &key));
-            columns.push(indicator.into_column());
-            keys.push(ComponentKey::Scalar(key));
-        }
-        let frame = DataFrame::new(codes.len(), columns)?;
-        Ok(MaterializedColumns::new(frame, keys))
+            (
+                self.output_name(input_name, &key),
+                ComponentKey::Scalar(key),
+            )
+        });
+        let omitted = (state.columns.len() - state.kept) as u32;
+        Ok(Indicators::new(codes, columns, omitted)?)
     }
 
     /// Builds the one-hot encoding: one column per unbinned level or bin
@@ -471,7 +464,7 @@ impl TransformDefinition for CategoricalDefinition {
 
 impl Definition<CategoricalState> for CategoricalDefinition {
     type Input = PreparedInput;
-    type Output = MaterializedColumns<ComponentKey>;
+    type Output = TransformOutput;
     type Error = TransformError;
 
     fn validate(
@@ -518,12 +511,12 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let Some(selection) = &self.selection else {
             return Ok(CategoricalState {
                 levels,
+                kept: columns.len(),
                 columns,
-                omitted_indices: Vec::new(),
             });
         };
         let (parameter, selected) = selection.parameter();
-        let mut selected_indices = Vec::new();
+        let mut selected_columns = vec![false; columns.len()];
         for value in selected.as_slice() {
             let named_bin = columns.iter().position(|column| {
                 matches!(column, EncodedColumn::Bin { name, .. }
@@ -544,24 +537,26 @@ impl Definition<CategoricalState> for CategoricalDefinition {
                 }
             };
 
-            if !selected_indices.contains(&column) {
-                selected_indices.push(column);
-            }
+            selected_columns[column] = true;
         }
 
-        // `keep` omits every column it doesn't name
-        let omitted_indices = if let LevelSelection::Keep(_) = selection {
-            (0..columns.len())
-                .filter(|index| !selected_indices.contains(index))
-                .collect()
-        } else {
-            selected_indices
-        };
+        let keep_selected = matches!(selection, LevelSelection::Keep(_));
+        // Move omitted columns after the kept ones, so a kept column's index is its output position
+        let (mut kept, mut omitted) = (Vec::new(), Vec::new());
+        for (column, selected) in columns.into_iter().zip(selected_columns) {
+            if selected == keep_selected {
+                kept.push(column);
+            } else {
+                omitted.push(column);
+            }
+        }
+        let kept_count = kept.len();
+        kept.extend(omitted);
 
         Ok(CategoricalState {
             levels,
-            columns,
-            omitted_indices,
+            kept: kept_count,
+            columns: kept,
         })
     }
 
@@ -572,7 +567,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
         let codes = Self::codes(state, input)?;
-        self.indicators(state, &codes, field.name())
+        Ok(TransformOutput::Indicator(self.indicators(
+            state,
+            codes,
+            field.name(),
+        )?))
     }
 }
 
@@ -615,8 +614,10 @@ fn level_columns(columns: &[EncodedColumn], level_count: usize) -> Vec<usize> {
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
     levels: Series,
+    /// The kept columns, then the omitted ones
     columns: Vec<EncodedColumn>,
-    omitted_indices: Vec<usize>,
+    /// The number of kept columns
+    kept: usize,
 }
 
 #[cfg(test)]
@@ -1037,12 +1038,9 @@ mod tests {
         assert_eq!(actual.shape(), (height, expected.len()));
 
         let fitted_levels = CategoricalDefinition::fitted_levels(&transform.levels).unwrap();
-        let names = transform
-            .columns
+        let names = transform.columns[..transform.kept]
             .iter()
-            .enumerate()
-            .filter(|(index, _)| !transform.omitted_indices.contains(index))
-            .map(|(_, column)| definition.output_name(input[0].name(), &column.key(&fitted_levels)))
+            .map(|column| definition.output_name(input[0].name(), &column.key(&fitted_levels)))
             .collect::<Vec<_>>();
 
         for (index, (column, expected_values)) in actual.columns().iter().zip(expected).enumerate()

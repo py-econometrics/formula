@@ -11,6 +11,7 @@ pub mod state;
 pub(crate) use categorical::CategoricalDefinition;
 #[cfg(test)]
 pub(crate) use categorical::{LevelSelection, Levels};
+pub(crate) use codes::{Combinations, Indicators};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
@@ -30,7 +31,7 @@ pub use crate::transform::integer::IntegerEncodingState;
 use crate::transform::polynomial::PolynomialState;
 use crate::transform::state::ExportState;
 use polars::error::PolarsError;
-use polars::prelude::{Column, PlSmallStr, Scalar};
+use polars::prelude::{Column, DataFrame, PlSmallStr, Scalar};
 
 fn call_name<'a>(name: &str, arguments: impl IntoIterator<Item = &'a str>) -> PlSmallStr {
     let arguments = arguments.into_iter().collect::<Vec<_>>().join(", ");
@@ -42,6 +43,25 @@ pub enum ParameterValue {
     Scalar(Scalar),
     List(Vec<Scalar>),
     Map(Vec<(PlSmallStr, ParameterValue)>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TransformOutput {
+    Columns(MaterializedColumns<ComponentKey>),
+    Indicator(Indicators),
+}
+
+impl TransformOutput {
+    pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
+        match self {
+            Self::Columns(columns) => columns,
+            Self::Indicator(indicators) => indicators.columns(),
+        }
+    }
+
+    pub(crate) fn frame(&self) -> &DataFrame {
+        self.columns().frame()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -139,7 +159,7 @@ impl Transform {
     pub(crate) fn transform(
         &self,
         inputs: &[Column],
-    ) -> Result<MaterializedColumns<ComponentKey>, FitError<TransformError>> {
+    ) -> Result<TransformOutput, FitError<TransformError>> {
         #[cfg(test)]
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 

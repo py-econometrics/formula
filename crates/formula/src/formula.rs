@@ -4,11 +4,14 @@ use crate::parse::{
     FORMULA_SEPARATOR, PIPE_SEPARATOR, ParseResult, is_identifier_character, parse_scalar,
 };
 use crate::transform::{
-    ArgumentCount, CategoricalDefinition, GroupedTransform, IntegerEncodingDefinition,
-    IntegerEncodingState, ParameterValue, Transform, TransformError, validate_numeric_field,
+    ArgumentCount, CategoricalDefinition, Combinations, GroupedTransform,
+    IntegerEncodingDefinition, IntegerEncodingState, ParameterValue, Transform, TransformError,
+    TransformOutput, validate_numeric_field,
 };
 use crate::{SelectionError, TransformState};
-use polars::prelude::{AnyValue, Column, DataFrame, DataType, PolarsResult, Scalar};
+use polars::prelude::{
+    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PolarsResult, Scalar,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use winnow::Parser;
@@ -324,6 +327,8 @@ impl<'a> TransformCall<'a> {
 #[derive(Clone, Debug)]
 pub struct Term {
     factors: Vec<Arc<Factor>>,
+    /// Interactions of categorical factor codes observed during fitting
+    combinations: Option<Combinations>,
 }
 
 // Interaction identity ignores factor order: a:b equals b:a.
@@ -343,6 +348,7 @@ impl FromIterator<Arc<Factor>> for Term {
     fn from_iter<T: IntoIterator<Item = Arc<Factor>>>(factors: T) -> Self {
         Self {
             factors: collect_unique(factors),
+            combinations: None,
         }
     }
 }
@@ -410,7 +416,10 @@ impl Term {
     }
 
     pub(crate) fn intercept() -> Self {
-        Self { factors: vec![] }
+        Self {
+            factors: vec![],
+            combinations: None,
+        }
     }
 
     pub(crate) fn as_factor(&self) -> Option<&Factor> {
@@ -521,13 +530,18 @@ impl Term {
         &self,
         height: usize,
         transformed: &[FittedFactor],
+        fitting: bool,
     ) -> Result<(Self, MaterializedColumns<ColumnMetadata>), TransformError> {
         let mut factors = Vec::with_capacity(self.factors.len());
         let mut factor_columns = Vec::with_capacity(self.factors.len());
+        let mut categorical = Vec::with_capacity(self.factors.len());
+        let mut codes = Vec::new();
+        let mut counts = Vec::new();
+        let mut kept = Vec::new();
         for factor in &self.factors {
             let result = lookup_factor(transformed, factor);
             if let FactorKind::Variable(_) = &factor.kind {
-                let [column] = result.columns.frame.columns() else {
+                let [column] = result.output.frame().columns() else {
                     unreachable!("a variable transforms to exactly one column");
                 };
                 validate_numeric_field(&column.field())?;
@@ -535,16 +549,134 @@ impl Term {
             factors.push(Arc::clone(&result.factor));
             factor_columns.push(
                 result
-                    .columns
+                    .output
+                    .columns()
                     .clone()
                     .with_factor(Arc::clone(&result.factor)),
             );
+            categorical.push(match &result.output {
+                TransformOutput::Indicator(indicators) => {
+                    codes.push(indicators.codes());
+                    counts.push(indicators.count());
+                    kept.push(indicators.kept());
+                    true
+                }
+                TransformOutput::Columns(_) => false,
+            });
         }
 
-        let columns = self.assemble_columns(height, factor_columns)?;
-        let term = Self { factors };
+        let combinations = if codes.len() < 2 {
+            // A term with fewer than two categorical factors encodes no combinations
+            None
+        } else if fitting {
+            // Fitting ignores any fitted combinations, as `Fit::fit` ignores a fitted state
+            Some(Combinations::fit(&codes, counts)?)
+        } else {
+            Some(
+                self.combinations
+                    .clone()
+                    .expect("a fitted term with two or more categorical factors has combinations"),
+            )
+        };
+        let columns = match &combinations {
+            None => self.assemble_columns(height, factor_columns)?,
+            Some(combinations) => Self::assemble_combinations(
+                height,
+                &factor_columns,
+                &categorical,
+                &kept,
+                &combinations.transform(&codes)?,
+                combinations,
+            )?,
+        };
+        let term = Self {
+            factors,
+            combinations,
+        };
 
         Ok((term, columns))
+    }
+
+    /// The columns of a term with two or more categorical factors
+    fn assemble_combinations(
+        height: usize,
+        factor_columns: &[MaterializedColumns<ColumnMetadata>],
+        categorical: &[bool],
+        kept: &[u32],
+        combination: &Column,
+        combinations: &Combinations,
+    ) -> Result<MaterializedColumns<ColumnMetadata>, TransformError> {
+        let categorical_positions: Vec<_> = categorical
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &is_categorical)| is_categorical.then_some(position))
+            .collect();
+        let observed = combinations.observed(kept)?;
+        let has_empty_factor = factor_columns
+            .iter()
+            .any(|factor| factor.metadata.is_empty());
+        if observed.is_empty() || has_empty_factor {
+            return Ok(MaterializedColumns::new(
+                DataFrame::empty_with_height(height),
+                Vec::new(),
+            ));
+        }
+
+        let mut numeric_choices = vec![vec![0; factor_columns.len()]];
+        for (position, factor) in factor_columns.iter().enumerate() {
+            if categorical[position] {
+                continue;
+            }
+            let mut choices = Vec::new();
+            for choice in &numeric_choices {
+                for index in 0..factor.metadata.len() {
+                    let mut indices = choice.clone();
+                    indices[position] = index;
+                    choices.push(indices);
+                }
+            }
+            numeric_choices = choices;
+        }
+
+        let mut interactions = Vec::new();
+        for (codes, joint_code) in observed {
+            for choice in &numeric_choices {
+                let mut indices = choice.clone();
+                for (&position, &code) in categorical_positions.iter().zip(&codes) {
+                    indices[position] = code as usize;
+                }
+                interactions.push((indices, joint_code));
+            }
+        }
+        // Order the interactions as `Self::assemble_columns` does
+        interactions.sort_unstable();
+
+        let combination = combination.as_materialized_series();
+        let mut columns = Vec::new();
+        let mut metadata = Vec::new();
+        for (interaction, code) in &interactions {
+            let mut column = combination.equal(*code)?.into_column();
+            let mut names = Vec::new();
+            let mut contributions = Vec::new();
+            for ((factor, index), is_categorical) in
+                factor_columns.iter().zip(interaction).zip(categorical)
+            {
+                let factor_column = &factor.frame().columns()[*index];
+                if !is_categorical {
+                    column = (&column.cast(&DataType::Float64)?
+                        * &factor_column.cast(&DataType::Float64)?)?;
+                }
+                names.push(factor_column.name().as_str());
+                contributions.extend(factor.metadata[*index].contributions.iter().cloned());
+            }
+            columns.push(column.with_name(names.join(":").into()));
+            metadata.push(ColumnMetadata { contributions });
+        }
+
+        Ok(MaterializedColumns::new(
+            DataFrame::new(height, columns)?,
+            metadata,
+        ))
     }
 }
 
@@ -963,7 +1095,7 @@ impl MaterializedColumns<ComponentKey> {
 
 struct FittedFactor {
     factor: Arc<Factor>,
-    columns: MaterializedColumns<ComponentKey>,
+    output: TransformOutput,
 }
 
 #[derive(Clone, Debug)]
@@ -1120,10 +1252,10 @@ fn fit_and_transform_factors(
         let result = match &factor.kind {
             FactorKind::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
-                columns: MaterializedColumns::single_column(
+                output: TransformOutput::Columns(MaterializedColumns::single_column(
                     literal_column(value, data.height()).into_frame(),
                     ComponentKey::None,
-                ),
+                )),
             },
             FactorKind::Variable(variable) => {
                 let column = data
@@ -1136,10 +1268,12 @@ fn fit_and_transform_factors(
                 let factor = Arc::new(Factor {
                     kind: FactorKind::Variable(fitted),
                 });
-                let columns =
-                    MaterializedColumns::single_column(output.into_frame(), ComponentKey::None);
+                let output = TransformOutput::Columns(MaterializedColumns::single_column(
+                    output.into_frame(),
+                    ComponentKey::None,
+                ));
 
-                FittedFactor { factor, columns }
+                FittedFactor { factor, output }
             }
             FactorKind::Call {
                 transform,
@@ -1150,13 +1284,13 @@ fn fit_and_transform_factors(
                 for argument in arguments {
                     let result = lookup_factor(&transformed, argument);
                     fitted_arguments.push(Arc::clone(&result.factor));
-                    inputs.extend(result.columns.frame.columns().iter().cloned());
+                    inputs.extend(result.output.frame().columns().iter().cloned());
                 }
 
                 let transform = transform.fit(&inputs).map_err(|error| {
                     ModelError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
-                let columns = transform.transform(&inputs).map_err(|error| {
+                let output = transform.transform(&inputs).map_err(|error| {
                     ModelError::TransformCall(format!("{}: {error}", factor.render()))
                 })?;
                 let factor = Arc::new(Factor {
@@ -1166,7 +1300,7 @@ fn fit_and_transform_factors(
                     },
                 });
 
-                FittedFactor { factor, columns }
+                FittedFactor { factor, output }
             }
         };
         transformed.push(result)
@@ -1181,20 +1315,22 @@ fn transform_factors(
     let mut transformed = Vec::with_capacity(scheduled.len());
 
     for factor in scheduled {
-        let columns = match &factor.kind {
-            FactorKind::Literal(value) => MaterializedColumns::single_column(
-                literal_column(value, data.height()).into_frame(),
-                ComponentKey::None,
-            ),
+        let output = match &factor.kind {
+            FactorKind::Literal(value) => {
+                TransformOutput::Columns(MaterializedColumns::single_column(
+                    literal_column(value, data.height()).into_frame(),
+                    ComponentKey::None,
+                ))
+            }
             FactorKind::Variable(variable) => {
                 let column = data
                     .column(&variable.definition().name)
                     .map_err(TransformError::from)?;
 
-                MaterializedColumns::single_column(
+                TransformOutput::Columns(MaterializedColumns::single_column(
                     variable.transform(column)?.into_frame(),
                     ComponentKey::None,
-                )
+                ))
             }
             FactorKind::Call {
                 transform,
@@ -1203,7 +1339,7 @@ fn transform_factors(
                 let mut inputs = Vec::new();
                 for argument in arguments {
                     let result = lookup_factor(&transformed, argument);
-                    inputs.extend(result.columns.frame.columns().iter().cloned());
+                    inputs.extend(result.output.frame().columns().iter().cloned());
                 }
                 transform.transform(&inputs).map_err(|error| {
                     ModelError::TransformCall(format!("{}: {error}", factor.render()))
@@ -1212,7 +1348,7 @@ fn transform_factors(
         };
         transformed.push(FittedFactor {
             factor: Arc::clone(factor),
-            columns,
+            output,
         });
     }
     Ok(transformed)
@@ -1250,6 +1386,7 @@ fn assemble_terms(
     expressions: &[&Expression],
     height: usize,
     factors: &[FittedFactor],
+    fitting: bool,
 ) -> Result<Vec<FittedTerm>, TransformError> {
     let mut transformed: Vec<FittedTerm> = Vec::new();
 
@@ -1258,7 +1395,7 @@ fn assemble_terms(
             if transformed.iter().any(|entry| &entry.term == term) {
                 continue;
             }
-            let (term, columns) = term.assemble(height, factors)?;
+            let (term, columns) = term.assemble(height, factors, fitting)?;
             transformed.push(FittedTerm { term, columns });
         }
     }
@@ -1272,7 +1409,7 @@ pub(crate) fn transform_terms(
 ) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
     let factors = transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors)?)
+    Ok(assemble_terms(expressions, data.height(), &factors, false)?)
 }
 
 fn fit_and_transform_terms(
@@ -1281,7 +1418,7 @@ fn fit_and_transform_terms(
 ) -> Result<Vec<FittedTerm>, ModelError> {
     let scheduled = schedule_factors(expressions);
     let factors = fit_and_transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors)?)
+    Ok(assemble_terms(expressions, data.height(), &factors, true)?)
 }
 
 fn lookup_factor<'a>(transformed: &'a [FittedFactor], factor: &Arc<Factor>) -> &'a FittedFactor {
@@ -1392,7 +1529,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            output.metadata,
+            output.columns().metadata,
             vec![
                 ComponentKey::Scalar(Scalar::from(polars::prelude::PlSmallStr::from_static(
                     "group",
@@ -2174,7 +2311,7 @@ mod tests {
                 for entry in entries {
                     if let FactorKind::Literal(value) = &entry.factor.kind {
                         literal_count += 1;
-                        let [Column::Scalar(column)] = entry.columns.frame().columns() else {
+                        let [Column::Scalar(column)] = entry.output.frame().columns() else {
                             panic!("literal must retain scalar storage");
                         };
                         assert_eq!(column.scalar(), value);
@@ -2462,6 +2599,112 @@ mod tests {
                     .equals_missing(&expected),
                 "{source}"
             );
+        }
+    }
+
+    #[test]
+    fn categorical_interactions_encode_only_observed_combinations() {
+        // (b, v) and (c, u) aren't observed when fitting
+        let training = polars::df!(
+            "y" => [1.0, 2.0, 3.0, 4.0],
+            "f" => ["a", "a", "b", "c"],
+            "g" => ["u", "v", "u", "v"],
+            "x" => [1.0, 2.0, 3.0, 4.0],
+        )
+        .unwrap();
+        // (a, v) was observed when fitting, (b, v) and (c, u) weren't, and `d` is an unseen level
+        let input = polars::df!(
+            "y" => [1.0, 2.0, 3.0, 4.0],
+            "f" => ["a", "b", "c", "d"],
+            "g" => ["v", "v", "u", "u"],
+            "x" => [5.0, 6.0, 7.0, 8.0],
+        )
+        .unwrap();
+
+        for (source, expected_fit, expected_transform) in [
+            // Categorical columns combine into boolean columns
+            (
+                "C(f):C(g)",
+                polars::df!(
+                    "C(f)[a]:C(g)[u]" => [true, false, false, false],
+                    "C(f)[a]:C(g)[v]" => [false, true, false, false],
+                    "C(f)[b]:C(g)[u]" => [false, false, true, false],
+                    "C(f)[c]:C(g)[v]" => [false, false, false, true],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f)[a]:C(g)[u]" => [Some(false), None, None, None],
+                    "C(f)[a]:C(g)[v]" => [Some(true), None, None, None],
+                    "C(f)[b]:C(g)[u]" => [Some(false), None, None, None],
+                    "C(f)[c]:C(g)[v]" => [Some(false), None, None, None],
+                )
+                .unwrap(),
+            ),
+            // A numeric factor multiplies them into float columns
+            (
+                "C(f):x:C(g)",
+                polars::df!(
+                    "C(f)[a]:x:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:x:C(g)[v]" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[b]:x:C(g)[u]" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[c]:x:C(g)[v]" => [0.0, 0.0, 0.0, 4.0],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f)[a]:x:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:x:C(g)[v]" => [Some(5.0), None, None, None],
+                    "C(f)[b]:x:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:x:C(g)[v]" => [Some(0.0), None, None, None],
+                )
+                .unwrap(),
+            ),
+            // The columns of a numeric factor between categorical ones keep the product's order
+            (
+                "C(f):poly(x, 2, raw=true):C(g)",
+                polars::df!(
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [0.0, 4.0, 0.0, 0.0],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [0.0, 0.0, 9.0, 0.0],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [0.0, 0.0, 0.0, 4.0],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [0.0, 0.0, 0.0, 16.0],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [Some(5.0), None, None, None],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [Some(25.0), None, None, None],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[b]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [Some(0.0), None, None, None],
+                )
+                .unwrap(),
+            ),
+            // Omitted levels keep distinct codes: (c, u) is unseen although (a, u) was observed
+            (
+                "C(f, omit=['a', 'c']):C(g)",
+                polars::df!(
+                    "C(f, omit=['a', 'c'])[b]:C(g)[u]" => [false, false, true, false],
+                )
+                .unwrap(),
+                polars::df!(
+                    "C(f, omit=['a', 'c'])[b]:C(g)[u]" => [Some(false), None, None, None],
+                )
+                .unwrap(),
+            ),
+        ] {
+            let fitted = fit(&format!("y ~ {source} - 1"), &training);
+            let transformed = fitted.transform(&input).unwrap();
+
+            for (model, expected) in [(&fitted, expected_fit), (&transformed, expected_transform)] {
+                let frame = model.expression(Role::Independent).unwrap().frame();
+                assert!(frame.equals_missing(&expected), "{source}");
+                assert_eq!(frame.dtypes(), expected.dtypes(), "{source}");
+            }
         }
     }
 
