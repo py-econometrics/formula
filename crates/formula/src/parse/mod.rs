@@ -8,8 +8,8 @@ use crate::formula::{Factor, Formula, Formulas, push_unique};
 use crate::parse::ast::{Compose, StepwiseOperator};
 use crate::parse::expand::Expand;
 use crate::transform::{
-    CategoricalDefinition, ExpressionTransform, LevelSelection, Levels, ParameterValue,
-    PolynomialDefinition, StandardizeDefinition, Transform,
+    CategoricalDefinition, ExpressionTransform, ParameterValue, PolynomialDefinition,
+    StandardizeDefinition, Transform,
 };
 use polars::prelude::{PlSmallStr, Scalar};
 use std::collections::{BTreeMap, BTreeSet};
@@ -829,80 +829,19 @@ impl TryFrom<TransformCall> for Factor {
                 Transform::Standardize(Fit::Unfitted(StandardizeDefinition::SCALE))
             }
             "C" => {
-                // `omit=[]` omits nothing, so it is normalised away; we do this here to support
-                // a non-empty `keep` with an `empty` omit
-                let omit = keywords
-                    .remove(CategoricalDefinition::OMIT_PARAMETER)
-                    .filter(
-                        |omit| !matches!(omit, ParameterValue::List(levels) if levels.is_empty()),
-                    );
+                let omit = keywords.remove(CategoricalDefinition::OMIT_PARAMETER);
                 let keep = keywords.remove(CategoricalDefinition::KEEP_PARAMETER);
                 let bins = keywords.remove(CategoricalDefinition::BIN_PARAMETER);
                 keywords.reject_unexpected("C")?;
-                let bins = match bins {
-                    None => None,
-                    Some(ParameterValue::Map(bins)) => Some(
-                        bins.into_iter()
-                            .map(|(name, members)| match Levels::try_from(members) {
-                                // An empty bin would encode a column without any levels
-                                Ok(Levels::List(levels)) if levels.is_empty() => {
-                                    Err(TransformCallError::InvalidParameter {
-                                        transform: "C",
-                                        message: format!(
-                                            "bin '{name}' must name at least one level"
-                                        ),
-                                    })
-                                }
-                                Ok(members) => Ok((name, members)),
-                                Err(_) => Err(TransformCallError::InvalidParameter {
-                                    transform: "C",
-                                    message: format!("bin '{name}' must be a scalar or a list"),
-                                }),
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    ),
-                    Some(_) => {
-                        return Err(TransformCallError::InvalidParameter {
+                let definition =
+                    CategoricalDefinition::from_parameters(omit, keep, bins).map_err(|error| {
+                        TransformCallError::InvalidParameter {
                             transform: "C",
-                            message: "`bin` must be a dict".into(),
-                        });
-                    }
-                };
-                let selection = match (omit, keep) {
-                    (None, None) => None,
-                    (Some(_), Some(_)) => {
-                        return Err(TransformCallError::InvalidParameter {
-                            transform: "C",
-                            message: "`omit` and `keep` are mutually exclusive".into(),
-                        });
-                    }
-                    (Some(omit), None) => match Levels::try_from(omit) {
-                        Ok(omit) => Some(LevelSelection::Omit(omit)),
-                        Err(_) => {
-                            return Err(TransformCallError::InvalidParameter {
-                                transform: "C",
-                                message: "`omit` must be a scalar or a list".into(),
-                            });
+                            message: error.to_string(),
                         }
-                    },
-                    (None, Some(keep)) => match Levels::try_from(keep) {
-                        // Keeping no levels would leave a term without columns
-                        Ok(Levels::List(levels)) if levels.is_empty() => {
-                            return Err(TransformCallError::InvalidParameter {
-                                transform: "C",
-                                message: "`keep` must name at least one level".into(),
-                            });
-                        }
-                        Ok(keep) => Some(LevelSelection::Keep(keep)),
-                        Err(_) => {
-                            return Err(TransformCallError::InvalidParameter {
-                                transform: "C",
-                                message: "`keep` must be a scalar or a list".into(),
-                            });
-                        }
-                    },
-                };
-                Transform::C(Fit::Unfitted(CategoricalDefinition::new(selection, bins)))
+                    })?;
+
+                Transform::C(Fit::Unfitted(definition))
             }
             "poly" => {
                 let keyword = keywords.remove(PolynomialDefinition::DEGREE_PARAMETER);
@@ -940,12 +879,13 @@ impl TryFrom<TransformCall> for Factor {
                 let raw = keywords.remove(PolynomialDefinition::RAW_PARAMETER);
                 keywords.reject_unexpected("poly")?;
 
-                let definition = PolynomialDefinition::new(degree, raw).map_err(|error| {
-                    TransformCallError::InvalidParameter {
-                        transform: "poly",
-                        message: error.to_string(),
-                    }
-                })?;
+                let definition =
+                    PolynomialDefinition::from_parameters(degree, raw).map_err(|error| {
+                        TransformCallError::InvalidParameter {
+                            transform: "poly",
+                            message: error.to_string(),
+                        }
+                    })?;
 
                 Transform::Poly(Fit::Unfitted(definition))
             }
@@ -1031,6 +971,7 @@ mod tests {
     use super::*;
     use crate::formula::Role;
     use crate::parse::ast as typed;
+    use crate::transform::{LevelSelection, Levels};
 
     #[test]
     fn parameter_list_parser_preserves_each_elements_scalar_type() {
@@ -1899,7 +1840,7 @@ mod tests {
             let expected = Factor {
                 kind: FactorKind::Call {
                     transform: Transform::Poly(Fit::Unfitted(
-                        PolynomialDefinition::new(
+                        PolynomialDefinition::from_parameters(
                             Some(ParameterValue::Scalar(Scalar::from(degree))),
                             Some(ParameterValue::Scalar(Scalar::from(raw))),
                         )
