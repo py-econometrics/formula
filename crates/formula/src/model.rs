@@ -850,6 +850,8 @@ mod tests {
                 .select_terms("x:C(g, omit='a')", Role::Independent)
                 .unwrap()
                 .select_terms("C(g, omit='a'):x", Role::Independent)
+                .unwrap()
+                .select_terms("i(g, x, omit='a')", Role::Independent)
                 .unwrap();
             let input = polars::df!(
                 "g" => ["c", "b", "a", "new"], "x" => [10.0, 20.0, 30.0, 40.0],
