@@ -331,23 +331,19 @@ pub struct Term {
     combinations: Option<Combinations>,
 }
 
-// Interaction identity ignores factor order: a:b equals b:a.
-// Keep storage order for output naming and column ordering.
-// This comparison relies on terms containing no duplicate factors.
+// Terms store their factors sorted, so a:b equals b:a
 impl PartialEq for Term {
     fn eq(&self, other: &Self) -> bool {
-        self.factors.len() == other.factors.len()
-            && self
-                .factors
-                .iter()
-                .all(|factor| other.factors.contains(factor))
+        self.factors == other.factors
     }
 }
 
 impl FromIterator<Arc<Factor>> for Term {
     fn from_iter<T: IntoIterator<Item = Arc<Factor>>>(factors: T) -> Self {
+        let mut factors = collect_unique(factors);
+        factors.sort_by_cached_key(|factor| factor.render());
         Self {
-            factors: collect_unique(factors),
+            factors,
             combinations: None,
         }
     }
@@ -2644,43 +2640,42 @@ mod tests {
             (
                 "C(f):x:C(g)",
                 polars::df!(
-                    "C(f)[a]:x:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
-                    "C(f)[a]:x:C(g)[v]" => [0.0, 2.0, 0.0, 0.0],
-                    "C(f)[b]:x:C(g)[u]" => [0.0, 0.0, 3.0, 0.0],
-                    "C(f)[c]:x:C(g)[v]" => [0.0, 0.0, 0.0, 4.0],
+                    "C(f)[a]:C(g)[u]:x" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:C(g)[v]:x" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[b]:C(g)[u]:x" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[c]:C(g)[v]:x" => [0.0, 0.0, 0.0, 4.0],
                 )
                 .unwrap(),
                 polars::df!(
-                    "C(f)[a]:x:C(g)[u]" => [Some(0.0), None, None, None],
-                    "C(f)[a]:x:C(g)[v]" => [Some(5.0), None, None, None],
-                    "C(f)[b]:x:C(g)[u]" => [Some(0.0), None, None, None],
-                    "C(f)[c]:x:C(g)[v]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:C(g)[u]:x" => [Some(0.0), None, None, None],
+                    "C(f)[a]:C(g)[v]:x" => [Some(5.0), None, None, None],
+                    "C(f)[b]:C(g)[u]:x" => [Some(0.0), None, None, None],
+                    "C(f)[c]:C(g)[v]:x" => [Some(0.0), None, None, None],
                 )
                 .unwrap(),
             ),
-            // The columns of a numeric factor between categorical ones keep the product's order
             (
                 "C(f):poly(x, 2, raw=true):C(g)",
                 polars::df!(
-                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
-                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [0.0, 2.0, 0.0, 0.0],
-                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [1.0, 0.0, 0.0, 0.0],
-                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [0.0, 4.0, 0.0, 0.0],
-                    "C(f)[b]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [0.0, 0.0, 3.0, 0.0],
-                    "C(f)[b]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [0.0, 0.0, 9.0, 0.0],
-                    "C(f)[c]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [0.0, 0.0, 0.0, 4.0],
-                    "C(f)[c]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [0.0, 0.0, 0.0, 16.0],
+                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [0.0, 4.0, 0.0, 0.0],
+                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [0.0, 0.0, 9.0, 0.0],
+                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [0.0, 0.0, 0.0, 4.0],
+                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [0.0, 0.0, 0.0, 16.0],
                 )
                 .unwrap(),
                 polars::df!(
-                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [Some(0.0), None, None, None],
-                    "C(f)[a]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [Some(5.0), None, None, None],
-                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [Some(0.0), None, None, None],
-                    "C(f)[a]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [Some(25.0), None, None, None],
-                    "C(f)[b]:poly(x, degree=2, raw=true)[1]:C(g)[u]" => [Some(0.0), None, None, None],
-                    "C(f)[b]:poly(x, degree=2, raw=true)[2]:C(g)[u]" => [Some(0.0), None, None, None],
-                    "C(f)[c]:poly(x, degree=2, raw=true)[1]:C(g)[v]" => [Some(0.0), None, None, None],
-                    "C(f)[c]:poly(x, degree=2, raw=true)[2]:C(g)[v]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
+                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [Some(5.0), None, None, None],
+                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [Some(25.0), None, None, None],
+                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
+                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
+                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
                 )
                 .unwrap(),
             ),
@@ -3375,15 +3370,15 @@ mod tests {
 
     #[test]
     fn planning_deduplicates_factors_across_formula_sides() {
-        for (source, count, right_index) in [
-            ("log(x) ~ log(x) - 1", 2, 0),
-            ("C(x) ~ C(x) - 1", 2, 0),
-            ("C(x, omit='a') ~ C(x, omit='a') - 1", 2, 0),
-            ("C(x):z ~ z:C(x) - 1", 3, 1),
-            ("C(x, omit='a'):C(z) ~ C(z):C(x, omit='a') - 1", 4, 1),
-            ("poly(x, raw=true) ~ poly(x, degree=1, raw=true) - 1", 2, 0),
-            ("poly(x) ~ poly(x, degree=1, raw=false) - 1", 2, 0),
-            ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2, 0),
+        for (source, count) in [
+            ("log(x) ~ log(x) - 1", 2),
+            ("C(x) ~ C(x) - 1", 2),
+            ("C(x, omit='a') ~ C(x, omit='a') - 1", 2),
+            ("C(x):z ~ z:C(x) - 1", 3),
+            ("C(x, omit='a'):C(z) ~ C(z):C(x, omit='a') - 1", 4),
+            ("poly(x, raw=true) ~ poly(x, degree=1, raw=true) - 1", 2),
+            ("poly(x) ~ poly(x, degree=1, raw=false) - 1", 2),
+            ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2),
         ] {
             let formula = crate::parse(source).unwrap().iter().next().unwrap().clone();
             let scheduled = schedule_factors(&[
@@ -3395,7 +3390,7 @@ mod tests {
             assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
             assert_eq!(
                 formula.expressions[&Role::Dependent].terms[0].factors[0],
-                formula.expressions[&Role::Independent].terms[0].factors[right_index],
+                formula.expressions[&Role::Independent].terms[0].factors[0],
                 "{source}"
             );
             for factor in formula.expressions[&Role::Dependent].terms[0]
@@ -3647,12 +3642,46 @@ mod tests {
     }
 
     #[test]
-    fn interaction_deduplication_preserves_first_output_name() {
-        let data = polars::df!("a" => [2.0, 4.0], "b" => [3.0, 5.0]).unwrap();
-        let model = fit("a ~ b:a + a:b - 1", &data);
-        let output = model.expression(Role::Independent).unwrap().frame();
-        assert_eq!(output.shape(), (2, 1));
-        assert_eq!(output.columns()[0].name().as_str(), "b:a");
+    fn interactions_have_one_factor_order_however_written() {
+        let data = polars::df!(
+            "y" => [1.0, 2.0, 3.0, 4.0],
+            "x" => [1.0, 2.0, 3.0, 4.0],
+            "g" => ["a", "a", "b", "b"],
+            "h" => ["c", "d", "c", "d"],
+        )
+        .unwrap();
+        for (sources, expected) in [
+            (
+                &[
+                    "y ~ x:C(g) - 1",
+                    "y ~ C(g):x - 1",
+                    "y ~ x:C(g) + C(g):x - 1",
+                ][..],
+                "y ~ C(g):x - 1",
+            ),
+            (
+                &["y ~ C(h):C(g) - 1", "y ~ C(g):C(h) - 1"],
+                "y ~ C(g):C(h) - 1",
+            ),
+            (
+                &["y ~ x:C(h):C(g) - 1", "y ~ C(g):x:C(h) - 1"],
+                "y ~ C(g):C(h):x - 1",
+            ),
+        ] {
+            let models = sources
+                .iter()
+                .map(|source| fit(source, &data))
+                .collect::<Vec<_>>();
+            for (source, model) in sources.iter().zip(&models) {
+                assert_eq!(model.formula().to_string(), expected, "{source}");
+                // Fitted separately, each model names and orders its columns as the first does
+                assert_eq!(
+                    model.expression(Role::Independent).unwrap().frame(),
+                    models[0].expression(Role::Independent).unwrap().frame(),
+                    "{source}"
+                );
+            }
+        }
     }
 
     fn assert_requires_one_argument(make_transform: impl Fn() -> Transform) {
