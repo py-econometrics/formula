@@ -69,7 +69,7 @@ jobs:
         run: pixi run --locked test
 
   polars:
-    name: Python tests (polars ${{ matrix.polars }})
+    name: Polars compatibility (${{ matrix.polars }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
