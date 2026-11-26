@@ -1585,7 +1585,7 @@ mod tests {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
         for source in [
             "y ~ sw(x, z)",
-            "y ~ x + [x ~ sw(x, z)]",
+            "y ~ x + [x ~ sw(z, y)]",
             "y ~ [x ~ z - 1] - 1",
         ] {
             let specification = crate::parse(source).unwrap();

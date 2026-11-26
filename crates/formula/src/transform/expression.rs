@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn scalar_only_calls_use_height_without_input_columns() {
-        let specification = crate::parse("add(2, 3) ~ add(2, 3) - 1").unwrap();
+        let specification = crate::parse("add(1, 2) ~ add(2, 3) - 1").unwrap();
         for height in [0, 3] {
             let data = DataFrame::empty_with_height(height);
             let models = specification.fit(&data).unwrap();

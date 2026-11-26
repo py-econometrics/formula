@@ -165,7 +165,7 @@ def test_model_indexing(data):
         "y ~ sw(x, z)",
         "y ~ x - 1 + 1",
         "y ~ x - 1 + 1 + z",
-        "y ~ x + [x ~ sw(x, z)]",
+        "y ~ x + [x ~ sw(z, y)]",
         "y ~ [x ~ z - 1] - 1",
         "y ~ x + [x ~ z + [z ~ x]] + [z ~ x | firm]",
     ],
