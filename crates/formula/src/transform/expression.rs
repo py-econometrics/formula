@@ -316,7 +316,7 @@ mod tests {
             let output = fit(source, &data);
             assert_numeric_output(
                 output.expression(crate::Role::Independent).unwrap().frame(),
-                "mul(x, 2)",
+                source,
                 &expected,
             );
         }

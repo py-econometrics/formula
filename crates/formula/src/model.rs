@@ -416,7 +416,7 @@ mod tests {
                     .unwrap()
                     .frame()
                     .get_column_names(),
-                ["Intercept", "x"],
+                ["1", "x"],
             );
             let effects = model.expression(Role::FixedEffect).unwrap().frame();
             assert_eq!(effects.shape(), (3, 3));
@@ -1498,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_effect_names_preserve_input_names_and_ignore_group_order() {
+    fn fixed_effect_names_render_inputs_and_ignore_group_order() {
         let data = polars::df!(
             "y" => [1.0, 2.0], "x" => [3.0, 4.0],
             "firm name" => ["a", "b"], "f2" => ["u", "v"],
@@ -1517,10 +1517,10 @@ mod tests {
         for models in [&models, &applied] {
             for (model, expected) in models.iter().zip([
                 vec![
-                    "G(firm name, intercept=true)[group]",
-                    "G(firm name:f2, intercept=true)[group]",
+                    "G(`firm name`, intercept=true)[group]",
+                    "G(`firm name`:f2, intercept=true)[group]",
                 ],
-                vec!["G(firm name:f2, intercept=true)[group]"],
+                vec!["G(`firm name`:f2, intercept=true)[group]"],
             ]) {
                 assert_eq!(
                     model
@@ -1610,10 +1610,10 @@ mod tests {
     fn equivalent_formulas_preserve_the_first_models_column_order() {
         let data = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "z" => [5.0, 6.0]).unwrap();
         let cases: &[(&[&str], &[&str])] = &[
-            (&["y ~ x + z", "y ~ z + x"], &["Intercept", "x", "z"]),
-            (&["y ~ z + x", "y ~ x + z"], &["Intercept", "z", "x"]),
-            (&["y ~ x - 1 + 1", "y ~ x + 1"], &["x", "Intercept"]),
-            (&["y ~ x + 1", "y ~ x - 1 + 1"], &["Intercept", "x"]),
+            (&["y ~ x + z", "y ~ z + x"], &["1", "x", "z"]),
+            (&["y ~ z + x", "y ~ x + z"], &["1", "z", "x"]),
+            (&["y ~ x - 1 + 1", "y ~ x + 1"], &["x", "1"]),
+            (&["y ~ x + 1", "y ~ x - 1 + 1"], &["1", "x"]),
         ];
 
         for &(sources, expected_columns) in cases {

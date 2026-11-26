@@ -38,7 +38,7 @@ def test_categorical_omit_scalar_and_list(argument, parameter, remaining, dtype)
     assert call.parameters == {"omit": parameter}
     assert [column.contributions[0].key for column in term.columns] == remaining
     assert [column.data.name for column in term.columns] == [
-        f"C(g, omit={argument})[{level}]" for level in remaining
+        f"C(g, omit={argument})[`{level}`]" for level in remaining
     ]
 
     prediction = model.select(formula.Role.Independent).transform(
