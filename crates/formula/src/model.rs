@@ -1055,7 +1055,7 @@ mod tests {
             .unwrap();
             let model = fit("y ~ w + z + z:x + x", &data);
             let expected = polars::df!(
-                "z" => [5.0, 6.0], "z:x" => [15.0, 24.0], "x" => [3.0, 4.0],
+                "z" => [5.0, 6.0], "x:z" => [15.0, 24.0], "x" => [3.0, 4.0],
             )
             .unwrap();
             for query in ["x*z", "x + x:z + z + z:x", "(x*z + w) - w"] {
@@ -1073,7 +1073,7 @@ mod tests {
                             .map(|factor| factor.column().unwrap())
                             .collect::<Vec<_>>())
                         .collect::<Vec<_>>(),
-                    vec![vec!["z"], vec!["z", "x"], vec!["x"]],
+                    vec![vec!["z"], vec!["x", "z"], vec!["x"]],
                 );
                 assert_eq!(selected.formula(), model.formula());
                 assert!(selected.expression(Role::Dependent).is_none());
@@ -1498,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_effect_names_preserve_input_names_and_factor_order() {
+    fn fixed_effect_names_preserve_input_names_and_ignore_group_order() {
         let data = polars::df!(
             "y" => [1.0, 2.0], "x" => [3.0, 4.0],
             "firm name" => ["a", "b"], "f2" => ["u", "v"],
@@ -1520,7 +1520,7 @@ mod tests {
                     "G(firm name, intercept=true)[group]",
                     "G(firm name:f2, intercept=true)[group]",
                 ],
-                vec!["G(f2:firm name, intercept=true)[group]"],
+                vec!["G(firm name:f2, intercept=true)[group]"],
             ]) {
                 assert_eq!(
                     model
