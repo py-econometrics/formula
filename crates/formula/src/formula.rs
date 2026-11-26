@@ -873,6 +873,29 @@ impl Formula {
             .try_for_each(|(_, expression)| expression.validate())
     }
 
+    fn reject_duplicate_terms(&self) -> Result<(), ValidationError> {
+        let expressions = self.expressions.iter().collect::<Vec<_>>();
+        for (index, &(&first, expression)) in expressions.iter().enumerate() {
+            for &(&second, other) in &expressions[index + 1..] {
+                if let Some(term) = expression
+                    .terms
+                    .iter()
+                    .find(|term| other.terms.contains(term))
+                {
+                    return Err(ValidationError::DuplicateTerm {
+                        term: term.render(),
+                        roles: [first, second],
+                    });
+                }
+            }
+        }
+        // Each multi-stage child is a separate formula
+        self.expressions
+            .values()
+            .flat_map(|expression| &expression.children)
+            .try_for_each(Formula::reject_duplicate_terms)
+    }
+
     fn lower(&self, data: &DataFrame) -> Result<Self, TransformError> {
         let expressions = self
             .expressions
@@ -981,6 +1004,9 @@ impl Formulas {
             .iter()
             .map(|formula| formula.lower(data))
             .collect::<Result<Vec<_>, _>>()?;
+        for formula in &lowered {
+            formula.reject_duplicate_terms()?;
+        }
         let expressions = lowered
             .iter()
             .flat_map(Formula::all_expressions)
@@ -1034,6 +1060,11 @@ pub enum ValidationError {
         actual: usize,
     },
     InvalidTransformComposition,
+    /// A term that occurs in two roles of one formula
+    DuplicateTerm {
+        term: String,
+        roles: [Role; 2],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1494,6 +1525,13 @@ impl std::fmt::Display for ValidationError {
             Self::InvalidTransformComposition => {
                 f.write_str("an expanding transform cannot be used as a transform argument")
             }
+            Self::DuplicateTerm {
+                term,
+                roles: [first, second],
+            } => write!(
+                f,
+                "term {term} occurs in both roles {first:?} and {second:?}"
+            ),
         }
     }
 }
@@ -1972,6 +2010,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terms_repeated_across_roles_are_rejected() {
+        let data = naming_data();
+        let roles = [Role::Dependent, Role::Independent];
+        for (source, expected) in [
+            ("log(x) ~ log(x) - 1", "log(x)"),
+            // Interaction identity ignores factor order
+            ("x:z ~ z:x - 1", "x:z"),
+            // `g` lowers to C(g) on both sides
+            ("g ~ C(g) - 1", "C(g)"),
+            // Within a multi-stage child
+            ("y ~ z + [log(x) ~ log(x) - 1]", "log(x)"),
+        ] {
+            let Err(error) = crate::parse(source).unwrap().fit(&data) else {
+                panic!("{source} must be rejected");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    ModelError::Validation(ValidationError::DuplicateTerm { term, roles: actual })
+                        if term == expected && *actual == roles
+                ),
+                "{source}: {error}"
+            );
+        }
+        // A child is a separate formula, so it may share terms with its parent
+        for source in ["y ~ log(y)", "x ~ C(x)", "y ~ log(x) + [log(x) ~ z]"] {
+            assert!(crate::parse(source).unwrap().fit(&data).is_ok(), "{source}");
+        }
+    }
+
     /// The name a column should have, derived from its structure: its components' names joined
     /// with `:` in the term's factor order, or `1` for the intercept. A component is named by its
     /// factor's rendering, followed by its label if the factor expands. Categorical labels are
@@ -2341,7 +2410,7 @@ mod tests {
 
     #[test]
     fn multiplicative_operators_preserve_column_order() {
-        let data = polars::df!("a" => [2.0], "b" => [3.0], "c" => [4.0]).unwrap();
+        let data = polars::df!("y" => [1.0], "a" => [2.0], "b" => [3.0], "c" => [4.0]).unwrap();
         let cases: &[(&str, &[&str])] = &[
             ("a*b*c", &["a", "b", "a:b", "c", "a:c", "b:c", "a:b:c"]),
             ("a*b/c", &["a", "b", "a:b", "a:b:c"]),
@@ -2349,7 +2418,7 @@ mod tests {
             ("a*(b/c)", &["a", "b", "b:c", "a:b", "a:b:c"]),
         ];
         for &(source, names) in cases {
-            let model = fit(&format!("a ~ {source} - 1"), &data);
+            let model = fit(&format!("y ~ {source} - 1"), &data);
             let output = model.expression(Role::Independent).unwrap().frame();
             assert_eq!(output.get_column_names(), names, "{source}");
         }
@@ -2460,6 +2529,7 @@ mod tests {
     #[test]
     fn quoted_columns_are_named_as_rendered_and_preserve_values_on_fitting_and_transformation() {
         let training = polars::df!(
+            "y" => [1.0, 2.0],
             "household income" => [4.0, 9.0],
             "income-growth" => [2.0, 3.0],
             "a+b" => [5.0, 6.0],
@@ -2488,7 +2558,7 @@ mod tests {
                 polars::df!("`household income`:`income-growth`" => [8.0, 27.0]).unwrap(),
             ),
         ] {
-            let fitted = fit(&format!("`household income` ~ {source} - 1"), &training);
+            let fitted = fit(&format!("y ~ {source} - 1"), &training);
             assert!(
                 fitted
                     .expression(Role::Independent)
