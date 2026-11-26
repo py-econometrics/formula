@@ -5,7 +5,7 @@ description = "Wilkinson formulas powered by Polars"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["polars==2.1.0"]
+dependencies = ["polars>=1.43.2"]
 
 [build-system]
 requires = ["maturin>=1.7,<2"]
