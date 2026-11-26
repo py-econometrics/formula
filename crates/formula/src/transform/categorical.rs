@@ -170,7 +170,9 @@ impl CategoricalDefinition {
 
     fn output_name(&self, input_name: &str, level: &Scalar) -> PlSmallStr {
         let call = self.call_name(&[input_name]);
-        format!("{call}[{}]", Self::level_name(level)).into()
+        // Backtick-quote the label, doubling embedded backticks
+        let label = Self::level_name(level).replace('`', "``");
+        format!("{call}[`{label}`]").into()
     }
 
     fn level_name(level: &Scalar) -> String {
@@ -657,7 +659,10 @@ mod tests {
             let fitted = Fitted::fit(CategoricalDefinition::new(None, None), &prepared_training)?;
             let output = fitted.transform(&prepared_training)?;
 
-            assert_eq!(output.frame().get_column_names(), ["C(x)[b]", "C(x)[d]"]);
+            assert_eq!(
+                output.frame().get_column_names(),
+                ["C(x)[`b`]", "C(x)[`d`]"]
+            );
             assert_output(
                 &fitted.definition,
                 &fitted.state,
@@ -693,15 +698,15 @@ mod tests {
         for (input, expected) in [
             (
                 Column::new("x".into(), [10_i64, 9, 2, 9]),
-                ["C(x)[2]", "C(x)[9]", "C(x)[10]"],
+                ["C(x)[`2`]", "C(x)[`9`]", "C(x)[`10`]"],
             ),
             (
                 labels.cast(&categorical)?,
-                ["C(x)[a]", "C(x)[b]", "C(x)[c]"],
+                ["C(x)[`a`]", "C(x)[`b`]", "C(x)[`c`]"],
             ),
             (
                 labels.cast(&enumeration)?,
-                ["C(x)[c]", "C(x)[a]", "C(x)[b]"],
+                ["C(x)[`c`]", "C(x)[`a`]", "C(x)[`b`]"],
             ),
         ] {
             let prepared = prepare(&[input]);
@@ -757,7 +762,7 @@ mod tests {
             ];
             let prepared_input = prepare(&input);
             let output = fitted.transform(&prepared_input)?;
-            assert_eq!(output.frame().get_column_names(), ["C(x, omit='b')[d]"]);
+            assert_eq!(output.frame().get_column_names(), ["C(x, omit='b')[`d`]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
@@ -1180,7 +1185,7 @@ mod tests {
             );
             let names = levels[..count]
                 .iter()
-                .map(|level| format!("C(group)[{level}]"))
+                .map(|level| format!("C(group)[`{level}`]"))
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
@@ -1240,7 +1245,7 @@ mod tests {
             );
             let names = levels[1..count]
                 .iter()
-                .map(|level| format!("C(group, omit='a')[{level}]"))
+                .map(|level| format!("C(group, omit='a')[`{level}`]"))
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
@@ -1283,8 +1288,8 @@ mod tests {
         assert_eq!(
             output.frame().get_column_names(),
             [
-                "C(group, keep=['d', 'b'])[b]",
-                "C(group, keep=['d', 'b'])[d]"
+                "C(group, keep=['d', 'b'])[`b`]",
+                "C(group, keep=['d', 'b'])[`d`]"
             ]
         );
         assert_output(
@@ -1583,9 +1588,9 @@ mod tests {
         assert_eq!(
             output.frame().get_column_names(),
             [
-                "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[a]",
-                "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[db]",
-                "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[x]",
+                "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[`a`]",
+                "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[`db`]",
+                "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[`x`]",
             ]
         );
         assert_output(
@@ -1630,15 +1635,15 @@ mod tests {
             (
                 LevelSelection::Omit(Levels::Scalar(text("a"))),
                 [
-                    "C(group, bin={'a': ['a', 'b']}, omit='a')[c]",
-                    "C(group, bin={'a': ['a', 'b']}, omit='a')[d]",
+                    "C(group, bin={'a': ['a', 'b']}, omit='a')[`c`]",
+                    "C(group, bin={'a': ['a', 'b']}, omit='a')[`d`]",
                 ],
             ),
             (
                 LevelSelection::Keep(Levels::List(vec![text("c"), text("a")])),
                 [
-                    "C(group, bin={'a': ['a', 'b']}, keep=['c', 'a'])[a]",
-                    "C(group, bin={'a': ['a', 'b']}, keep=['c', 'a'])[c]",
+                    "C(group, bin={'a': ['a', 'b']}, keep=['c', 'a'])[`a`]",
+                    "C(group, bin={'a': ['a', 'b']}, keep=['c', 'a'])[`c`]",
                 ],
             ),
         ] {
@@ -1679,7 +1684,7 @@ mod tests {
         )?;
         assert_eq!(
             named.transform(&training)?.frame().get_column_names(),
-            ["C(x, bin={'1': [1, 2]}, omit='1')[3]"]
+            ["C(x, bin={'1': [1, 2]}, omit='1')[`3`]"]
         );
 
         let error = CategoricalDefinition::new(

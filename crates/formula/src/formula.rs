@@ -102,7 +102,9 @@ impl Definition<VariableState> for VariableDefinition {
     }
 
     fn transform(&self, _state: &VariableState, input: &Column) -> Result<Column, TransformError> {
-        Ok(input.clone())
+        Ok(input
+            .clone()
+            .with_name(render_column_name(&self.name).into()))
     }
 }
 
@@ -281,7 +283,7 @@ impl Factor {
         match &self.kind {
             FactorKind::Variable(variable) => render_column_name(&variable.definition().name),
             FactorKind::Literal(value) => match value.as_any_value() {
-                AnyValue::Int64(value) => value.to_string(),
+                AnyValue::Int64(value) => format!("{value:?}"),
                 AnyValue::Float64(value) => format!("{value:?}"),
                 _ => unreachable!("formula arguments contain only numeric literals"),
             },
@@ -362,7 +364,7 @@ impl From<Factor> for Term {
 }
 
 impl Term {
-    const INTERCEPT_COLUMN_NAME: &'static str = "Intercept";
+    const INTERCEPT_COLUMN_NAME: &'static str = "1";
 
     fn fixed_effect(group: Vec<Arc<Factor>>, loadings: Vec<Arc<Factor>>, intercept: bool) -> Self {
         let group = Arc::new(Factor {
@@ -1233,11 +1235,6 @@ impl<'a> FormulaColumn<'a> {
     }
 }
 
-fn literal_column(value: &Scalar, height: usize) -> Column {
-    let name = value.as_any_value().str_value().into_owned();
-    Column::new_scalar(name.into(), value.clone(), height)
-}
-
 fn fit_and_transform_factors(
     scheduled: &[Arc<Factor>],
     data: &DataFrame,
@@ -1249,7 +1246,8 @@ fn fit_and_transform_factors(
             FactorKind::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
                 output: TransformOutput::Columns(MaterializedColumns::single_column(
-                    literal_column(value, data.height()).into_frame(),
+                    Column::new_scalar(factor.render().into(), value.clone(), data.height())
+                        .into_frame(),
                     ComponentKey::None,
                 )),
             },
@@ -1314,7 +1312,8 @@ fn transform_factors(
         let output = match &factor.kind {
             FactorKind::Literal(value) => {
                 TransformOutput::Columns(MaterializedColumns::single_column(
-                    literal_column(value, data.height()).into_frame(),
+                    Column::new_scalar(factor.render().into(), value.clone(), data.height())
+                        .into_frame(),
                     ComponentKey::None,
                 ))
             }
@@ -1873,8 +1872,12 @@ mod tests {
             "log(`firm name`)",
             "log(`a``b`)",
             "log(`1`)",
+            "log(`log(x)`)",
+            "log(`x:z`)",
             "add(x, 2)",
             "add(x, 2.0)",
+            "add(x, 1e18)",
+            "add(x, 1.00001e18)",
             "C(`group name`, omit='a')",
             "C(`group name`, keep=['a', 'b'])",
         ] {
@@ -1885,6 +1888,141 @@ mod tests {
                 original,
                 "{source}"
             );
+        }
+    }
+
+    fn naming_data() -> DataFrame {
+        polars::df!(
+            "y" => [1.0, 2.0, 3.0],
+            "x" => [1.0, 2.0, 3.0],
+            "z" => [2.0, 3.0, 5.0],
+            "log(x)" => [4.0, 5.0, 6.0],
+            "x:z" => [7.0, 8.0, 9.0],
+            "1" => [10.0, 11.0, 12.0],
+            "a`b" => [13.0, 14.0, 15.0],
+            "g" => ["a", "a]:C(h)[b", "a`b"],
+            "h" => ["b", "b", "c"],
+            "q" => ["it's", "say \"hi\"", "back\\slash"],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn distinct_columns_have_distinct_names() {
+        let data = naming_data();
+        for (source, expected) in [
+            ("y ~ log(x) + `log(x)` - 1", &["log(x)", "`log(x)`"][..]),
+            ("y ~ x:z + `x:z` - 1", &["x:z", "`x:z`"]),
+            (
+                "y ~ log(`log(x)`) + log(log(x)) - 1",
+                &["log(`log(x)`)", "log(log(x))"],
+            ),
+            (
+                "y ~ pow(x, 1e18) + pow(x, 1.00001e18) - 1",
+                &["pow(x, 1e18)", "pow(x, 1.00001e18)"],
+            ),
+            ("y ~ `1`", &["1", "`1`"]),
+            (
+                "y ~ C(g) + C(g):C(h) - 1",
+                &[
+                    "C(g)[`a`]",
+                    "C(g)[`a]:C(h)[b`]",
+                    "C(g)[`a``b`]",
+                    "C(g)[`a`]:C(h)[`b`]",
+                    "C(g)[`a]:C(h)[b`]:C(h)[`b`]",
+                    "C(g)[`a``b`]:C(h)[`c`]",
+                ],
+            ),
+            (
+                "y ~ C(q) - 1",
+                &["C(q)[`back\\slash`]", "C(q)[`it's`]", "C(q)[`say \"hi\"`]"],
+            ),
+            (
+                "y ~ C(h) + C(h, omit='b') + C(h, keep=['b']) - 1",
+                &[
+                    "C(h)[`b`]",
+                    "C(h)[`c`]",
+                    "C(h, omit='b')[`c`]",
+                    "C(h, keep=['b'])[`b`]",
+                ],
+            ),
+            (
+                "y ~ poly(x, 2) + poly(x, 2, raw=true) - 1",
+                &[
+                    "poly(x, degree=2, raw=false)[1]",
+                    "poly(x, degree=2, raw=false)[2]",
+                    "poly(x, degree=2, raw=true)[1]",
+                    "poly(x, degree=2, raw=true)[2]",
+                ],
+            ),
+        ] {
+            let model = fit(source, &data);
+            let transformed = model.transform(&data).unwrap();
+            for fitted in [&model, &transformed] {
+                assert_eq!(
+                    fitted
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .get_column_names(),
+                    expected,
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    /// The name a column should have, derived from its structure: its components' names joined
+    /// with `:` in the term's factor order, or `1` for the intercept. A component is named by its
+    /// factor's rendering, followed by its label if the factor expands. Categorical labels are
+    /// derived here for string levels only.
+    fn structural_column_name(column: &FormulaColumn) -> String {
+        let names = column
+            .contributions()
+            .map(|(factor, key)| {
+                let rendered = factor.render();
+                match (factor.call().map(|call| call.name()), key) {
+                    (_, ComponentKey::None) => rendered,
+                    (Some("C"), ComponentKey::Scalar(level)) => {
+                        let level = level.as_any_value().str_value().replace('`', "``");
+                        format!("{rendered}[`{level}`]")
+                    }
+                    (Some("poly"), ComponentKey::Scalar(basis)) => {
+                        format!("{rendered}[{}]", basis.as_any_value().str_value())
+                    }
+                    (call, key) => unreachable!("unexpected component of {call:?}: {key:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return "1".to_owned();
+        }
+        names.join(":")
+    }
+
+    #[test]
+    fn column_names_are_derived_from_factor_renderings() {
+        let data = naming_data();
+        for source in [
+            "log(y) ~ log(x) + `log(x)` + log(`log(x)`) + log(log(x))",
+            "`a``b` ~ x:z + `x:z` + z:log(x) + `1`",
+            "y ~ pow(x, 2) + pow(x, 2.0) + pow(x, 1.00001e18) + center(`a``b`)",
+            "y ~ C(g) + C(g):C(h) + h:x + C(h, omit='b'):poly(z, 2)",
+            "y ~ g:h + poly(log(x), 2, raw=true):z",
+        ] {
+            let model = fit(source, &data);
+            let transformed = model.transform(&data).unwrap();
+            for fitted in [&model, &transformed] {
+                for role in [Role::Dependent, Role::Independent] {
+                    for column in fitted.columns(role).unwrap() {
+                        assert_eq!(
+                            column.data().name().as_str(),
+                            structural_column_name(&column),
+                            "{source}: {role:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1940,7 +2078,7 @@ mod tests {
             .unwrap();
             let model = fit("y ~ poly(x, degree=3, raw=true)", &training);
             let expected = polars::df!(
-                "Intercept" => [1.0; 2],
+                "1" => [1.0; 2],
                 "poly(x, degree=3, raw=true)[1]" => [2.0, -3.0],
                 "poly(x, degree=3, raw=true)[2]" => [4.0, 9.0],
                 "poly(x, degree=3, raw=true)[3]" => [8.0, -27.0],
@@ -1957,7 +2095,7 @@ mod tests {
             let prediction = polars::df!("y" => [6.0, 7.0], "x" => [Some(4.0), None]).unwrap();
             let output = model.transform(&prediction).unwrap();
             let expected = polars::df!(
-                "Intercept" => [1.0; 2],
+                "1" => [1.0; 2],
                 "poly(x, degree=3, raw=true)[1]" => [Some(4.0), None],
                 "poly(x, degree=3, raw=true)[2]" => [Some(16.0), None],
                 "poly(x, degree=3, raw=true)[3]" => [Some(64.0), None],
@@ -2043,7 +2181,7 @@ mod tests {
                     assert_eq!(
                         frame.get_column_names(),
                         [
-                            "Intercept",
+                            "1",
                             "poly(x, degree=2, raw=false)[1]",
                             "poly(x, degree=2, raw=false)[2]"
                         ]
@@ -2110,7 +2248,7 @@ mod tests {
                     .frame()
                     .get_column_names(),
                 [
-                    "Intercept",
+                    "1",
                     "poly(log(x), degree=2, raw=true)[1]",
                     "poly(log(x), degree=2, raw=true)[2]",
                 ]
@@ -2268,7 +2406,7 @@ mod tests {
                     .unwrap()
                     .frame()
                     .get_column_names(),
-                ["Intercept", "a", "b", "a:b:c"]
+                ["1", "a", "b", "a:b:c"]
             );
             assert_eq!(
                 actual
@@ -2320,7 +2458,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_columns_preserve_names_and_values_on_fitting_and_transformation() {
+    fn quoted_columns_are_named_as_rendered_and_preserve_values_on_fitting_and_transformation() {
         let training = polars::df!(
             "household income" => [4.0, 9.0],
             "income-growth" => [2.0, 3.0],
@@ -2335,19 +2473,19 @@ mod tests {
         for (source, expected) in [
             (
                 "`household income`",
-                polars::df!("household income" => [4.0, 9.0]).unwrap(),
+                polars::df!("`household income`" => [4.0, 9.0]).unwrap(),
             ),
-            ("`a+b`", polars::df!("a+b" => [5.0, 6.0]).unwrap()),
-            ("`a``b`", polars::df!("a`b" => [7.0, 8.0]).unwrap()),
-            ("``", polars::df!("" => [10.0, 11.0]).unwrap()),
-            ("`1`", polars::df!("1" => [12.0, 13.0]).unwrap()),
+            ("`a+b`", polars::df!("`a+b`" => [5.0, 6.0]).unwrap()),
+            ("`a``b`", polars::df!("`a``b`" => [7.0, 8.0]).unwrap()),
+            ("``", polars::df!("``" => [10.0, 11.0]).unwrap()),
+            ("`1`", polars::df!("`1`" => [12.0, 13.0]).unwrap()),
             (
                 "sqrt(`household income`)",
-                polars::df!("sqrt(household income)" => [2.0, 3.0]).unwrap(),
+                polars::df!("sqrt(`household income`)" => [2.0, 3.0]).unwrap(),
             ),
             (
                 "`household income`:`income-growth`",
-                polars::df!("household income:income-growth" => [8.0, 27.0]).unwrap(),
+                polars::df!("`household income`:`income-growth`" => [8.0, 27.0]).unwrap(),
             ),
         ] {
             let fitted = fit(&format!("`household income` ~ {source} - 1"), &training);
@@ -2568,16 +2706,16 @@ mod tests {
             (
                 "C(group)",
                 polars::df!(
-                    "C(group)[a]" => [Some(false), Some(true), None],
-                    "C(group)[b]" => [Some(true), Some(false), None],
+                    "C(group)[`a`]" => [Some(false), Some(true), None],
+                    "C(group)[`b`]" => [Some(true), Some(false), None],
                 )
                 .unwrap(),
             ),
             (
                 "C(flag)",
                 polars::df!(
-                    "C(flag)[False]" => [true, false, true],
-                    "C(flag)[True]" => [false, true, false],
+                    "C(flag)[`False`]" => [true, false, true],
+                    "C(flag)[`True`]" => [false, true, false],
                 )
                 .unwrap(),
             ),
@@ -2622,17 +2760,17 @@ mod tests {
             (
                 "C(f):C(g)",
                 polars::df!(
-                    "C(f)[a]:C(g)[u]" => [true, false, false, false],
-                    "C(f)[a]:C(g)[v]" => [false, true, false, false],
-                    "C(f)[b]:C(g)[u]" => [false, false, true, false],
-                    "C(f)[c]:C(g)[v]" => [false, false, false, true],
+                    "C(f)[`a`]:C(g)[`u`]" => [true, false, false, false],
+                    "C(f)[`a`]:C(g)[`v`]" => [false, true, false, false],
+                    "C(f)[`b`]:C(g)[`u`]" => [false, false, true, false],
+                    "C(f)[`c`]:C(g)[`v`]" => [false, false, false, true],
                 )
                 .unwrap(),
                 polars::df!(
-                    "C(f)[a]:C(g)[u]" => [Some(false), None, None, None],
-                    "C(f)[a]:C(g)[v]" => [Some(true), None, None, None],
-                    "C(f)[b]:C(g)[u]" => [Some(false), None, None, None],
-                    "C(f)[c]:C(g)[v]" => [Some(false), None, None, None],
+                    "C(f)[`a`]:C(g)[`u`]" => [Some(false), None, None, None],
+                    "C(f)[`a`]:C(g)[`v`]" => [Some(true), None, None, None],
+                    "C(f)[`b`]:C(g)[`u`]" => [Some(false), None, None, None],
+                    "C(f)[`c`]:C(g)[`v`]" => [Some(false), None, None, None],
                 )
                 .unwrap(),
             ),
@@ -2640,42 +2778,42 @@ mod tests {
             (
                 "C(f):x:C(g)",
                 polars::df!(
-                    "C(f)[a]:C(g)[u]:x" => [1.0, 0.0, 0.0, 0.0],
-                    "C(f)[a]:C(g)[v]:x" => [0.0, 2.0, 0.0, 0.0],
-                    "C(f)[b]:C(g)[u]:x" => [0.0, 0.0, 3.0, 0.0],
-                    "C(f)[c]:C(g)[v]:x" => [0.0, 0.0, 0.0, 4.0],
+                    "C(f)[`a`]:C(g)[`u`]:x" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[`a`]:C(g)[`v`]:x" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[`b`]:C(g)[`u`]:x" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[`c`]:C(g)[`v`]:x" => [0.0, 0.0, 0.0, 4.0],
                 )
                 .unwrap(),
                 polars::df!(
-                    "C(f)[a]:C(g)[u]:x" => [Some(0.0), None, None, None],
-                    "C(f)[a]:C(g)[v]:x" => [Some(5.0), None, None, None],
-                    "C(f)[b]:C(g)[u]:x" => [Some(0.0), None, None, None],
-                    "C(f)[c]:C(g)[v]:x" => [Some(0.0), None, None, None],
+                    "C(f)[`a`]:C(g)[`u`]:x" => [Some(0.0), None, None, None],
+                    "C(f)[`a`]:C(g)[`v`]:x" => [Some(5.0), None, None, None],
+                    "C(f)[`b`]:C(g)[`u`]:x" => [Some(0.0), None, None, None],
+                    "C(f)[`c`]:C(g)[`v`]:x" => [Some(0.0), None, None, None],
                 )
                 .unwrap(),
             ),
             (
                 "C(f):poly(x, 2, raw=true):C(g)",
                 polars::df!(
-                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [1.0, 0.0, 0.0, 0.0],
-                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [1.0, 0.0, 0.0, 0.0],
-                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [0.0, 2.0, 0.0, 0.0],
-                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [0.0, 4.0, 0.0, 0.0],
-                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [0.0, 0.0, 3.0, 0.0],
-                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [0.0, 0.0, 9.0, 0.0],
-                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [0.0, 0.0, 0.0, 4.0],
-                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [0.0, 0.0, 0.0, 16.0],
+                    "C(f)[`a`]:C(g)[`u`]:poly(x, degree=2, raw=true)[1]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[`a`]:C(g)[`u`]:poly(x, degree=2, raw=true)[2]" => [1.0, 0.0, 0.0, 0.0],
+                    "C(f)[`a`]:C(g)[`v`]:poly(x, degree=2, raw=true)[1]" => [0.0, 2.0, 0.0, 0.0],
+                    "C(f)[`a`]:C(g)[`v`]:poly(x, degree=2, raw=true)[2]" => [0.0, 4.0, 0.0, 0.0],
+                    "C(f)[`b`]:C(g)[`u`]:poly(x, degree=2, raw=true)[1]" => [0.0, 0.0, 3.0, 0.0],
+                    "C(f)[`b`]:C(g)[`u`]:poly(x, degree=2, raw=true)[2]" => [0.0, 0.0, 9.0, 0.0],
+                    "C(f)[`c`]:C(g)[`v`]:poly(x, degree=2, raw=true)[1]" => [0.0, 0.0, 0.0, 4.0],
+                    "C(f)[`c`]:C(g)[`v`]:poly(x, degree=2, raw=true)[2]" => [0.0, 0.0, 0.0, 16.0],
                 )
                 .unwrap(),
                 polars::df!(
-                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
-                    "C(f)[a]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
-                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [Some(5.0), None, None, None],
-                    "C(f)[a]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [Some(25.0), None, None, None],
-                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
-                    "C(f)[b]:C(g)[u]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
-                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
-                    "C(f)[c]:C(g)[v]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
+                    "C(f)[`a`]:C(g)[`u`]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
+                    "C(f)[`a`]:C(g)[`u`]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
+                    "C(f)[`a`]:C(g)[`v`]:poly(x, degree=2, raw=true)[1]" => [Some(5.0), None, None, None],
+                    "C(f)[`a`]:C(g)[`v`]:poly(x, degree=2, raw=true)[2]" => [Some(25.0), None, None, None],
+                    "C(f)[`b`]:C(g)[`u`]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
+                    "C(f)[`b`]:C(g)[`u`]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
+                    "C(f)[`c`]:C(g)[`v`]:poly(x, degree=2, raw=true)[1]" => [Some(0.0), None, None, None],
+                    "C(f)[`c`]:C(g)[`v`]:poly(x, degree=2, raw=true)[2]" => [Some(0.0), None, None, None],
                 )
                 .unwrap(),
             ),
@@ -2683,11 +2821,11 @@ mod tests {
             (
                 "C(f, omit=['a', 'c']):C(g)",
                 polars::df!(
-                    "C(f, omit=['a', 'c'])[b]:C(g)[u]" => [false, false, true, false],
+                    "C(f, omit=['a', 'c'])[`b`]:C(g)[`u`]" => [false, false, true, false],
                 )
                 .unwrap(),
                 polars::df!(
-                    "C(f, omit=['a', 'c'])[b]:C(g)[u]" => [Some(false), None, None, None],
+                    "C(f, omit=['a', 'c'])[`b`]:C(g)[`u`]" => [Some(false), None, None, None],
                 )
                 .unwrap(),
             ),
@@ -2858,40 +2996,32 @@ mod tests {
             );
 
             let cases: &[(&str, &str, &[&str])] = &[
-                (
-                    "y1 ~ sqrt(exp(sqrt(g))):x",
-                    "y1",
-                    &["Intercept", INTERACTION],
-                ),
+                ("y1 ~ sqrt(exp(sqrt(g))):x", "y1", &["1", INTERACTION]),
                 (
                     "y1 ~ w + sqrt(exp(sqrt(g))):x",
                     "y1",
-                    &["Intercept", "w", INTERACTION],
+                    &["1", "w", INTERACTION],
                 ),
                 (
                     "y1 ~ v + sqrt(exp(sqrt(g))):x",
                     "y1",
-                    &["Intercept", "v", INTERACTION],
+                    &["1", "v", INTERACTION],
                 ),
-                (
-                    "y2 ~ sqrt(exp(sqrt(g))):x",
-                    "y2",
-                    &["Intercept", INTERACTION],
-                ),
+                ("y2 ~ sqrt(exp(sqrt(g))):x", "y2", &["1", INTERACTION]),
                 (
                     "y2 ~ w + sqrt(exp(sqrt(g))):x",
                     "y2",
-                    &["Intercept", "w", INTERACTION],
+                    &["1", "w", INTERACTION],
                 ),
                 (
                     "y2 ~ v + sqrt(exp(sqrt(g))):x",
                     "y2",
-                    &["Intercept", "v", INTERACTION],
+                    &["1", "v", INTERACTION],
                 ),
             ];
             let mut expected_columns = data.clone();
             expected_columns
-                .with_column(Column::new("Intercept".into(), [1.0; 3]))
+                .with_column(Column::new("1".into(), [1.0; 3]))
                 .unwrap();
             expected_columns.with_column(expected_interaction).unwrap();
 
@@ -3090,9 +3220,9 @@ mod tests {
             drop(data);
 
             let expected = polars::df!(
-                "Intercept" => [1.0; 3],
-                "C(g)[a]" => [Some(true), Some(false), None],
-                "C(g)[b]" => [Some(false), Some(true), None],
+                "1" => [1.0; 3],
+                "C(g)[`a`]" => [Some(true), Some(false), None],
+                "C(g)[`b`]" => [Some(false), Some(true), None],
             )
             .unwrap();
             assert!(
@@ -3109,9 +3239,9 @@ mod tests {
             .unwrap();
             let transformed = retained.transform(&fresh).unwrap();
             let expected = polars::df!(
-                "Intercept" => [1.0; 4],
-                "C(g)[a]" => [Some(false), Some(true), None, None],
-                "C(g)[b]" => [Some(true), Some(false), None, None],
+                "1" => [1.0; 4],
+                "C(g)[`a`]" => [Some(false), Some(true), None, None],
+                "C(g)[`b`]" => [Some(true), Some(false), None, None],
             )
             .unwrap();
             assert!(
@@ -3336,13 +3466,13 @@ mod tests {
 
         let input = polars::df!("g" => ["a", "b", "c"]).unwrap();
         let expected_first = polars::df!(
-            "C(g)[a]" => [Some(true), Some(false), None],
-            "C(g)[b]" => [Some(false), Some(true), None],
+            "C(g)[`a`]" => [Some(true), Some(false), None],
+            "C(g)[`b`]" => [Some(false), Some(true), None],
         )
         .unwrap();
         let expected_second = polars::df!(
-            "C(g)[b]" => [None, Some(true), Some(false)],
-            "C(g)[c]" => [None, Some(false), Some(true)],
+            "C(g)[`b`]" => [None, Some(true), Some(false)],
+            "C(g)[`c`]" => [None, Some(false), Some(true)],
         )
         .unwrap();
         for (models, expected) in [(&first, &expected_first), (&second, &expected_second)] {
@@ -3497,7 +3627,7 @@ mod tests {
         for source in ["y ~ x", "y ~ x + 1", "y ~ 1 + x + 1"] {
             let model = fit(source, &data);
             let frame = model.expression(Role::Independent).unwrap().frame();
-            assert_eq!(frame.get_column_names(), ["Intercept", "x"]);
+            assert_eq!(frame.get_column_names(), ["1", "x"]);
             assert_eq!(
                 frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
                 vec![Some(1.0), Some(1.0)]
@@ -3520,15 +3650,15 @@ mod tests {
             ("y ~ -1 + x", &["x"]),
             ("y ~ - 1 + x", &["x"]),
             ("y ~ x - 1", &["x"]),
-            ("y ~ x - 1 + 1", &["x", "Intercept"]),
+            ("y ~ x - 1 + 1", &["x", "1"]),
             ("y ~ x - 1 + 1 - 1", &["x"]),
             ("y ~ 0", &[]),
             ("y ~ 0 + x", &["x"]),
             ("y ~ x + 0", &["x"]),
-            ("y ~ x + 0 + 1", &["x", "Intercept"]),
-            ("y ~ x - 0", &["Intercept", "x"]),
-            ("y ~ x - 1 - 0", &["x", "Intercept"]),
-            ("y ~ -0 + x", &["Intercept", "x"]),
+            ("y ~ x + 0 + 1", &["x", "1"]),
+            ("y ~ x - 0", &["1", "x"]),
+            ("y ~ x - 1 - 0", &["x", "1"]),
+            ("y ~ -0 + x", &["1", "x"]),
         ];
         for &(source, expected) in cases {
             let model = fit(source, &data);
@@ -3550,10 +3680,10 @@ mod tests {
     fn grouped_subtraction_keeps_intercept_removal_local() {
         let data = polars::df!("y" => [2.0], "x" => [3.0], "z" => [4.0]).unwrap();
         let cases: &[(&str, &[&str])] = &[
-            ("y ~ (x - 1)", &["Intercept", "x"]),
-            ("y ~ (1 + x - 1)", &["Intercept", "x"]),
-            ("y ~ (-1 + x)", &["Intercept", "x"]),
-            ("y ~ (0 + x)", &["Intercept", "x"]),
+            ("y ~ (x - 1)", &["1", "x"]),
+            ("y ~ (1 + x - 1)", &["1", "x"]),
+            ("y ~ (-1 + x)", &["1", "x"]),
+            ("y ~ (0 + x)", &["1", "x"]),
             ("y ~ x - (z + 1)", &["x"]),
         ];
         for &(source, expected) in cases {
@@ -3571,18 +3701,17 @@ mod tests {
     }
 
     #[test]
-    fn intercept_name_collision_requires_suppression() {
-        let data = polars::df!("y" => [2.0], "Intercept" => [3.0]).unwrap();
-        assert!(matches!(
-            crate::parse("y ~ Intercept").unwrap().fit(&data),
-            Err(ModelError::Transform(TransformError::Polars(
-                polars::error::PolarsError::Duplicate(_)
-            )))
-        ));
-        let model = fit("y ~ Intercept - 1", &data);
-        assert_eq!(
-            model.expression(Role::Independent).unwrap().frame(),
-            &data.select(["Intercept"]).unwrap()
+    fn intercept_name_differs_from_input_columns_named_like_it() {
+        let data = polars::df!("y" => [2.0], "Intercept" => [3.0], "1" => [4.0]).unwrap();
+        let model = fit("y ~ Intercept + `1`", &data);
+        assert!(
+            model
+                .expression(Role::Independent)
+                .unwrap()
+                .frame()
+                .equals_missing(
+                    &polars::df!("1" => [1.0], "Intercept" => [3.0], "`1`" => [4.0]).unwrap()
+                )
         );
     }
 
@@ -3675,9 +3804,12 @@ mod tests {
             for (source, model) in sources.iter().zip(&models) {
                 assert_eq!(model.formula().to_string(), expected, "{source}");
                 // Fitted separately, each model names and orders its columns as the first does
-                assert_eq!(
-                    model.expression(Role::Independent).unwrap().frame(),
-                    models[0].expression(Role::Independent).unwrap().frame(),
+                assert!(
+                    model
+                        .expression(Role::Independent)
+                        .unwrap()
+                        .frame()
+                        .equals_missing(models[0].expression(Role::Independent).unwrap().frame()),
                     "{source}"
                 );
             }
