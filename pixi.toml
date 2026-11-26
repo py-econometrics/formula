@@ -6,7 +6,7 @@ platforms = ["linux-64", "win-64", "osx-arm64", "osx-64"]
 version = "0.1.0"
 
 [tasks]
-develop = "maturin develop --uv --locked"
+develop = "maturin develop --uv --locked --features testing"
 build = "maturin build --release --locked --out dist"
 test = { cmd = "python -m pytest python/tests", depends-on = ["develop"] }
 lint = "ruff check python"

@@ -42,7 +42,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
-        run: pixi run --locked cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: pixi run --locked cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Compile examples
         run: pixi run --locked cargo check --examples --locked
 
@@ -67,3 +67,38 @@ jobs:
         run: pixi run --locked cargo test --locked
       - name: Run Python tests
         run: pixi run --locked test
+
+  polars:
+    name: Polars compatibility (${{ matrix.polars }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest release that `pyproject.toml` allows, and the newest release on PyPI.
+        polars: ["1.43.2", latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: prefix-dev/setup-pixi@v0.11.3
+        with:
+          cache: true
+          cache-write: ${{ github.ref == 'refs/heads/main' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build the extension with the testing feature
+        run: pixi run --locked maturin build --locked --features testing --out "$RUNNER_TEMP/wheels"
+      - name: Install polars ${{ matrix.polars }}
+        env:
+          POLARS_VERSION: ${{ matrix.polars }}
+        run: |
+          if [[ "$POLARS_VERSION" == latest ]]; then
+            requirement=polars
+          else
+            requirement="polars==$POLARS_VERSION"
+          fi
+          pixi run --locked python -m venv "$RUNNER_TEMP/venv"
+          pixi run --locked uv pip install --python "$RUNNER_TEMP/venv" "$requirement" pytest "$RUNNER_TEMP"/wheels/*.whl
+          "$RUNNER_TEMP/venv/bin/python" -c 'import polars; print("polars", polars.__version__)'
+      - name: Run Python tests
+        run: $RUNNER_TEMP/venv/bin/python -m pytest python/tests

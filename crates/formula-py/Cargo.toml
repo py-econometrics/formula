@@ -8,6 +8,10 @@ publish = false
 name = "_formula"
 crate-type = ["cdylib"]
 
+[features]
+# Exposes `_roundtrip` for the boundary tests. Release builds leave it off.
+testing = []
+
 [dependencies]
 formula = { path = "../formula" }
 pyo3 = "0.29"

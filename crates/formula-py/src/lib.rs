@@ -13,6 +13,15 @@ mod _formula {
         FixedEffectEncoding, Formula, FormulaColumn, Formulas, Role, TransformCall, TransformState,
         parse, parse_many,
     };
+
+    /// Converts `data` to a Rust `DataFrame` and back to Python without evaluating any formula.
+    ///
+    /// The boundary tests in `python/tests/test_boundary.py` call this function.
+    #[cfg(feature = "testing")]
+    #[pyo3::pyfunction(name = "_roundtrip")]
+    fn roundtrip(data: pyo3_polars::PyDataFrame) -> pyo3_polars::PyDataFrame {
+        data
+    }
 }
 
 #[pyfunction]
