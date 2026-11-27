@@ -789,24 +789,13 @@ impl Expression {
             .map(|term| lookup_term(transformed, term).clone())
             .collect::<Vec<_>>();
 
-        let expression = Self::new(
-            terms.iter().map(|term| term.term.clone()),
-            self.children.clone(),
-        );
-
-        let columns = terms
-            .iter()
-            .flat_map(|term| term.columns.frame().columns().iter().cloned())
-            .collect();
-        let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
-
         let children = self
             .children
             .iter()
             .map(|child| child.assemble(height, transformed))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
-        Ok(FittedExpression::new(expression, terms, frame, children))
+        Ok(FittedExpression::new(height, terms, children).map_err(TransformError::from)?)
     }
 
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
@@ -920,20 +909,20 @@ impl Formula {
         Ok(FittedFormula::new(self.clone(), expressions, height))
     }
 
-    fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
+    fn collect_terms<'a>(&'a self, output: &mut Vec<&'a Term>) {
         for expression in self.expressions.values() {
-            output.push(expression);
+            output.extend(&expression.terms);
 
             for child in &expression.children {
-                child.collect_expressions(output);
+                child.collect_terms(output);
             }
         }
     }
 
-    fn all_expressions(&self) -> Vec<&Expression> {
-        let mut expressions = Vec::new();
-        self.collect_expressions(&mut expressions);
-        expressions
+    fn all_terms(&self) -> Vec<&Term> {
+        let mut terms = Vec::new();
+        self.collect_terms(&mut terms);
+        terms
     }
 }
 
@@ -1007,17 +996,17 @@ impl Formulas {
         for formula in &lowered {
             formula.reject_duplicate_terms()?;
         }
-        let expressions = lowered
+        let terms = lowered
             .iter()
-            .flat_map(Formula::all_expressions)
+            .flat_map(Formula::all_terms)
             .collect::<Vec<_>>();
 
         // Fit factors and assemble terms once across every formula
-        let terms = fit_and_transform_terms(&expressions, data)?;
+        let fitted = fit_and_transform_terms(&terms, data)?;
 
         let entries = lowered
             .iter()
-            .map(|formula| formula.assemble(data.height(), &terms))
+            .map(|formula| formula.assemble(data.height(), &fitted))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
         Ok(FittedFormulas::new(entries))
@@ -1138,6 +1127,10 @@ impl FittedTerm {
         self.term.factors()
     }
 
+    pub(crate) fn term(&self) -> &Term {
+        &self.term
+    }
+
     pub fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
         self.columns
             .iter()
@@ -1175,7 +1168,6 @@ impl FittedTerm {
 
 #[derive(Clone, Debug)]
 pub(crate) struct FittedExpression {
-    expression: Expression,
     terms: Vec<FittedTerm>,
     frame: DataFrame,
     children: Vec<FittedFormula>,
@@ -1183,17 +1175,21 @@ pub(crate) struct FittedExpression {
 
 impl FittedExpression {
     fn new(
-        expression: Expression,
+        height: usize,
         terms: Vec<FittedTerm>,
-        frame: DataFrame,
         children: Vec<FittedFormula>,
-    ) -> Self {
-        Self {
-            expression,
+    ) -> PolarsResult<Self> {
+        let columns = terms
+            .iter()
+            .flat_map(|term| term.columns.frame().columns().iter().cloned())
+            .collect();
+        let frame = DataFrame::new(height, columns)?;
+
+        Ok(Self {
             terms,
             frame,
             children,
-        }
+        })
     }
 
     pub(crate) fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
@@ -1204,8 +1200,8 @@ impl FittedExpression {
         &self.terms
     }
 
-    pub(crate) fn expression(&self) -> &Expression {
-        &self.expression
+    pub(crate) fn is_empty(&self) -> bool {
+        self.terms.is_empty() && self.children.is_empty()
     }
 
     pub(crate) fn frame(&self) -> &DataFrame {
@@ -1227,24 +1223,18 @@ impl FittedExpression {
             .map(|term| lookup_term(transformed, &term.term).clone())
             .collect::<Vec<_>>();
 
-        let columns = terms
-            .iter()
-            .flat_map(|term| term.columns.frame().columns().iter().cloned())
-            .collect();
-        let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
-
         let children = self
             .children
             .iter()
             .map(|child| child.assemble(height, transformed))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
-        Ok(Self::new(self.expression.clone(), terms, frame, children))
+        Ok(Self::new(height, terms, children).map_err(TransformError::from)?)
     }
 
     pub(crate) fn select_terms(&self, query: &Expression) -> Result<Self, SelectionError> {
         for term in &query.terms {
-            if !self.expression.terms.contains(term) {
+            if !self.terms.iter().any(|fitted| &fitted.term == term) {
                 return Err(SelectionError::MissingTerm(term.render()));
             }
         }
@@ -1256,15 +1246,7 @@ impl FittedExpression {
             .cloned()
             .collect::<Vec<_>>();
 
-        let expression = Expression::new(terms.iter().map(|term| term.term.clone()), Vec::new());
-
-        let columns = terms
-            .iter()
-            .flat_map(|term| term.columns.frame().columns().iter().cloned())
-            .collect();
-        let frame = DataFrame::new(self.frame.height(), columns).map_err(SelectionError::Frame)?;
-
-        Ok(Self::new(expression, terms, frame, Vec::new()))
+        Self::new(self.frame.height(), terms, Vec::new()).map_err(SelectionError::Frame)
     }
 }
 
@@ -1406,7 +1388,7 @@ fn transform_factors(
     Ok(transformed)
 }
 
-fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
+fn schedule_factors(terms: &[&Term]) -> Vec<Arc<Factor>> {
     fn schedule(factor: &Arc<Factor>, scheduled: &mut Vec<Arc<Factor>>) {
         // Structural equality check if factor is already scheduled.
         if scheduled.contains(factor) {
@@ -1423,11 +1405,9 @@ fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
     }
 
     let mut scheduled = Vec::new();
-    for expression in expressions {
-        for term in &expression.terms {
-            for factor in &term.factors {
-                schedule(factor, &mut scheduled);
-            }
+    for term in terms {
+        for factor in &term.factors {
+            schedule(factor, &mut scheduled);
         }
     }
 
@@ -1435,42 +1415,40 @@ fn schedule_factors(expressions: &[&Expression]) -> Vec<Arc<Factor>> {
 }
 
 fn assemble_terms(
-    expressions: &[&Expression],
+    terms: &[&Term],
     height: usize,
     factors: &[FittedFactor],
     fitting: bool,
 ) -> Result<Vec<FittedTerm>, TransformError> {
     let mut transformed: Vec<FittedTerm> = Vec::new();
 
-    for expression in expressions {
-        for term in &expression.terms {
-            if transformed.iter().any(|entry| &entry.term == term) {
-                continue;
-            }
-            let (term, columns) = term.assemble(height, factors, fitting)?;
-            transformed.push(FittedTerm { term, columns });
+    for &term in terms {
+        if transformed.iter().any(|entry| &entry.term == term) {
+            continue;
         }
+        let (term, columns) = term.assemble(height, factors, fitting)?;
+        transformed.push(FittedTerm { term, columns });
     }
 
     Ok(transformed)
 }
 
 pub(crate) fn transform_terms(
-    expressions: &[&Expression],
+    terms: &[&Term],
     data: &DataFrame,
 ) -> Result<Vec<FittedTerm>, ModelError> {
-    let scheduled = schedule_factors(expressions);
+    let scheduled = schedule_factors(terms);
     let factors = transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors, false)?)
+    Ok(assemble_terms(terms, data.height(), &factors, false)?)
 }
 
 fn fit_and_transform_terms(
-    expressions: &[&Expression],
+    terms: &[&Term],
     data: &DataFrame,
 ) -> Result<Vec<FittedTerm>, ModelError> {
-    let scheduled = schedule_factors(expressions);
+    let scheduled = schedule_factors(terms);
     let factors = fit_and_transform_factors(&scheduled, data)?;
-    Ok(assemble_terms(expressions, data.height(), &factors, true)?)
+    Ok(assemble_terms(terms, data.height(), &factors, true)?)
 }
 
 fn lookup_factor<'a>(transformed: &'a [FittedFactor], factor: &Arc<Factor>) -> &'a FittedFactor {
@@ -2523,7 +2501,7 @@ mod tests {
     fn literal_factors_retain_scalar_storage_at_current_input_height() {
         let expressions = parse_expression.parse("mul(add(x, -2), 3.0)").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&[expression]);
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
         let training = polars::df!("x" => [1.0, 2.0]).unwrap();
         let fitted = fit_and_transform_factors(&scheduled, &training).unwrap();
         let fitted_factors = fitted
@@ -3442,35 +3420,26 @@ mod tests {
         // Each transform runs once across both local roles and the child.
         assert_eq!(TRANSFORM_CALLS.get(), (2, 2));
 
-        let sqrt = &model
-            .expression(Role::Dependent)
-            .unwrap()
-            .expression()
-            .terms[0]
+        let sqrt = &model.expression(Role::Dependent).unwrap().terms()[0]
+            .term
             .factors[0];
-        let independent = model.expression(Role::Independent).unwrap().expression();
-        assert!(Arc::ptr_eq(sqrt, &independent.terms[0].factors[0]));
-        let FactorKind::Call { arguments, .. } = &independent.terms[1].factors[0].kind else {
+        let independent = model.expression(Role::Independent).unwrap().terms();
+        assert!(Arc::ptr_eq(sqrt, &independent[0].term.factors[0]));
+        let FactorKind::Call { arguments, .. } = &independent[1].term.factors[0].kind else {
             panic!("expected exp call");
         };
         assert!(Arc::ptr_eq(sqrt, &arguments[0]));
         let child = &model.expression(Role::Independent).unwrap().children()[0];
         assert!(Arc::ptr_eq(
             sqrt,
-            &child
-                .expression(Role::Dependent)
-                .unwrap()
-                .expression()
-                .terms[0]
+            &child.expression(Role::Dependent).unwrap().terms()[0]
+                .term
                 .factors[0]
         ));
         assert!(Arc::ptr_eq(
-            &independent.terms[1].factors[0],
-            &child
-                .expression(Role::Independent)
-                .unwrap()
-                .expression()
-                .terms[0]
+            &independent[1].term.factors[0],
+            &child.expression(Role::Independent).unwrap().terms()[0]
+                .term
                 .factors[0]
         ));
 
@@ -3481,29 +3450,20 @@ mod tests {
         assert_eq!(TRANSFORM_CALLS.get(), (0, 2));
         assert!(Arc::ptr_eq(
             sqrt,
-            &applied
-                .expression(Role::Dependent)
-                .unwrap()
-                .expression()
-                .terms[0]
+            &applied.expression(Role::Dependent).unwrap().terms()[0]
+                .term
                 .factors[0],
         ));
         assert!(Arc::ptr_eq(
-            &independent.terms[1].factors[0],
-            &applied
-                .expression(Role::Independent)
-                .unwrap()
-                .expression()
-                .terms[1]
+            &independent[1].term.factors[0],
+            &applied.expression(Role::Independent).unwrap().terms()[1]
+                .term
                 .factors[0],
         ));
         assert!(Arc::ptr_eq(
             sqrt,
-            &applied
-                .expression(Role::Independent)
-                .unwrap()
-                .expression()
-                .terms[0]
+            &applied.expression(Role::Independent).unwrap().terms()[0]
+                .term
                 .factors[0],
         ));
 
@@ -3607,10 +3567,12 @@ mod tests {
             ("poly(x, degree=2) ~ poly(x, raw=false, degree=2) - 1", 2),
         ] {
             let formula = crate::parse(source).unwrap().iter().next().unwrap().clone();
-            let scheduled = schedule_factors(&[
-                &formula.expressions[&Role::Dependent],
-                &formula.expressions[&Role::Independent],
-            ]);
+            let terms = formula.expressions[&Role::Dependent]
+                .terms
+                .iter()
+                .chain(&formula.expressions[&Role::Independent].terms)
+                .collect::<Vec<_>>();
+            let scheduled = schedule_factors(&terms);
 
             assert_eq!(scheduled.len(), count, "{source}");
             assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -3638,7 +3600,7 @@ mod tests {
     fn planning_orders_dependencies_before_parents() {
         let expressions = parse_expression.parse("log(x) + sqrt(log(x))").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&[expression]);
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
 
         assert_eq!(scheduled.len(), 3);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -3650,7 +3612,7 @@ mod tests {
     fn planning_preserves_repeated_arguments() {
         let expressions = parse_expression.parse("sub(x, x)").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&[expression]);
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
 
         assert_eq!(scheduled.len(), 2);
         let FactorKind::Call { arguments, .. } = &scheduled[1].kind else {
@@ -3666,7 +3628,7 @@ mod tests {
     fn planning_distinguishes_argument_order() {
         let expressions = parse_expression.parse("sub(x, y) + sub(y, x)").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&[expression]);
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
 
         assert_eq!(scheduled.len(), 4);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -3689,7 +3651,7 @@ mod tests {
         ] {
             let expressions = parse_expression.parse(source).unwrap();
             let expression = expressions.first().unwrap();
-            let scheduled = schedule_factors(&[expression]);
+            let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
 
             assert_eq!(scheduled.len(), 3, "{source}");
             assert_eq!(scheduled[0].as_ref(), &Factor::from(input));
@@ -3707,14 +3669,20 @@ mod tests {
             .next()
             .unwrap()
             .clone();
-        let scheduled = schedule_factors(&[
-            &formula.expressions[&Role::Dependent],
-            &formula.expressions[&Role::Independent],
-        ]);
+        let independent = formula.expressions[&Role::Independent]
+            .terms
+            .iter()
+            .collect::<Vec<_>>();
+        let terms = formula.expressions[&Role::Dependent]
+            .terms
+            .iter()
+            .chain(independent.iter().copied())
+            .collect::<Vec<_>>();
+        let scheduled = schedule_factors(&terms);
 
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
-        assert!(schedule_factors(&[&formula.expressions[&Role::Independent]]).is_empty());
+        assert!(schedule_factors(&independent).is_empty());
     }
 
     #[test]
@@ -4068,12 +4036,17 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(original, vec![Some(0), Some(1), Some(2)]);
-        assert_eq!(
-            model.expression(Role::FixedEffect).unwrap().expression(),
-            transformed
-                .expression(Role::FixedEffect)
+        assert!(
+            model
+                .terms(Role::FixedEffect)
                 .unwrap()
-                .expression()
+                .iter()
+                .map(FittedTerm::term)
+                .eq(transformed
+                    .terms(Role::FixedEffect)
+                    .unwrap()
+                    .iter()
+                    .map(FittedTerm::term))
         );
     }
 
