@@ -82,13 +82,12 @@ impl FittedFormula {
         Ok(expression.terms())
     }
 
-    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
+    pub(crate) fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<Self, ModelError> {
         let expressions = self
             .expressions
             .iter()
             .map(|(&role, transformed)| {
                 transformed
-                    .expression()
                     .assemble(height, terms)
                     .map(|expression| (role, expression))
             })
