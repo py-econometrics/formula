@@ -1,8 +1,7 @@
-use crate::formula::{ComponentKey, MaterializedColumns};
 use polars::prelude::{
     ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, IntoLazy, IntoSeries, JoinType,
-    MaintainOrderJoin, NULL, PlSmallStr, PolarsResult, Series, UniqueKeepStrategy, all_horizontal,
-    col, dtype_cols, lit, polars_ensure, when,
+    MaintainOrderJoin, NULL, PlSmallStr, PolarsResult, Scalar, Series, UniqueKeepStrategy,
+    all_horizontal, col, dtype_cols, lit, polars_ensure, when,
 };
 
 /// The column of a mapping frame that holds each tuple's code
@@ -50,72 +49,120 @@ pub(super) fn map_codes(frame: &DataFrame, mapping: &DataFrame) -> PolarsResult<
     Ok(codes.column(CODE_COLUMN)?.clone())
 }
 
-/// Each row's code, and an indicator column for each kept code
+/// The position of the column among `columns` that holds each of `level_count` levels
 ///
-/// Codes `0..kept()` are kept, and indicator column `i` is true where a row's code is `i`. Codes
-/// `kept()..count()` were omitted, so their rows are `false` in every column.
-#[derive(Clone, Debug)]
-pub(crate) struct Indicators {
-    columns: MaterializedColumns<ComponentKey>,
-    codes: Column,
-    omitted: u32,
+/// Each column lists the positions of the levels it holds.
+pub(super) fn level_columns<'a>(
+    columns: impl IntoIterator<Item = &'a [usize]>,
+    level_count: usize,
+) -> Vec<usize> {
+    let mut level_columns = vec![0; level_count];
+    for (column, levels) in columns.into_iter().enumerate() {
+        for &level in levels {
+            level_columns[level] = column;
+        }
+    }
+    level_columns
 }
 
-impl Indicators {
-    /// Builds indicator column `i` with the name and key `columns` gives at position `i`
+pub(super) fn fitted_levels(levels: &Series) -> PolarsResult<Vec<Scalar>> {
+    (0..levels.len())
+        .map(|index| {
+            Ok(Scalar::new(
+                levels.dtype().clone(),
+                levels.get(index)?.into_static(),
+            ))
+        })
+        .collect()
+}
+
+/// Each row's code from a categorical transform, and the number of kept and omitted codes
+///
+/// Codes `0..k` have indicator columns, where `k` is the number of kept codes, and the remaining
+/// codes up to `count()` were omitted. A row whose code was omitted is false in every indicator
+/// column, and a row whose code is null is null in every indicator column.
+#[derive(Clone, Debug)]
+pub(crate) struct Codes {
+    codes: Column,
+    count: u32,
+}
+
+impl Codes {
+    /// Each row's code: the position in `columns` of the column that holds the row's value
     ///
-    /// Each indicator column is true where a row's code is its position, and null where the code
-    /// is null. The `omitted` codes that follow the last column's position have no column.
-    pub(super) fn new(
-        codes: Column,
-        columns: impl IntoIterator<Item = (PlSmallStr, ComponentKey)>,
-        omitted: u32,
+    /// Each column lists the positions in `levels` of the values it holds. A null, or a value
+    /// that isn't one of `levels`, has a null code.
+    pub(super) fn new<'a>(
+        input: &Column,
+        levels: &Series,
+        columns: impl ExactSizeIterator<Item = &'a [usize]>,
     ) -> PolarsResult<Self> {
-        let mut indicators = Vec::new();
-        let mut keys = Vec::new();
-        for (code, (name, key)) in columns.into_iter().enumerate() {
-            let indicator = codes
-                .as_materialized_series()
-                .equal(code as u32)?
-                .with_name(name);
-            indicators.push(indicator.into_column());
-            keys.push(key);
-        }
-        let indicators = Self {
-            columns: MaterializedColumns::new(DataFrame::new(codes.len(), indicators)?, keys),
-            codes,
-            omitted,
+        let count = columns.len() as u32;
+        let level_codes = level_columns(columns, levels.len())
+            .into_iter()
+            .map(|column| column as u32)
+            .collect::<Vec<_>>();
+        // For a small number of levels comparing each row with each level is cheaper than a join's
+        // single hash lookup per row; there's no hard evidence for choosing 8
+        let codes = if level_codes.len() <= 8 {
+            let argument = col(input.name().clone());
+            let expression = fitted_levels(levels)?
+                .into_iter()
+                .zip(&level_codes)
+                .rev()
+                .fold(
+                    lit(NULL).cast(DataType::UInt32),
+                    |otherwise, (level, code)| {
+                        when(argument.clone().eq(lit(level)))
+                            .then(lit(*code))
+                            .otherwise(otherwise)
+                    },
+                );
+            let frame = input
+                .clone()
+                .into_frame()
+                .lazy()
+                .with_column(expression.alias(CODE_COLUMN))
+                .collect()?;
+            frame.column(CODE_COLUMN)?.clone()
+        } else {
+            let mapping = DataFrame::new(
+                levels.len(),
+                vec![
+                    levels.clone().with_name(input.name().clone()).into_column(),
+                    Column::new(CODE_COLUMN.into(), level_codes),
+                ],
+            )?;
+            map_codes(&input.clone().into_frame(), &mapping)?
         };
-        let count = indicators.count();
-        // Only debug builds check, as scanning every row's code costs about as much as
-        // transforming a factor with few levels
-        debug_assert!(
-            indicators
-                .codes
-                .as_materialized_series()
-                .max::<u32>()?
-                .is_none_or(|code| code < count),
-            "each code must be less than the number of kept and omitted codes",
-        );
-        Ok(indicators)
+        Ok(Self { codes, count })
     }
 
-    pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
-        &self.columns
+    pub(super) fn indicators(
+        &self,
+        names: impl IntoIterator<Item = PlSmallStr>,
+    ) -> PolarsResult<DataFrame> {
+        let indicators = names
+            .into_iter()
+            .enumerate()
+            .map(|(code, name)| {
+                let indicator = self
+                    .codes
+                    .as_materialized_series()
+                    .equal(code as u32)?
+                    .with_name(name);
+                Ok(indicator.into_column())
+            })
+            .collect::<PolarsResult<Vec<_>>>()?;
+        DataFrame::new(self.codes.len(), indicators)
     }
 
     pub(crate) fn codes(&self) -> &Column {
         &self.codes
     }
 
-    /// The number of kept codes (equals number of indicator columns)
-    pub(crate) fn kept(&self) -> u32 {
-        self.columns.frame().width() as u32
-    }
-
-    /// The number of kept and omitted codes
     pub(crate) fn count(&self) -> u32 {
-        self.kept() + self.omitted
+        self.count
     }
 }
 
@@ -200,6 +247,7 @@ impl Combinations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polars::prelude::NamedFrom;
 
     #[test]
     fn observed_decodes_full_width_unsigned_codes() {
@@ -233,24 +281,18 @@ mod tests {
 
     #[test]
     fn indicators_mark_kept_codes_and_leave_omitted_codes_false() {
-        let codes = Column::new("codes".into(), [Some(0_u32), Some(1), Some(2), None]);
-        let columns = ["a", "b"].map(|name| (PlSmallStr::from(name), ComponentKey::None));
-        let indicators = Indicators::new(codes, columns, 1).unwrap();
-        assert_eq!((indicators.kept(), indicators.count()), (2, 3));
+        let input = Column::new("x".into(), [Some("a"), Some("b"), Some("c"), None]);
+        let levels = Series::new("x".into(), ["a", "b", "c"]);
+        let columns: [&[usize]; 3] = [&[0], &[1], &[2]];
+        let codes = Codes::new(&input, &levels, columns.into_iter()).unwrap();
+        let indicators = codes.indicators(["a", "b"].map(PlSmallStr::from)).unwrap();
+        assert_eq!(codes.count(), 3);
         let expected = polars::df!(
             "a" => [Some(true), Some(false), Some(false), None],
             "b" => [Some(false), Some(true), Some(false), None],
         )
         .unwrap();
-        assert!(indicators.columns().frame().equals_missing(&expected));
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "each code must be less than the number of kept and omitted codes")]
-    fn indicators_reject_codes_beyond_the_omitted_ones() {
-        let codes = Column::new("codes".into(), [0_u32, 2]);
-        let columns = [(PlSmallStr::from("a"), ComponentKey::None)];
-        let _ = Indicators::new(codes, columns, 1);
+        assert_eq!(indicators.width(), 2);
+        assert!(indicators.equals_missing(&expected));
     }
 }

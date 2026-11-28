@@ -378,9 +378,10 @@ impl Definition<PolynomialState> for PolynomialDefinition {
             .unzip();
 
         let frame = DataFrame::new(height, columns)?;
-        Ok(TransformOutput::Columns(MaterializedColumns::new(
-            frame, metadata,
-        )))
+        Ok(TransformOutput::new(
+            MaterializedColumns::new(frame, metadata),
+            None,
+        ))
     }
 }
 

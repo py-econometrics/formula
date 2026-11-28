@@ -11,7 +11,7 @@ pub mod state;
 pub(crate) use categorical::CategoricalDefinition;
 #[cfg(test)]
 pub(crate) use categorical::{LevelSelection, Levels};
-pub(crate) use codes::{Combinations, Indicators};
+pub(crate) use codes::{Codes, Combinations};
 pub(crate) use expression::ExpressionTransform;
 pub(crate) use grouped::GroupedTransform;
 pub use input::ArgumentCount;
@@ -45,22 +45,28 @@ pub enum ParameterValue {
     Map(Vec<(PlSmallStr, ParameterValue)>),
 }
 
+/// A transform's output columns, and each row's code if the transform is categorical
 #[derive(Clone, Debug)]
-pub(crate) enum TransformOutput {
-    Columns(MaterializedColumns<ComponentKey>),
-    Indicator(Indicators),
+pub(crate) struct TransformOutput {
+    columns: MaterializedColumns<ComponentKey>,
+    codes: Option<Codes>,
 }
 
 impl TransformOutput {
+    pub(crate) fn new(columns: MaterializedColumns<ComponentKey>, codes: Option<Codes>) -> Self {
+        Self { columns, codes }
+    }
+
     pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
-        match self {
-            Self::Columns(columns) => columns,
-            Self::Indicator(indicators) => indicators.columns(),
-        }
+        &self.columns
+    }
+
+    pub(crate) fn codes(&self) -> Option<&Codes> {
+        self.codes.as_ref()
     }
 
     pub(crate) fn frame(&self) -> &DataFrame {
-        self.columns().frame()
+        self.columns.frame()
     }
 }
 

@@ -3,14 +3,10 @@ use super::{
     ArgumentCount, ParameterValue, TransformDefinition, TransformError, TransformOutput, call_name,
 };
 use crate::fit::Definition;
-use crate::formula::ComponentKey;
-use crate::transform::codes::{CODE_COLUMN, Indicators, map_codes};
+use crate::formula::{ComponentKey, MaterializedColumns};
+use crate::transform::codes::{Codes, fitted_levels, level_columns};
 use polars::chunked_array::cast::CastOptions;
-use polars::error::PolarsResult;
-use polars::prelude::{
-    AnyValue, Column, DataFrame, DataType, IntoColumn, IntoLazy, NULL, PlSmallStr, Scalar, Series,
-    SortOptions, col, lit, when,
-};
+use polars::prelude::{AnyValue, DataType, PlSmallStr, Scalar, Series, SortOptions};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -276,87 +272,12 @@ impl CategoricalDefinition {
             })
     }
 
-    fn fitted_levels(levels: &Series) -> PolarsResult<Vec<Scalar>> {
-        (0..levels.len())
-            .map(|index| {
-                Ok(Scalar::new(
-                    levels.dtype().clone(),
-                    levels.get(index)?.into_static(),
-                ))
-            })
-            .collect()
-    }
-
-    /// Each row's code
-    ///
-    /// A null, or a level not seen when fitting, has a null code. A level that `omit` or `keep`
-    /// dropped still has its column's index as code, so [`Self::indicators`] gives its rows
-    /// `false`, where an unseen level's rows are null.
-    pub(super) fn codes(state: &CategoricalState, input: &Column) -> PolarsResult<Column> {
-        let codes = level_columns(&state.columns, state.levels.len())
-            .into_iter()
-            .map(|column| column as u32)
-            .collect::<Vec<_>>();
-        // For a small number of levels comparing each row with each level is cheaper than a join's
-        // single hash lookup per row; there's no hard evidence for choosing 8
-        if codes.len() <= 8 {
-            let argument = col(input.name().clone());
-            let levels = Self::fitted_levels(&state.levels)?;
-            let expression = levels.into_iter().zip(&codes).rev().fold(
-                lit(NULL).cast(DataType::UInt32),
-                |otherwise, (level, code)| {
-                    when(argument.clone().eq(lit(level)))
-                        .then(lit(*code))
-                        .otherwise(otherwise)
-                },
-            );
-            let frame = input
-                .clone()
-                .into_frame()
-                .lazy()
-                .with_column(expression.alias(CODE_COLUMN))
-                .collect()?;
-            return Ok(frame.column(CODE_COLUMN)?.clone());
-        }
-        let mapping = DataFrame::new(
-            state.levels.len(),
-            vec![
-                state
-                    .levels
-                    .clone()
-                    .with_name(input.name().clone())
-                    .into_column(),
-                Column::new(CODE_COLUMN.into(), codes),
-            ],
-        )?;
-        map_codes(&input.clone().into_frame(), &mapping)
-    }
-
-    /// The indicators for [`Self::codes`]: a column for each kept level or bin
-    pub(super) fn indicators(
-        &self,
-        state: &CategoricalState,
-        codes: Column,
-        input_name: &str,
-    ) -> Result<Indicators, TransformError> {
-        let fitted_levels = Self::fitted_levels(&state.levels)?;
-        let columns = state.columns[..state.kept].iter().map(|column| {
-            let key = column.key(&fitted_levels);
-            (
-                self.output_name(input_name, &key),
-                ComponentKey::Scalar(key),
-            )
-        });
-        let omitted = (state.columns.len() - state.kept) as u32;
-        Ok(Indicators::new(codes, columns, omitted)?)
-    }
-
     /// Builds the one-hot encoding: one column per unbinned level or bin
     fn bin_levels(
         bins: &[(PlSmallStr, Levels)],
         levels: &Series,
     ) -> Result<(Vec<EncodedColumn>, Vec<usize>), TransformError> {
-        let fitted_levels = Self::fitted_levels(levels)?;
+        let fitted_levels = fitted_levels(levels)?;
         // Populate mapping of level index to bin
         let mut level_bins: Vec<Option<usize>> = vec![None; levels.len()];
         for (bin, (name, members)) in bins.iter().enumerate() {
@@ -404,7 +325,7 @@ impl CategoricalDefinition {
             }
         }
         // Construct the mapping of a level to the column of the one-hot encoding
-        let level_columns = level_columns(&columns, levels.len());
+        let level_columns = level_columns(columns.iter().map(EncodedColumn::levels), levels.len());
         Ok((columns, level_columns))
     }
 }
@@ -568,12 +489,22 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         inputs: &PreparedInput,
     ) -> Result<Self::Output, TransformError> {
         let (field, input) = inputs.single()?;
-        let codes = Self::codes(state, input)?;
-        Ok(TransformOutput::Indicator(self.indicators(
-            state,
-            codes,
-            field.name(),
-        )?))
+        let codes = Codes::new(
+            input,
+            &state.levels,
+            state.columns.iter().map(EncodedColumn::levels),
+        )?;
+        let fitted_levels = fitted_levels(&state.levels)?;
+        let keys = state.columns[..state.kept]
+            .iter()
+            .map(|column| column.key(&fitted_levels))
+            .collect::<Vec<_>>();
+        let names = keys.iter().map(|key| self.output_name(field.name(), key));
+        let columns = MaterializedColumns::new(
+            codes.indicators(names)?,
+            keys.into_iter().map(ComponentKey::Scalar).collect(),
+        );
+        Ok(TransformOutput::new(columns, Some(codes)))
     }
 }
 
@@ -602,17 +533,6 @@ impl EncodedColumn {
     }
 }
 
-/// The index of the column in `columns` that each of `level_count` fitted levels is encoded in
-fn level_columns(columns: &[EncodedColumn], level_count: usize) -> Vec<usize> {
-    let mut level_columns = vec![0; level_count];
-    for (column, encoded) in columns.iter().enumerate() {
-        for level in encoded.levels() {
-            level_columns[*level] = column;
-        }
-    }
-    level_columns
-}
-
 #[derive(Debug)]
 pub(crate) struct CategoricalState {
     levels: Series,
@@ -627,7 +547,7 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
-    use polars::prelude::{CategoricalPhysical, Categories, FrozenCategories};
+    use polars::prelude::{CategoricalPhysical, Categories, Column, DataFrame, FrozenCategories};
 
     fn native_dtypes() -> Vec<DataType> {
         let categorical = DataType::from_categories(Categories::random(
@@ -1042,7 +962,7 @@ mod tests {
         let height = expected.first().map_or(0, |column| column.len());
         assert_eq!(actual.shape(), (height, expected.len()));
 
-        let fitted_levels = CategoricalDefinition::fitted_levels(&transform.levels).unwrap();
+        let fitted_levels = fitted_levels(&transform.levels).unwrap();
         let names = transform.columns[..transform.kept]
             .iter()
             .map(|column| definition.output_name(input[0].name(), &column.key(&fitted_levels)))

@@ -157,8 +157,9 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
                 .into_frame(),
         };
 
-        Ok(TransformOutput::Columns(
+        Ok(TransformOutput::new(
             MaterializedColumns::single_column(frame, ComponentKey::None),
+            None,
         ))
     }
 }

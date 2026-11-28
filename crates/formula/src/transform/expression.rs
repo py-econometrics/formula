@@ -181,8 +181,9 @@ impl ExpressionTransform {
             )
             .into());
         }
-        Ok(TransformOutput::Columns(
+        Ok(TransformOutput::new(
             MaterializedColumns::single_column(output, ComponentKey::None),
+            None,
         ))
     }
 }
