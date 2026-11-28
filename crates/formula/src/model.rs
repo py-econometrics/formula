@@ -1,6 +1,6 @@
 use crate::fit::FitError;
 use crate::formula::{
-    Expression, FittedExpression, FittedTerm, Role, ValidationError, parse_one, transform_terms,
+    FittedExpression, FittedTerm, Role, Term, ValidationError, parse_one, transform_terms,
 };
 use crate::parse::{ParseResult, parse_term};
 use crate::transform::TransformError;
@@ -97,16 +97,16 @@ impl FittedFormula {
     }
 
     pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
-        let expressions = self.all_expressions();
-        let terms = transform_terms(&expressions, data)?;
+        let terms = self.all_terms();
+        let transformed = transform_terms(&terms, data)?;
 
-        self.assemble(data.height(), &terms)
+        self.assemble(data.height(), &transformed)
     }
 
     pub(crate) fn expression(&self, role: Role) -> Option<&FittedExpression> {
         self.expressions
             .get(&role)
-            .filter(|transformed| !transformed.expression().is_empty())
+            .filter(|transformed| !transformed.is_empty())
     }
 
     pub fn select(&self, roles: &[Role]) -> Result<Self, SelectionError> {
@@ -150,20 +150,20 @@ impl FittedFormula {
             .ok_or(SelectionError::MissingRole(role))
     }
 
-    fn collect_expressions<'a>(&'a self, output: &mut Vec<&'a Expression>) {
+    fn collect_terms<'a>(&'a self, output: &mut Vec<&'a Term>) {
         for expression in self.expressions.values() {
-            output.push(expression.expression());
+            output.extend(expression.terms().iter().map(FittedTerm::term));
 
             for child in expression.children() {
-                child.collect_expressions(output);
+                child.collect_terms(output);
             }
         }
     }
 
-    fn all_expressions(&self) -> Vec<&Expression> {
-        let mut expressions = Vec::new();
-        self.collect_expressions(&mut expressions);
-        expressions
+    fn all_terms(&self) -> Vec<&Term> {
+        let mut terms = Vec::new();
+        self.collect_terms(&mut terms);
+        terms
     }
 }
 
@@ -203,17 +203,13 @@ impl FittedFormulas {
         Ok(self.get(&formula))
     }
 
-    fn expressions(&self) -> impl Iterator<Item = &Expression> {
-        self.iter().flat_map(FittedFormula::all_expressions)
-    }
-
     pub fn transform(&self, data: &DataFrame) -> Result<Self, ModelError> {
-        let expressions: Vec<&Expression> = self.expressions().collect();
-        let terms = transform_terms(&expressions, data)?;
+        let terms: Vec<&Term> = self.iter().flat_map(FittedFormula::all_terms).collect();
+        let transformed = transform_terms(&terms, data)?;
 
         let entries = self
             .iter()
-            .map(|model| model.assemble(data.height(), &terms))
+            .map(|model| model.assemble(data.height(), &transformed))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
         Ok(Self { entries })
