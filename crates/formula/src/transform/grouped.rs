@@ -1,6 +1,5 @@
 use super::input::{PreparedInput, validate_numeric_field};
-use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformOutput, call_name};
-use crate::formula::MaterializedColumns;
+use super::{ArgumentCount, ParameterValue, TransformDefinition, call_name};
 use crate::{ComponentKey, TransformError};
 use polars::prelude::{Column, DataFrame, DataType, PlSmallStr, Scalar};
 use std::collections::BTreeMap;
@@ -96,10 +95,7 @@ impl GroupedTransform {
         std::iter::once(group).chain(loadings).collect()
     }
 
-    pub(crate) fn transform(
-        &self,
-        inputs: &PreparedInput,
-    ) -> Result<TransformOutput, TransformError> {
+    pub(crate) fn transform(&self, inputs: &PreparedInput) -> Result<DataFrame, TransformError> {
         let (group, loadings) = self.validate_inputs(inputs)?;
         let arguments = inputs
             .fields
@@ -123,12 +119,7 @@ impl GroupedTransform {
             );
         }
 
-        let frame = DataFrame::new(height, columns)?;
-
-        Ok(TransformOutput::new(
-            MaterializedColumns::new(frame, self.components()),
-            None,
-        ))
+        Ok(DataFrame::new(height, columns)?)
     }
 }
 
@@ -153,7 +144,7 @@ mod tests {
                 .clone()
                 .with_name("G(firm, intercept=true)[group]".into());
             let output = GroupedTransform::new(true, 0).transform(&prepare(&[group]))?;
-            assert!(output.frame().equals_missing(&expected.into_frame()));
+            assert!(output.equals_missing(&expected.into_frame()));
         }
         Ok(())
     }
@@ -167,7 +158,7 @@ mod tests {
         ];
         let prepared_inputs = prepare(&inputs);
         let output = GroupedTransform::new(false, 2).transform(&prepared_inputs)?;
-        let frame = output.frame();
+        let frame = &output;
 
         assert_eq!(
             frame.get_column_names(),
@@ -208,10 +199,10 @@ mod tests {
             let inputs = prepare(&[Column::new("x".into(), [0_u32, 1]), loading]);
             let output = GroupedTransform::new(false, 1).transform(&inputs)?;
             assert_eq!(
-                output.frame()[1].f64()?.iter().collect::<Vec<_>>(),
+                output[1].f64()?.iter().collect::<Vec<_>>(),
                 vec![Some(2.0), Some(3.0)],
             );
-            assert_ne!(output.frame()[0].name(), output.frame()[1].name());
+            assert_ne!(output[0].name(), output[1].name());
         }
         Ok(())
     }
@@ -230,11 +221,11 @@ mod tests {
         ] {
             let prepared_inputs = prepare(&inputs);
             let output = GroupedTransform::new(false, 1).transform(&prepared_inputs)?;
-            assert_eq!(output.frame().shape(), (inputs[0].len(), 2));
-            assert_eq!(output.frame()[0].dtype(), &DataType::UInt32);
-            assert_eq!(output.frame()[1].dtype(), &DataType::Float64);
-            assert_eq!(output.frame()[0].null_count(), inputs[0].len());
-            assert_eq!(output.frame()[1].null_count(), inputs[1].len());
+            assert_eq!(output.shape(), (inputs[0].len(), 2));
+            assert_eq!(output[0].dtype(), &DataType::UInt32);
+            assert_eq!(output[1].dtype(), &DataType::Float64);
+            assert_eq!(output[0].null_count(), inputs[0].len());
+            assert_eq!(output[1].null_count(), inputs[1].len());
         }
         Ok(())
     }

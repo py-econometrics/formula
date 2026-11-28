@@ -1,8 +1,7 @@
 use super::input::{PreparedInput, argument_column_name};
-use super::{ArgumentCount, StateValue, TransformDefinition, TransformError, TransformOutput};
+use super::{ArgumentCount, StateValue, TransformDefinition, TransformError};
 use crate::TransformState;
 use crate::fit::Definition;
-use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::codes::{CODE_COLUMN, map_codes, tuple_codes};
 use crate::transform::state::ExportState;
 use polars::prelude::{
@@ -44,7 +43,7 @@ impl TransformDefinition for IntegerEncodingDefinition {
 
 impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
     type Input = PreparedInput;
-    type Output = TransformOutput;
+    type Output = DataFrame;
     type Error = TransformError;
 
     fn validate(
@@ -157,10 +156,7 @@ impl Definition<IntegerEncodingState> for IntegerEncodingDefinition {
                 .into_frame(),
         };
 
-        Ok(TransformOutput::new(
-            MaterializedColumns::single_column(frame, ComponentKey::None),
-            None,
-        ))
+        Ok(frame)
     }
 }
 
@@ -261,7 +257,7 @@ mod tests {
         assert_eq!(levels.schema(), expected_levels.schema());
         assert!(levels.equals_missing(&expected_levels));
         assert_integer_output(
-            fitted.transform(&inputs)?.frame(),
+            &fitted.transform(&inputs)?,
             &[Some(0), Some(1), Some(2), Some(0), None],
         );
         Ok(())
@@ -290,7 +286,7 @@ mod tests {
             assert_eq!(levels.schema(), expected_levels.schema());
             assert!(levels.equals_missing(&expected_levels));
             assert_integer_output(
-                fitted.transform(&inputs)?.frame(),
+                &fitted.transform(&inputs)?,
                 &[Some(3), None, Some(1), Some(3)],
             );
         }
@@ -434,15 +430,15 @@ mod tests {
         let second = definition.fit(&second_input)?;
 
         assert_integer_output(
-            definition.transform(&first, &first_input)?.frame(),
+            &definition.transform(&first, &first_input)?,
             &[Some(0), Some(1)],
         );
         assert_integer_output(
-            definition.transform(&second, &first_input)?.frame(),
+            &definition.transform(&second, &first_input)?,
             &[Some(1), Some(0)],
         );
         assert_integer_output(
-            definition.transform(&first, &first_input)?.frame(),
+            &definition.transform(&first, &first_input)?,
             &[Some(0), Some(1)],
         );
 
@@ -468,9 +464,7 @@ mod tests {
             assert_eq!(definition.argument_count(), ArgumentCount::AtLeast(1));
             let transform = definition.fit(&prepare(&input[..count]))?;
             assert_integer_output(
-                definition
-                    .transform(&transform, &prepare(&input[..count]))?
-                    .frame(),
+                &definition.transform(&transform, &prepare(&input[..count]))?,
                 &expected,
             );
         }
@@ -498,8 +492,8 @@ mod tests {
         for _ in 0..2 {
             let output = definition.transform(&transform, &input)?;
             // Codes are returned in order input data
-            assert_integer_output(output.frame(), &[Some(3), Some(2), Some(1), Some(0), None]);
-            assert_eq!(output.frame().columns()[0].name().as_str(), "f1:f2");
+            assert_integer_output(&output, &[Some(3), Some(2), Some(1), Some(0), None]);
+            assert_eq!(output.columns()[0].name().as_str(), "f1:f2");
             assert_eq!(transform.fields, fitted_fields);
             assert!(mapping.equals_missing(&fitted_mapping));
         }
@@ -527,11 +521,8 @@ mod tests {
             )
             .cast(&dtype)?]);
             let output = fitted.transform(&input)?;
-            assert_integer_output(
-                output.frame(),
-                &[Some(1), None, None, Some(3), None, Some(1)],
-            );
-            assert_eq!(output.frame().columns()[0].name().as_str(), "x");
+            assert_integer_output(&output, &[Some(1), None, None, Some(3), None, Some(1)]);
+            assert_eq!(output.columns()[0].name().as_str(), "x");
         }
         Ok(())
     }
@@ -543,14 +534,14 @@ mod tests {
                 let training = prepare(&[Column::new("x".into(), values).cast(&dtype)?]);
                 let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
                 let input = prepare(&[Column::new("x".into(), [Some("a"), None]).cast(&dtype)?]);
-                assert_integer_output(fitted.transform(&input)?.frame(), &[None, None]);
+                assert_integer_output(&fitted.transform(&input)?, &[None, None]);
             }
 
             let training = [Column::new("x".into(), ["a"]).cast(&dtype)?];
             let prepared_training = prepare(&training);
             let fitted = Fitted::fit(IntegerEncodingDefinition, &prepared_training)?;
             let empty = prepare(&[training[0].slice(0, 0)]);
-            assert_integer_output(fitted.transform(&empty)?.frame(), &[]);
+            assert_integer_output(&fitted.transform(&empty)?, &[]);
         }
         Ok(())
     }
@@ -564,7 +555,7 @@ mod tests {
         let input = prepare(&[Column::new("x".into(), ["new", "b", "a"]).cast(&dtype)?]);
 
         for _ in 0..2 {
-            assert_integer_output(fitted.transform(&input)?.frame(), &[None, Some(1), None]);
+            assert_integer_output(&fitted.transform(&input)?, &[None, Some(1), None]);
         }
         Ok(())
     }
@@ -599,10 +590,7 @@ mod tests {
             let training =
                 prepare(&[Column::new("x".into(), [labels[count - 1].as_str()]).cast(&dtype)?]);
             let fitted = Fitted::fit(IntegerEncodingDefinition, &training)?;
-            assert_integer_output(
-                fitted.transform(&training)?.frame(),
-                &[Some((count - 1) as u32)],
-            );
+            assert_integer_output(&fitted.transform(&training)?, &[Some((count - 1) as u32)]);
         }
         Ok(())
     }
@@ -624,7 +612,7 @@ mod tests {
                 Column::new("n".into(), [2_i32, 2, 1, 1, 1]),
             ]);
             assert_integer_output(
-                fitted.transform(&input)?.frame(),
+                &fitted.transform(&input)?,
                 &[Some(2), None, None, None, Some(1)],
             );
         }
@@ -644,10 +632,7 @@ mod tests {
                     Column::new("x".into(), ["d", "b", "a", "b"]).cast(&left_dtype)?,
                     Column::new("z".into(), ["c", "c", "a", "a"]).cast(&right_dtype)?,
                 ]);
-                assert_integer_output(
-                    fitted.transform(&input)?.frame(),
-                    &[Some(2), None, None, Some(1)],
-                );
+                assert_integer_output(&fitted.transform(&input)?, &[Some(2), None, None, Some(1)]);
             }
         }
         Ok(())
@@ -676,7 +661,7 @@ mod tests {
         let definition = IntegerEncodingDefinition;
         let transform = definition.fit(&training)?;
         assert_integer_output(
-            definition.transform(&transform, &input)?.frame(),
+            &definition.transform(&transform, &input)?,
             &[Some(0), Some(1), None, None, None, None],
         );
         Ok(())
@@ -701,7 +686,7 @@ mod tests {
             let definition = IntegerEncodingDefinition;
             let state = definition.fit(&inputs)?;
             assert_integer_output(
-                definition.transform(&state, &inputs)?.frame(),
+                &definition.transform(&state, &inputs)?,
                 &[Some(0), None, None, Some(1), None, Some(0), None],
             );
         }
@@ -749,7 +734,7 @@ mod tests {
             let definition = IntegerEncodingDefinition;
             let state = definition.fit(&inputs)?;
             assert_integer_output(
-                definition.transform(&state, &inputs)?.frame(),
+                &definition.transform(&state, &inputs)?,
                 &[
                     Some(0),
                     None,
@@ -789,7 +774,7 @@ mod tests {
             let definition = IntegerEncodingDefinition;
             let state = definition.fit(&training)?;
             assert_integer_output(
-                definition.transform(&state, &inputs)?.frame(),
+                &definition.transform(&state, &inputs)?,
                 &[None, None, None, None, None],
             );
         }
@@ -920,7 +905,7 @@ mod tests {
             let definition = IntegerEncodingDefinition;
             let transform = definition.fit(&prepared_input)?;
             assert_integer_output(
-                definition.transform(&transform, &prepared_input)?.frame(),
+                &definition.transform(&transform, &prepared_input)?,
                 &expected,
             );
         }
@@ -938,13 +923,11 @@ mod tests {
             let definition = IntegerEncodingDefinition;
             let transform = definition.fit(&prepared_training)?;
             assert_integer_output(
-                definition
-                    .transform(&transform, &prepared_training)?
-                    .frame(),
+                &definition.transform(&transform, &prepared_training)?,
                 &vec![None; training[0].len()],
             );
             assert_integer_output(
-                definition.transform(&transform, &known_dtype)?.frame(),
+                &definition.transform(&transform, &known_dtype)?,
                 &[None, None],
             );
         }

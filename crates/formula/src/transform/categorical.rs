@@ -1,13 +1,11 @@
 use super::input::PreparedInput;
-use super::{
-    ArgumentCount, ParameterValue, TransformDefinition, TransformError, TransformOutput, call_name,
-};
+use super::{ArgumentCount, ParameterValue, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
-use crate::formula::{ComponentKey, MaterializedColumns};
+use crate::formula::ComponentKey;
 use crate::transform::codes::{Codes, fitted_levels, level_columns};
 use polars::chunked_array::cast::CastOptions;
 use polars::error::PolarsResult;
-use polars::prelude::{AnyValue, DataType, PlSmallStr, Scalar, Series, SortOptions};
+use polars::prelude::{AnyValue, DataFrame, DataType, PlSmallStr, Scalar, Series, SortOptions};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -388,7 +386,7 @@ impl TransformDefinition for CategoricalDefinition {
 
 impl Definition<CategoricalState> for CategoricalDefinition {
     type Input = PreparedInput;
-    type Output = TransformOutput;
+    type Output = (DataFrame, Codes);
     type Error = TransformError;
 
     fn validate(
@@ -492,8 +490,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             .keys
             .iter()
             .map(|key| self.output_name(field.name(), key));
-        let columns = MaterializedColumns::new(codes.indicators(names)?, state.components());
-        Ok(TransformOutput::new(columns, Some(codes)))
+        Ok((codes.indicators(names)?, codes))
     }
 }
 
@@ -527,7 +524,7 @@ pub(crate) struct CategoricalState {
     levels: Series,
     /// The kept columns, then the omitted ones
     columns: Vec<EncodedColumn>,
-    /// The key of each kept column, so the first `keys.len()` columns are the kept ones
+    /// The keys of the kept columns
     keys: Vec<Scalar>,
 }
 
@@ -559,7 +556,7 @@ mod tests {
     use super::*;
     use crate::fit::{Fit, Fitted};
     use crate::transform::Transform;
-    use polars::prelude::{CategoricalPhysical, Categories, Column, DataFrame, FrozenCategories};
+    use polars::prelude::{CategoricalPhysical, Categories, Column, FrozenCategories};
 
     fn native_dtypes() -> Vec<DataType> {
         let categorical = DataType::from_categories(Categories::random(
@@ -591,15 +588,12 @@ mod tests {
             let fitted = Fitted::fit(CategoricalDefinition::new(None, None), &prepared_training)?;
             let output = fitted.transform(&prepared_training)?;
 
-            assert_eq!(
-                output.frame().get_column_names(),
-                ["C(x)[`b`]", "C(x)[`d`]"]
-            );
+            assert_eq!(output.0.get_column_names(), ["C(x)[`b`]", "C(x)[`d`]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &training,
-                output.frame(),
+                &output.0,
                 &[
                     &[Some(true), Some(false), Some(true)],
                     &[Some(false), Some(true), Some(false)],
@@ -643,10 +637,7 @@ mod tests {
         ] {
             let prepared = prepare(&[input]);
             let fitted = Fitted::fit(CategoricalDefinition::new(None, None), &prepared)?;
-            assert_eq!(
-                fitted.transform(&prepared)?.frame().get_column_names(),
-                expected
-            );
+            assert_eq!(fitted.transform(&prepared)?.0.get_column_names(), expected);
         }
         Ok(())
     }
@@ -666,7 +657,7 @@ mod tests {
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                fitted.transform(&prepared_input)?.frame(),
+                &fitted.transform(&prepared_input)?.0,
                 &[
                     &[Some(true), None, None, Some(false), None],
                     &[Some(false), None, None, Some(true), None],
@@ -694,12 +685,12 @@ mod tests {
             ];
             let prepared_input = prepare(&input);
             let output = fitted.transform(&prepared_input)?;
-            assert_eq!(output.frame().get_column_names(), ["C(x, omit='b')[`d`]"]);
+            assert_eq!(output.0.get_column_names(), ["C(x, omit='b')[`d`]"]);
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                output.frame(),
+                &output.0,
                 &[&[Some(false), None, None, Some(true)]],
             );
         }
@@ -761,23 +752,15 @@ mod tests {
 
         for _ in 0..2 {
             let output = fitted.transform(&prepared_input)?;
-            assert_eq!(
-                output.frame().get_column_names(),
-                original.frame().get_column_names()
-            );
+            assert_eq!(output.0.get_column_names(), original.0.get_column_names());
             assert_output(
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                output.frame(),
+                &output.0,
                 &[&[None, Some(true), None], &[None, Some(false), None]],
             );
-            assert!(
-                fitted
-                    .transform(&training)?
-                    .frame()
-                    .equals_missing(original.frame())
-            );
+            assert!(fitted.transform(&training)?.0.equals_missing(&original.0));
         }
         Ok(())
     }
@@ -811,7 +794,7 @@ mod tests {
                 let fitted = Fitted::fit(CategoricalDefinition::new(None, None), &training)?;
                 let input =
                     prepare(&[Column::new("x".into(), [Some("a"), None, Some("b")]).cast(&dtype)?]);
-                assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
+                assert_eq!(fitted.transform(&input)?.0.shape(), (3, 0));
             }
         }
         Ok(())
@@ -828,12 +811,9 @@ mod tests {
                 let height = values.len();
                 let input = prepare(&[Column::new("x".into(), values).cast(&dtype)?]);
                 let output = fitted.transform(&input)?;
-                assert_eq!(output.frame().shape(), (height, 2));
-                assert_eq!(
-                    output.frame().get_column_names(),
-                    original.frame().get_column_names()
-                );
-                for column in output.frame().columns() {
+                assert_eq!(output.0.shape(), (height, 2));
+                assert_eq!(output.0.get_column_names(), original.0.get_column_names());
+                for column in output.0.columns() {
                     assert_eq!(column.dtype(), &DataType::Boolean);
                     assert_eq!(column.null_count(), height);
                 }
@@ -856,7 +836,7 @@ mod tests {
             )?;
             let input =
                 prepare(&[Column::new("x".into(), [Some("b"), Some("a"), None]).cast(&dtype)?]);
-            assert_eq!(fitted.transform(&input)?.frame().shape(), (3, 0));
+            assert_eq!(fitted.transform(&input)?.0.shape(), (3, 0));
         }
         Ok(())
     }
@@ -869,10 +849,7 @@ mod tests {
             None,
         );
         let transform = definition.fit(&inputs)?;
-        assert_eq!(
-            definition.transform(&transform, &inputs)?.frame().shape(),
-            (3, 0)
-        );
+        assert_eq!(definition.transform(&transform, &inputs)?.0.shape(), (3, 0));
         Ok(())
     }
 
@@ -888,10 +865,7 @@ mod tests {
             let inputs = prepare(&[inputs[0].cast(training.dtype())?]);
             let definition = CategoricalDefinition::new(None, None);
             let transform = definition.fit(&prepare(&[training]))?;
-            assert_eq!(
-                definition.transform(&transform, &inputs)?.frame().shape(),
-                (2, 0)
-            );
+            assert_eq!(definition.transform(&transform, &inputs)?.0.shape(), (2, 0));
         }
         Ok(())
     }
@@ -925,7 +899,7 @@ mod tests {
                 &definition,
                 &state,
                 &inputs,
-                definition.transform(&state, &prepared_inputs)?.frame(),
+                &definition.transform(&state, &prepared_inputs)?.0,
                 &[
                     &[Some(true), None, None, Some(false), None, Some(true), None],
                     &[Some(false), None, None, Some(true), None, Some(false), None],
@@ -1040,14 +1014,14 @@ mod tests {
             &definition,
             &first,
             &input,
-            definition.transform(&first, &prepared_input)?.frame(),
+            &definition.transform(&first, &prepared_input)?.0,
             &[&[Some(false), Some(true), None]],
         );
         assert_output(
             &definition,
             &second,
             &input,
-            definition.transform(&second, &prepared_input)?.frame(),
+            &definition.transform(&second, &prepared_input)?.0,
             &[&[Some(false), None, Some(true)]],
         );
 
@@ -1075,8 +1049,8 @@ mod tests {
             transform
                 .transform(&training)
                 .unwrap()
-                .frame()
-                .equals_missing(original.frame())
+                .0
+                .equals_missing(&original.0)
         );
         assert_eq!(transform.definition(), &definition);
         Ok(())
@@ -1112,7 +1086,7 @@ mod tests {
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                output.frame(),
+                &output.0,
                 &expected,
             );
             let names = levels[..count]
@@ -1121,7 +1095,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
-                    .frame()
+                    .0
                     .get_column_names()
                     .iter()
                     .map(|name| name.as_str())
@@ -1172,7 +1146,7 @@ mod tests {
                 &fitted.definition,
                 &fitted.state,
                 &input,
-                output.frame(),
+                &output.0,
                 &expected,
             );
             let names = levels[1..count]
@@ -1181,7 +1155,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 output
-                    .frame()
+                    .0
                     .get_column_names()
                     .iter()
                     .map(|name| name.as_str())
@@ -1218,7 +1192,7 @@ mod tests {
         let output = fitted.transform(&prepared_input)?;
         // Columns follow the fitted level order, not the order of `keep`
         assert_eq!(
-            output.frame().get_column_names(),
+            output.0.get_column_names(),
             [
                 "C(group, keep=['d', 'b'])[`b`]",
                 "C(group, keep=['d', 'b'])[`d`]"
@@ -1228,7 +1202,7 @@ mod tests {
             &fitted.definition,
             &fitted.state,
             &input,
-            output.frame(),
+            &output.0,
             &[
                 &[
                     Some(false),
@@ -1288,7 +1262,7 @@ mod tests {
                 &definition,
                 &transform,
                 &input,
-                definition.transform(&transform, &prepared_input)?.frame(),
+                &definition.transform(&transform, &prepared_input)?.0,
                 &[&[Some(false), Some(true), Some(false)]],
             );
         }
@@ -1309,7 +1283,7 @@ mod tests {
             &definition,
             &transform,
             &input,
-            definition.transform(&transform, &prepared_input)?.frame(),
+            &definition.transform(&transform, &prepared_input)?.0,
             &[&[Some(false), Some(true), Some(false)]],
         );
         Ok(())
@@ -1329,7 +1303,7 @@ mod tests {
             &definition,
             &transform,
             &input,
-            definition.transform(&transform, &prepared_input)?.frame(),
+            &definition.transform(&transform, &prepared_input)?.0,
             &[&[Some(true), Some(false), None]],
         );
         Ok(())
@@ -1466,8 +1440,8 @@ mod tests {
             original
                 .transform(&prepared_input)
                 .unwrap()
-                .frame()
-                .equals_missing(original_output.frame())
+                .0
+                .equals_missing(&original_output.0)
         );
 
         let Fit::Fitted(transform) = transform else {
@@ -1478,7 +1452,7 @@ mod tests {
             &transform.definition,
             &transform.state,
             &input,
-            transform.transform(&prepared_input)?.frame(),
+            &transform.transform(&prepared_input)?.0,
             &[
                 &[None, Some(true), Some(false)],
                 &[None, Some(false), Some(true)],
@@ -1518,7 +1492,7 @@ mod tests {
         let output = fitted.transform(&prepare(&input))?;
 
         assert_eq!(
-            output.frame().get_column_names(),
+            output.0.get_column_names(),
             [
                 "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[`a`]",
                 "C(group, bin={'db': ['d', 'b', 'd'], 'x': 'c'})[`db`]",
@@ -1529,7 +1503,7 @@ mod tests {
             &fitted.definition,
             &fitted.state,
             &input,
-            output.frame(),
+            &output.0,
             &[
                 &[
                     Some(true),
@@ -1584,7 +1558,7 @@ mod tests {
                 &training,
             )?;
             let output = fitted.transform(&training)?;
-            assert_eq!(output.frame().get_column_names(), expected);
+            assert_eq!(output.0.get_column_names(), expected);
         }
 
         // Bins covering every level leave a single column
@@ -1593,7 +1567,7 @@ mod tests {
             Levels::List(vec![text("a"), text("b"), text("c"), text("d")]),
         )];
         let fitted = Fitted::fit(CategoricalDefinition::new(None, Some(all)), &training)?;
-        assert_eq!(fitted.transform(&training)?.frame().width(), 1);
+        assert_eq!(fitted.transform(&training)?.0.width(), 1);
         Ok(())
     }
 
@@ -1615,7 +1589,7 @@ mod tests {
             &training,
         )?;
         assert_eq!(
-            named.transform(&training)?.frame().get_column_names(),
+            named.transform(&training)?.0.get_column_names(),
             ["C(x, bin={'1': [1, 2]}, omit='1')[`3`]"]
         );
 

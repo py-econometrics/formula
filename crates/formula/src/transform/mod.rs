@@ -45,7 +45,6 @@ pub enum ParameterValue {
     Map(Vec<(PlSmallStr, ParameterValue)>),
 }
 
-/// A transform's output columns, and each row's code if the transform is categorical
 #[derive(Clone, Debug)]
 pub(crate) struct TransformOutput {
     columns: MaterializedColumns<ComponentKey>,
@@ -53,8 +52,15 @@ pub(crate) struct TransformOutput {
 }
 
 impl TransformOutput {
-    pub(crate) fn new(columns: MaterializedColumns<ComponentKey>, codes: Option<Codes>) -> Self {
-        Self { columns, codes }
+    pub(crate) fn new(
+        frame: DataFrame,
+        codes: Option<Codes>,
+        components: Vec<ComponentKey>,
+    ) -> Self {
+        Self {
+            columns: MaterializedColumns::new(frame, components),
+            codes,
+        }
     }
 
     pub(crate) fn columns(&self) -> &MaterializedColumns<ComponentKey> {
@@ -170,15 +176,48 @@ impl Transform {
         TRANSFORM_CALLS.update(|(fits, transforms)| (fits, transforms + 1));
 
         let inputs = self.input(inputs).map_err(FitError::Transform)?;
-        match self {
-            Self::Expression(expression) => {
-                expression.transform(&inputs).map_err(FitError::Transform)
+        let (frame, codes) = match self {
+            Self::Expression(expression) => (
+                expression.transform(&inputs).map_err(FitError::Transform)?,
+                None,
+            ),
+            Self::C(categorical) => {
+                let (frame, codes) = categorical.transform(&inputs)?;
+                (frame, Some(codes))
             }
-            Self::C(categorical) => categorical.transform(&inputs),
-            Self::Poly(polynomial) => polynomial.transform(&inputs),
-            Self::Standardize(standardize) => standardize.transform(&inputs),
-            Self::F(integer) => integer.transform(&inputs),
-            Self::G(grouped) => grouped.transform(&inputs).map_err(FitError::Transform),
+            Self::Poly(polynomial) => (polynomial.transform(&inputs)?, None),
+            Self::Standardize(standardize) => (standardize.transform(&inputs)?, None),
+            Self::F(integer) => (integer.transform(&inputs)?, None),
+            Self::G(grouped) => (
+                grouped.transform(&inputs).map_err(FitError::Transform)?,
+                None,
+            ),
+        };
+
+        Ok(TransformOutput::new(frame, codes, self.components()?))
+    }
+
+    /// The keys of a fitted transform's output columns
+    pub(crate) fn components(&self) -> Result<Vec<ComponentKey>, FitError<TransformError>> {
+        match self {
+            Self::C(categorical) => categorical
+                .state()
+                .map(CategoricalState::components)
+                .ok_or(FitError::NotFitted),
+            Self::Poly(polynomial) => polynomial
+                .state()
+                .map(|_| polynomial.definition().components())
+                .ok_or(FitError::NotFitted),
+            Self::Standardize(standardize) => standardize
+                .state()
+                .map(|_| vec![ComponentKey::None])
+                .ok_or(FitError::NotFitted),
+            Self::F(integer) => integer
+                .state()
+                .map(|_| vec![ComponentKey::None])
+                .ok_or(FitError::NotFitted),
+            Self::Expression(_) => Ok(vec![ComponentKey::None]),
+            Self::G(grouped) => Ok(grouped.components()),
         }
     }
 
@@ -274,6 +313,86 @@ mod tests {
 
     fn prepare(inputs: &[Column]) -> PreparedInput {
         PreparedInput::new(inputs, false).unwrap()
+    }
+
+    #[test]
+    fn components_follow_definitions_and_fitted_state() -> Result<(), TransformError> {
+        let label = |value: &'static str| Scalar::from(PlSmallStr::from_static(value));
+        let key = |value: &'static str| ComponentKey::Scalar(label(value));
+        let labels = [Column::new("x".into(), ["b", "a", "c"])];
+        for (selection, bins, expected) in [
+            (None, None, vec![key("a"), key("b"), key("c")]),
+            (
+                Some(LevelSelection::Omit(Levels::Scalar(label("b")))),
+                None,
+                vec![key("a"), key("c")],
+            ),
+            (
+                Some(LevelSelection::Keep(Levels::List(vec![
+                    label("c"),
+                    label("a"),
+                ]))),
+                None,
+                vec![key("a"), key("c")],
+            ),
+            (
+                None,
+                Some(vec![(
+                    PlSmallStr::from_static("ab"),
+                    Levels::List(vec![label("a"), label("b")]),
+                )]),
+                vec![key("ab"), key("c")],
+            ),
+        ] {
+            let transform =
+                Transform::C(Fit::Unfitted(CategoricalDefinition::new(selection, bins)));
+            assert!(matches!(transform.components(), Err(FitError::NotFitted)));
+            assert_eq!(transform.fit(&labels)?.components().unwrap(), expected);
+        }
+
+        let values = [Column::new("x".into(), [1.0, 2.0, 4.0])];
+        let basis = [1_i64, 2].map(|index| ComponentKey::Scalar(Scalar::from(index)));
+        for raw in [true, false] {
+            let transform = Transform::Poly(Fit::Unfitted(PolynomialDefinition::from_parameters(
+                Some(ParameterValue::Scalar(Scalar::from(2_i64))),
+                Some(ParameterValue::Scalar(Scalar::from(raw))),
+            )?));
+            assert!(matches!(transform.components(), Err(FitError::NotFitted)));
+            assert_eq!(transform.fit(&values)?.components().unwrap(), basis);
+        }
+
+        for transform in [
+            Transform::Standardize(Fit::Unfitted(StandardizeDefinition::SCALE)),
+            Transform::F(Fit::Unfitted(IntegerEncodingDefinition)),
+        ] {
+            assert!(matches!(transform.components(), Err(FitError::NotFitted)));
+            assert_eq!(
+                transform.fit(&values)?.components().unwrap(),
+                [ComponentKey::None]
+            );
+        }
+        assert_eq!(
+            Transform::Expression(ExpressionTransform::LOG)
+                .components()
+                .unwrap(),
+            [ComponentKey::None]
+        );
+
+        let loading = |position: u64| {
+            ComponentKey::Tuple(vec![
+                key("loading"),
+                ComponentKey::Scalar(Scalar::from(position)),
+            ])
+        };
+        for (loadings, expected) in [
+            (0, vec![key("group")]),
+            (1, vec![key("group"), loading(1)]),
+            (2, vec![key("group"), loading(1), loading(2)]),
+        ] {
+            let transform = Transform::G(GroupedTransform::new(false, loadings));
+            assert_eq!(transform.components().unwrap(), expected);
+        }
+        Ok(())
     }
 
     #[test]
