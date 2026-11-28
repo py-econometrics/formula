@@ -111,9 +111,10 @@ impl GroupedTransform {
 
         let frame = DataFrame::new(height, columns)?;
 
-        Ok(TransformOutput::Columns(MaterializedColumns::new(
-            frame, keys,
-        )))
+        Ok(TransformOutput::new(
+            MaterializedColumns::new(frame, keys),
+            None,
+        ))
     }
 }
 

@@ -552,14 +552,14 @@ impl Term {
                     .clone()
                     .with_factor(Arc::clone(&result.factor)),
             );
-            categorical.push(match &result.output {
-                TransformOutput::Indicator(indicators) => {
-                    codes.push(indicators.codes());
-                    counts.push(indicators.count());
-                    kept.push(indicators.kept());
+            categorical.push(match result.output.codes() {
+                Some(factor_codes) => {
+                    codes.push(factor_codes.codes());
+                    counts.push(factor_codes.count());
+                    kept.push(result.output.frame().width() as u32);
                     true
                 }
-                TransformOutput::Columns(_) => false,
+                None => false,
             });
         }
 
@@ -1284,11 +1284,14 @@ fn fit_and_transform_factors(
         let result = match &factor.kind {
             FactorKind::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
-                output: TransformOutput::Columns(MaterializedColumns::single_column(
-                    Column::new_scalar(factor.render().into(), value.clone(), data.height())
-                        .into_frame(),
-                    ComponentKey::None,
-                )),
+                output: TransformOutput::new(
+                    MaterializedColumns::single_column(
+                        Column::new_scalar(factor.render().into(), value.clone(), data.height())
+                            .into_frame(),
+                        ComponentKey::None,
+                    ),
+                    None,
+                ),
             },
             FactorKind::Variable(variable) => {
                 let column = data
@@ -1301,10 +1304,10 @@ fn fit_and_transform_factors(
                 let factor = Arc::new(Factor {
                     kind: FactorKind::Variable(fitted),
                 });
-                let output = TransformOutput::Columns(MaterializedColumns::single_column(
-                    output.into_frame(),
-                    ComponentKey::None,
-                ));
+                let output = TransformOutput::new(
+                    MaterializedColumns::single_column(output.into_frame(), ComponentKey::None),
+                    None,
+                );
 
                 FittedFactor { factor, output }
             }
@@ -1349,22 +1352,26 @@ fn transform_factors(
 
     for factor in scheduled {
         let output = match &factor.kind {
-            FactorKind::Literal(value) => {
-                TransformOutput::Columns(MaterializedColumns::single_column(
+            FactorKind::Literal(value) => TransformOutput::new(
+                MaterializedColumns::single_column(
                     Column::new_scalar(factor.render().into(), value.clone(), data.height())
                         .into_frame(),
                     ComponentKey::None,
-                ))
-            }
+                ),
+                None,
+            ),
             FactorKind::Variable(variable) => {
                 let column = data
                     .column(&variable.definition().name)
                     .map_err(TransformError::from)?;
 
-                TransformOutput::Columns(MaterializedColumns::single_column(
-                    variable.transform(column)?.into_frame(),
-                    ComponentKey::None,
-                ))
+                TransformOutput::new(
+                    MaterializedColumns::single_column(
+                        variable.transform(column)?.into_frame(),
+                        ComponentKey::None,
+                    ),
+                    None,
+                )
             }
             FactorKind::Call {
                 transform,

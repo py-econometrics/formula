@@ -128,8 +128,9 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         }
         .alias(name);
         let output = inputs.frame.clone().lazy().select([expression]).collect()?;
-        Ok(TransformOutput::Columns(
+        Ok(TransformOutput::new(
             MaterializedColumns::single_column(output, ComponentKey::None),
+            None,
         ))
     }
 }
