@@ -1216,6 +1216,32 @@ impl FittedExpression {
         &self.children
     }
 
+    pub(crate) fn assemble(
+        &self,
+        height: usize,
+        transformed: &[FittedTerm],
+    ) -> Result<Self, ModelError> {
+        let terms = self
+            .terms
+            .iter()
+            .map(|term| lookup_term(transformed, &term.term).clone())
+            .collect::<Vec<_>>();
+
+        let columns = terms
+            .iter()
+            .flat_map(|term| term.columns.frame().columns().iter().cloned())
+            .collect();
+        let frame = DataFrame::new(height, columns).map_err(TransformError::from)?;
+
+        let children = self
+            .children
+            .iter()
+            .map(|child| child.assemble(height, transformed))
+            .collect::<Result<Vec<_>, ModelError>>()?;
+
+        Ok(Self::new(self.expression.clone(), terms, frame, children))
+    }
+
     pub(crate) fn select_terms(&self, query: &Expression) -> Result<Self, SelectionError> {
         for term in &query.terms {
             if !self.expression.terms.contains(term) {
