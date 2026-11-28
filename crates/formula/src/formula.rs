@@ -10,9 +10,10 @@ use crate::transform::{
 };
 use crate::{SelectionError, TransformState};
 use polars::prelude::{
-    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PolarsResult, Scalar,
+    AnyValue, ChunkCompareEq, Column, DataFrame, DataType, IntoColumn, PlSmallStr, PolarsResult,
+    Scalar,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use winnow::Parser;
 use winnow::combinator::fail;
@@ -778,26 +779,6 @@ impl Expression {
         Ok(Self::new(terms, children))
     }
 
-    pub(crate) fn assemble(
-        &self,
-        height: usize,
-        transformed: &[FittedTerm],
-    ) -> Result<FittedExpression, ModelError> {
-        let terms = self
-            .terms
-            .iter()
-            .map(|term| lookup_term(transformed, term, true).clone())
-            .collect::<Vec<_>>();
-
-        let children = self
-            .children
-            .iter()
-            .map(|child| child.assemble(height, transformed))
-            .collect::<Result<Vec<_>, ModelError>>()?;
-
-        Ok(FittedExpression::new(height, terms, children).map_err(TransformError::from)?)
-    }
-
     pub(crate) fn add(self, other: impl Into<Self>) -> Self {
         let other = other.into();
         Self::new(
@@ -895,14 +876,38 @@ impl Formula {
         Ok(Self { expressions })
     }
 
-    fn assemble(&self, height: usize, terms: &[FittedTerm]) -> Result<FittedFormula, ModelError> {
+    fn assemble(
+        &self,
+        height: usize,
+        terms: &[FittedTerm],
+        selection: &ColumnSelection,
+    ) -> Result<FittedFormula, ModelError> {
         let expressions = self
             .expressions
             .iter()
             .map(|(&role, expression)| {
-                expression
-                    .assemble(height, terms)
-                    .map(|transformed| (role, transformed))
+                let candidates = expression
+                    .terms
+                    .iter()
+                    .map(|term| lookup_term(terms, term, true))
+                    .collect::<Vec<_>>();
+                let kept = selection.select(&candidates);
+                let fitted = candidates
+                    .iter()
+                    .map(|candidate| {
+                        candidate
+                            .select(candidate.column_names().filter(|name| kept.contains(*name)))
+                    })
+                    .collect::<PolarsResult<Vec<_>>>()
+                    .map_err(TransformError::from)?;
+                let children = expression
+                    .children
+                    .iter()
+                    .map(|child| child.assemble(height, terms, selection))
+                    .collect::<Result<Vec<_>, ModelError>>()?;
+                let expression = FittedExpression::new(height, fitted, children)
+                    .map_err(TransformError::from)?;
+                Ok((role, expression))
             })
             .collect::<Result<BTreeMap<_, _>, ModelError>>()?;
 
@@ -1006,7 +1011,7 @@ impl Formulas {
 
         let entries = lowered
             .iter()
-            .map(|formula| formula.assemble(data.height(), &fitted))
+            .map(|formula| formula.assemble(data.height(), &fitted, &ColumnSelection::All))
             .collect::<Result<Vec<_>, ModelError>>()?;
 
         Ok(FittedFormulas::new(entries))
@@ -1116,6 +1121,24 @@ struct FittedFactor {
     output: TransformOutput,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ColumnSelection {
+    /// Every candidate column
+    All,
+}
+
+impl ColumnSelection {
+    fn select(&self, candidates: &[&FittedTerm]) -> BTreeSet<PlSmallStr> {
+        match self {
+            Self::All => candidates
+                .iter()
+                .flat_map(|term| term.column_names())
+                .map(PlSmallStr::from)
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FittedTerm {
     term: Term,
@@ -1131,14 +1154,19 @@ impl FittedTerm {
         &self.term
     }
 
-    fn select(&self, fitted: &Self) -> PolarsResult<Self> {
-        let (columns, metadata): (Vec<_>, Vec<_>) = fitted
-            .columns
+    fn column_names(&self) -> impl Iterator<Item = &str> {
+        self.columns
             .frame()
             .columns()
             .iter()
-            .map(|column| {
-                let (data, metadata) = lookup_column(&self.columns, column.name().as_str());
+            .map(|column| column.name().as_str())
+    }
+
+    fn select<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> PolarsResult<Self> {
+        let (columns, metadata): (Vec<_>, Vec<_>) = names
+            .into_iter()
+            .map(|name| {
+                let (data, metadata) = lookup_column(&self.columns, name);
                 (data.clone(), metadata.clone())
             })
             .unzip();
@@ -1239,7 +1267,7 @@ impl FittedExpression {
         let terms = self
             .terms
             .iter()
-            .map(|term| lookup_term(transformed, &term.term, false).select(term))
+            .map(|term| lookup_term(transformed, &term.term, false).select(term.column_names()))
             .collect::<PolarsResult<Vec<_>>>()
             .map_err(TransformError::from)?;
 
@@ -1521,7 +1549,7 @@ fn lookup_column<'a>(
     let index = columns
         .frame()
         .get_column_index(name)
-        .expect("every fitted column must have a transformed column");
+        .expect("every selected column must be a candidate column");
 
     (&columns.frame().columns()[index], &columns.metadata[index])
 }
