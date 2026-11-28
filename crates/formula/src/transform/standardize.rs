@@ -2,10 +2,9 @@
 //! of `x` when fitting and reuse them when transforming new data.
 
 use super::input::{PreparedInput, validate_numeric_field};
-use super::{ArgumentCount, TransformDefinition, TransformError, TransformOutput, call_name};
+use super::{ArgumentCount, TransformDefinition, TransformError, call_name};
 use crate::fit::Definition;
-use crate::formula::{ComponentKey, MaterializedColumns};
-use polars::prelude::{Field, IntoLazy, NULL, col, lit, when};
+use polars::prelude::{DataFrame, Field, IntoLazy, NULL, col, lit, when};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StandardizeDefinition {
@@ -44,7 +43,7 @@ impl TransformDefinition for StandardizeDefinition {
 
 impl Definition<StandardizeState> for StandardizeDefinition {
     type Input = PreparedInput;
-    type Output = TransformOutput;
+    type Output = DataFrame;
     type Error = TransformError;
 
     fn fit(&self, inputs: &PreparedInput) -> Result<StandardizeState, TransformError> {
@@ -128,10 +127,7 @@ impl Definition<StandardizeState> for StandardizeDefinition {
         }
         .alias(name);
         let output = inputs.frame.clone().lazy().select([expression]).collect()?;
-        Ok(TransformOutput::new(
-            MaterializedColumns::single_column(output, ComponentKey::None),
-            None,
-        ))
+        Ok(output)
     }
 }
 
@@ -150,7 +146,7 @@ mod tests {
         values: &[f64],
     ) -> Vec<f64> {
         let output = fitted.transform(&prepare(values)).unwrap();
-        output.frame().columns()[0]
+        output.columns()[0]
             .f64()
             .unwrap()
             .into_no_null_iter()
@@ -247,10 +243,7 @@ mod tests {
             ),
         ] {
             let output = Fitted::fit(definition, &inputs)?.transform(&inputs)?;
-            let actual = output.frame().columns()[0]
-                .f64()?
-                .iter()
-                .collect::<Vec<_>>();
+            let actual = output.columns()[0].f64()?.iter().collect::<Vec<_>>();
             assert_eq!(actual, expected);
         }
         Ok(())
@@ -272,7 +265,7 @@ mod tests {
                 (StandardizeDefinition::SCALE, [-1.0, 0.0, 1.0]),
             ] {
                 let output = Fitted::fit(definition, &inputs)?.transform(&inputs)?;
-                let column = &output.frame().columns()[0];
+                let column = &output.columns()[0];
                 assert_eq!(column.dtype(), &dtype);
                 let actual = column
                     .cast(&DataType::Float64)?

@@ -1,7 +1,7 @@
 use crate::fit::Definition;
-use crate::formula::{ComponentKey, MaterializedColumns};
+use crate::formula::ComponentKey;
 use crate::transform::input::{PreparedInput, argument_column_name, validate_numeric_field};
-use crate::transform::{ParameterValue, TransformDefinition, TransformOutput, call_name};
+use crate::transform::{ParameterValue, TransformDefinition, call_name};
 use crate::{ArgumentCount, TransformError};
 use polars::prelude::{
     AnyValue, Column, DataFrame, DataType, Expr, Field, Float64Chunked, IntoColumn, IntoLazy, NULL,
@@ -316,7 +316,7 @@ pub(crate) struct PolynomialState {
 
 impl Definition<PolynomialState> for PolynomialDefinition {
     type Input = PreparedInput;
-    type Output = TransformOutput;
+    type Output = DataFrame;
     type Error = TransformError;
 
     fn validate(
@@ -379,11 +379,7 @@ impl Definition<PolynomialState> for PolynomialDefinition {
             })
             .collect();
 
-        let frame = DataFrame::new(height, columns)?;
-        Ok(TransformOutput::new(
-            MaterializedColumns::new(frame, self.components()),
-            None,
-        ))
+        Ok(DataFrame::new(height, columns)?)
     }
 }
 
@@ -506,10 +502,10 @@ mod tests {
             &training,
         )?;
         let output = fitted.transform(&training)?;
-        assert_polynomial_schema(output.frame(), 3, 2, false);
+        assert_polynomial_schema(&output, 3, 2, false);
 
         // q1 = x / sqrt(2), q2 = (3*x^2 - 2) / sqrt(6).
-        for (column, expected) in output.frame().columns().iter().zip([
+        for (column, expected) in output.columns().iter().zip([
             [-1.0 / 2.0_f64.sqrt(), 0.0, 1.0 / 2.0_f64.sqrt()],
             [
                 1.0 / 6.0_f64.sqrt(),
@@ -543,9 +539,8 @@ mod tests {
                 &prepared_training,
             )?;
             let output = fitted.transform(&prepared_training)?;
-            assert_polynomial_schema(output.frame(), training[0].len(), degree, false);
+            assert_polynomial_schema(&output, training[0].len(), degree, false);
             let columns = output
-                .frame()
                 .columns()
                 .iter()
                 .map(|column| {
@@ -582,15 +577,9 @@ mod tests {
         let prediction = prepare(&[Column::new("x".into(), [12.0])]);
         for _ in 0..2 {
             let output = fitted.transform(&prediction)?;
-            assert_polynomial_schema(output.frame(), 1, 2, false);
-            assert_close(
-                output.frame()[0].f64()?.get(0).unwrap(),
-                2.0 / 2.0_f64.sqrt(),
-            );
-            assert_close(
-                output.frame()[1].f64()?.get(0).unwrap(),
-                10.0 / 6.0_f64.sqrt(),
-            );
+            assert_polynomial_schema(&output, 1, 2, false);
+            assert_close(output[0].f64()?.get(0).unwrap(), 2.0 / 2.0_f64.sqrt());
+            assert_close(output[1].f64()?.get(0).unwrap(), 10.0 / 6.0_f64.sqrt());
         }
         Ok(())
     }
@@ -627,8 +616,7 @@ mod tests {
             assert!(
                 fitted
                     .transform(&prepare(&[input]))?
-                    .frame()
-                    .equals_missing(expected.frame()),
+                    .equals_missing(&expected),
                 "{case}"
             );
         }
@@ -661,13 +649,8 @@ mod tests {
 
         for fitted in [&clean_fit, &missing_fit] {
             let output = fitted.transform(&missing)?;
-            assert_polynomial_schema(output.frame(), 7, 2, false);
-            for (column, expected) in output
-                .frame()
-                .columns()
-                .iter()
-                .zip(expected.frame().columns())
-            {
+            assert_polynomial_schema(&output, 7, 2, false);
+            for (column, expected) in output.columns().iter().zip(expected.columns()) {
                 assert_eq!(column.null_count(), 4);
                 for row in [1, 2, 4, 6] {
                     assert_eq!(column.f64()?.get(row), None);
@@ -770,8 +753,8 @@ mod tests {
             ] {
                 let height = values.len();
                 let output = fitted.transform(&prepare(&[Column::new("x".into(), values)]))?;
-                assert_polynomial_schema(output.frame(), height, 2, raw);
-                for column in output.frame().columns() {
+                assert_polynomial_schema(&output, height, 2, raw);
+                for column in output.columns() {
                     assert_eq!(column.null_count(), height, "raw={raw}");
                 }
             }
@@ -815,8 +798,8 @@ mod tests {
 
         for _ in 0..2 {
             let output = fitted.transform(&prediction)?;
-            assert_polynomial_schema(output.frame(), 3, 3, true);
-            for (column, expected) in output.frame().columns().iter().zip([
+            assert_polynomial_schema(&output, 3, 3, true);
+            for (column, expected) in output.columns().iter().zip([
                 [Some(2.0), Some(-3.0), Some(0.0)],
                 [Some(4.0), Some(9.0), Some(0.0)],
                 [Some(8.0), Some(-27.0), Some(0.0)],
@@ -848,8 +831,8 @@ mod tests {
             &inputs,
         )?;
         let output = fitted.transform(&inputs)?;
-        assert_polynomial_schema(output.frame(), 6, 2, true);
-        for (column, expected) in output.frame().columns().iter().zip([
+        assert_polynomial_schema(&output, 6, 2, true);
+        for (column, expected) in output.columns().iter().zip([
             [Some(2.0), None, None, None, None, Some(-0.5)],
             [Some(4.0), None, None, None, None, Some(0.25)],
         ]) {
@@ -873,9 +856,9 @@ mod tests {
                 &prepare(&[Column::new("x".into(), values)]),
             )?;
             let output = fitted.transform(&prepare(&[Column::new("x".into(), [3.0])]))?;
-            assert_polynomial_schema(output.frame(), 1, 2, true);
-            assert_eq!(output.frame()[0].f64()?.get(0), Some(3.0));
-            assert_eq!(output.frame()[1].f64()?.get(0), Some(9.0));
+            assert_polynomial_schema(&output, 1, 2, true);
+            assert_eq!(output[0].f64()?.get(0), Some(3.0));
+            assert_eq!(output[1].f64()?.get(0), Some(9.0));
         }
         Ok(())
     }
@@ -891,11 +874,11 @@ mod tests {
             &inputs,
         )?;
         let output = fitted.transform(&inputs)?;
-        assert_polynomial_schema(output.frame(), 2, 3, true);
-        assert_eq!(output.frame()[0].f64()?.get(0), Some(f64::MAX));
-        assert_eq!(output.frame()[1].f64()?.get(0), Some(f64::INFINITY));
-        assert_eq!(output.frame()[1].f64()?.get(1), Some(f64::INFINITY));
-        assert_eq!(output.frame()[2].f64()?.get(1), Some(f64::NEG_INFINITY));
+        assert_polynomial_schema(&output, 2, 3, true);
+        assert_eq!(output[0].f64()?.get(0), Some(f64::MAX));
+        assert_eq!(output[1].f64()?.get(0), Some(f64::INFINITY));
+        assert_eq!(output[1].f64()?.get(1), Some(f64::INFINITY));
+        assert_eq!(output[2].f64()?.get(1), Some(f64::NEG_INFINITY));
         Ok(())
     }
 

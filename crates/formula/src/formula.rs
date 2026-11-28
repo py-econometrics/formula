@@ -1285,12 +1285,10 @@ fn fit_and_transform_factors(
             FactorKind::Literal(value) => FittedFactor {
                 factor: Arc::clone(factor),
                 output: TransformOutput::new(
-                    MaterializedColumns::single_column(
-                        Column::new_scalar(factor.render().into(), value.clone(), data.height())
-                            .into_frame(),
-                        ComponentKey::None,
-                    ),
+                    Column::new_scalar(factor.render().into(), value.clone(), data.height())
+                        .into_frame(),
                     None,
+                    vec![ComponentKey::None],
                 ),
             },
             FactorKind::Variable(variable) => {
@@ -1304,10 +1302,8 @@ fn fit_and_transform_factors(
                 let factor = Arc::new(Factor {
                     kind: FactorKind::Variable(fitted),
                 });
-                let output = TransformOutput::new(
-                    MaterializedColumns::single_column(output.into_frame(), ComponentKey::None),
-                    None,
-                );
+                let output =
+                    TransformOutput::new(output.into_frame(), None, vec![ComponentKey::None]);
 
                 FittedFactor { factor, output }
             }
@@ -1353,12 +1349,10 @@ fn transform_factors(
     for factor in scheduled {
         let output = match &factor.kind {
             FactorKind::Literal(value) => TransformOutput::new(
-                MaterializedColumns::single_column(
-                    Column::new_scalar(factor.render().into(), value.clone(), data.height())
-                        .into_frame(),
-                    ComponentKey::None,
-                ),
+                Column::new_scalar(factor.render().into(), value.clone(), data.height())
+                    .into_frame(),
                 None,
+                vec![ComponentKey::None],
             ),
             FactorKind::Variable(variable) => {
                 let column = data
@@ -1366,11 +1360,9 @@ fn transform_factors(
                     .map_err(TransformError::from)?;
 
                 TransformOutput::new(
-                    MaterializedColumns::single_column(
-                        variable.transform(column)?.into_frame(),
-                        ComponentKey::None,
-                    ),
+                    variable.transform(column)?.into_frame(),
                     None,
+                    vec![ComponentKey::None],
                 )
             }
             FactorKind::Call {
