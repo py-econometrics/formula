@@ -1380,6 +1380,47 @@ mod tests {
     }
 
     #[test]
+    fn collected_models_from_separate_fits_transform_with_their_own_state() {
+        fn frames(model: &crate::FittedFormula) -> Vec<polars::prelude::DataFrame> {
+            let mut output = vec![model.frame().unwrap()];
+            if let Ok(children) = model.children(Role::Independent) {
+                output.extend(children.iter().flat_map(frames));
+            }
+            output
+        }
+
+        // The two fits observe different levels of g
+        let first = polars::df!("y" => [1.0, 2.0], "x" => [3.0, 4.0], "g" => ["a", "b"]).unwrap();
+        let second = polars::df!(
+            "y" => [1.0, 2.0, 3.0], "x" => [3.0, 4.0, 5.0], "g" => ["a", "b", "c"],
+        )
+        .unwrap();
+        let input = polars::df!("y" => [6.0, 7.0], "x" => [8.0, 9.0], "g" => ["c", "a"]).unwrap();
+
+        for source in ["y ~ C(g) - 1", "y ~ x + [x ~ C(g) - 1]"] {
+            let fits =
+                [&first, &second].map(|data| crate::parse(source).unwrap().fit(data).unwrap());
+            let collected = fits
+                .iter()
+                .flat_map(super::FittedFormulas::iter)
+                .cloned()
+                .collect::<super::FittedFormulas>();
+            let transformed = collected.transform(&input).unwrap();
+
+            assert_eq!(transformed.len(), fits.len(), "{source}");
+            for (fit, actual) in fits.iter().zip(transformed.iter()) {
+                let expected = fit.transform(&input).unwrap();
+                let expected = frames(expected.iter().next().unwrap());
+                let actual = frames(actual);
+                assert_eq!(actual.len(), expected.len(), "{source}");
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert!(actual.equals_missing(expected), "{source}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn models_select_preserves_formula_keys_order_and_fitted_state() {
         let data = polars::df!(
             "y" => [1.0, 2.0, 3.0], "x" => [4.0, 5.0, 6.0],

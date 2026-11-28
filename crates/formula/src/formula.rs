@@ -537,7 +537,7 @@ impl Term {
         let mut counts = Vec::new();
         let mut kept = Vec::new();
         for factor in &self.factors {
-            let result = lookup_factor(transformed, factor);
+            let result = lookup_factor(transformed, factor, fitting);
             if let FactorKind::Variable(_) = &factor.kind {
                 let [column] = result.output.frame().columns() else {
                     unreachable!("a variable transforms to exactly one column");
@@ -786,7 +786,7 @@ impl Expression {
         let terms = self
             .terms
             .iter()
-            .map(|term| lookup_term(transformed, term).clone())
+            .map(|term| lookup_term(transformed, term, true).clone())
             .collect::<Vec<_>>();
 
         let children = self
@@ -1220,7 +1220,7 @@ impl FittedExpression {
         let terms = self
             .terms
             .iter()
-            .map(|term| lookup_term(transformed, &term.term).clone())
+            .map(|term| lookup_term(transformed, &term.term, false).clone())
             .collect::<Vec<_>>();
 
         let children = self
@@ -1315,7 +1315,7 @@ fn fit_and_transform_factors(
                 let mut fitted_arguments = Vec::with_capacity(arguments.len());
                 let mut inputs = Vec::new();
                 for argument in arguments {
-                    let result = lookup_factor(&transformed, argument);
+                    let result = lookup_factor(&transformed, argument, true);
                     fitted_arguments.push(Arc::clone(&result.factor));
                     inputs.extend(result.output.frame().columns().iter().cloned());
                 }
@@ -1372,7 +1372,7 @@ fn transform_factors(
             } => {
                 let mut inputs = Vec::new();
                 for argument in arguments {
-                    let result = lookup_factor(&transformed, argument);
+                    let result = lookup_factor(&transformed, argument, false);
                     inputs.extend(result.output.frame().columns().iter().cloned());
                 }
                 transform.transform(&inputs).map_err(|error| {
@@ -1388,16 +1388,19 @@ fn transform_factors(
     Ok(transformed)
 }
 
-fn schedule_factors(terms: &[&Term]) -> Vec<Arc<Factor>> {
-    fn schedule(factor: &Arc<Factor>, scheduled: &mut Vec<Arc<Factor>>) {
-        // Structural equality check if factor is already scheduled.
-        if scheduled.contains(factor) {
+fn schedule_factors(terms: &[&Term], fitting: bool) -> Vec<Arc<Factor>> {
+    fn schedule(factor: &Arc<Factor>, scheduled: &mut Vec<Arc<Factor>>, fitting: bool) {
+        // Skip a factor that is already scheduled.
+        if scheduled
+            .iter()
+            .any(|entry| same_factor(entry, factor, fitting))
+        {
             return;
         }
         // Traverse arguments of factor call recursively.
         if let FactorKind::Call { arguments, .. } = &factor.kind {
             for argument in arguments {
-                schedule(argument, scheduled);
+                schedule(argument, scheduled, fitting);
             }
         }
         // At this point, arguments have been scheduled before the parent factor.
@@ -1407,7 +1410,7 @@ fn schedule_factors(terms: &[&Term]) -> Vec<Arc<Factor>> {
     let mut scheduled = Vec::new();
     for term in terms {
         for factor in &term.factors {
-            schedule(factor, &mut scheduled);
+            schedule(factor, &mut scheduled, fitting);
         }
     }
 
@@ -1423,7 +1426,10 @@ fn assemble_terms(
     let mut transformed: Vec<FittedTerm> = Vec::new();
 
     for &term in terms {
-        if transformed.iter().any(|entry| &entry.term == term) {
+        if transformed
+            .iter()
+            .any(|entry| same_term(&entry.term, term, fitting))
+        {
             continue;
         }
         let (term, columns) = term.assemble(height, factors, fitting)?;
@@ -1437,7 +1443,7 @@ pub(crate) fn transform_terms(
     terms: &[&Term],
     data: &DataFrame,
 ) -> Result<Vec<FittedTerm>, ModelError> {
-    let scheduled = schedule_factors(terms);
+    let scheduled = schedule_factors(terms, false);
     let factors = transform_factors(&scheduled, data)?;
     Ok(assemble_terms(terms, data.height(), &factors, false)?)
 }
@@ -1446,22 +1452,46 @@ fn fit_and_transform_terms(
     terms: &[&Term],
     data: &DataFrame,
 ) -> Result<Vec<FittedTerm>, ModelError> {
-    let scheduled = schedule_factors(terms);
+    let scheduled = schedule_factors(terms, true);
     let factors = fit_and_transform_factors(&scheduled, data)?;
     Ok(assemble_terms(terms, data.height(), &factors, true)?)
 }
 
-fn lookup_factor<'a>(transformed: &'a [FittedFactor], factor: &Arc<Factor>) -> &'a FittedFactor {
+/// Whether `left` and `right` are the same factor:
+///
+/// If `fitting` then compare structurally, otherwise by identity to distinguish fitted state
+fn same_factor(left: &Arc<Factor>, right: &Arc<Factor>, fitting: bool) -> bool {
+    if fitting {
+        left == right
+    } else {
+        Arc::ptr_eq(left, right)
+    }
+}
+
+fn same_term(left: &Term, right: &Term, fitting: bool) -> bool {
+    left.factors.len() == right.factors.len()
+        && left
+            .factors
+            .iter()
+            .zip(&right.factors)
+            .all(|(left, right)| same_factor(left, right, fitting))
+}
+
+fn lookup_factor<'a>(
+    transformed: &'a [FittedFactor],
+    factor: &Arc<Factor>,
+    fitting: bool,
+) -> &'a FittedFactor {
     transformed
         .iter()
-        .find(|entry| &entry.factor == factor)
+        .find(|entry| same_factor(&entry.factor, factor, fitting))
         .expect("factor must be transformed before its consumer")
 }
 
-fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term) -> &'a FittedTerm {
+fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term, fitting: bool) -> &'a FittedTerm {
     transformed
         .iter()
-        .find(|entry| &entry.term == term)
+        .find(|entry| same_term(&entry.term, term, fitting))
         .expect("every term must have an transformed entry")
 }
 
@@ -2501,7 +2531,7 @@ mod tests {
     fn literal_factors_retain_scalar_storage_at_current_input_height() {
         let expressions = parse_expression.parse("mul(add(x, -2), 3.0)").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>(), true);
         let training = polars::df!("x" => [1.0, 2.0]).unwrap();
         let fitted = fit_and_transform_factors(&scheduled, &training).unwrap();
         let fitted_factors = fitted
@@ -3141,9 +3171,14 @@ mod tests {
             let specification = crate::parse("y ~ sqrt(exp(sqrt(g))) + sw0(x)").unwrap();
             assert_eq!(specification.len(), 2);
             TRANSFORM_CALLS.set((0, 0));
-            let _models = specification.fit(&data).unwrap();
+            let models = specification.fit(&data).unwrap();
             // Both sqrt calls and exp each fit and transform once across all models.
             assert_eq!(TRANSFORM_CALLS.get(), (3, 3));
+
+            TRANSFORM_CALLS.set((0, 0));
+            models.transform(&data).unwrap();
+            // Transforming the fitted models also runs each call once across all models.
+            assert_eq!(TRANSFORM_CALLS.get(), (0, 3));
         }
 
         #[test]
@@ -3572,7 +3607,7 @@ mod tests {
                 .iter()
                 .chain(&formula.expressions[&Role::Independent].terms)
                 .collect::<Vec<_>>();
-            let scheduled = schedule_factors(&terms);
+            let scheduled = schedule_factors(&terms, true);
 
             assert_eq!(scheduled.len(), count, "{source}");
             assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -3600,7 +3635,7 @@ mod tests {
     fn planning_orders_dependencies_before_parents() {
         let expressions = parse_expression.parse("log(x) + sqrt(log(x))").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>(), true);
 
         assert_eq!(scheduled.len(), 3);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -3612,7 +3647,7 @@ mod tests {
     fn planning_preserves_repeated_arguments() {
         let expressions = parse_expression.parse("sub(x, x)").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>(), true);
 
         assert_eq!(scheduled.len(), 2);
         let FactorKind::Call { arguments, .. } = &scheduled[1].kind else {
@@ -3628,7 +3663,7 @@ mod tests {
     fn planning_distinguishes_argument_order() {
         let expressions = parse_expression.parse("sub(x, y) + sub(y, x)").unwrap();
         let expression = expressions.first().unwrap();
-        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
+        let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>(), true);
 
         assert_eq!(scheduled.len(), 4);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("x"));
@@ -3651,7 +3686,7 @@ mod tests {
         ] {
             let expressions = parse_expression.parse(source).unwrap();
             let expression = expressions.first().unwrap();
-            let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>());
+            let scheduled = schedule_factors(&expression.terms.iter().collect::<Vec<_>>(), true);
 
             assert_eq!(scheduled.len(), 3, "{source}");
             assert_eq!(scheduled[0].as_ref(), &Factor::from(input));
@@ -3678,11 +3713,11 @@ mod tests {
             .iter()
             .chain(independent.iter().copied())
             .collect::<Vec<_>>();
-        let scheduled = schedule_factors(&terms);
+        let scheduled = schedule_factors(&terms, true);
 
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
-        assert!(schedule_factors(&independent).is_empty());
+        assert!(schedule_factors(&independent, true).is_empty());
     }
 
     #[test]
