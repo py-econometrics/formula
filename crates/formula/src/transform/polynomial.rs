@@ -70,6 +70,12 @@ impl PolynomialDefinition {
         let call = self.call_name(&[input_name]);
         format!("{call}[{exponent}]").into()
     }
+
+    pub(super) fn components(&self) -> Vec<ComponentKey> {
+        (1..=self.degree)
+            .map(|basis_index| ComponentKey::Scalar(Scalar::from(basis_index as i64)))
+            .collect()
+    }
 }
 
 impl TransformDefinition for PolynomialDefinition {
@@ -362,24 +368,20 @@ impl Definition<PolynomialState> for PolynomialDefinition {
     ) -> Result<Self::Output, TransformError> {
         let frame = inputs.frame.clone();
         let height = frame.height();
-        let (columns, metadata): (Vec<Column>, Vec<ComponentKey>) = state
+        let columns = state
             .basis
             .transform(frame, self.degree)?
             .into_iter()
             .enumerate()
             .map(|(index, column)| {
                 let basis_index = index + 1;
-                let column =
-                    column.with_name(self.output_name(state.field.name().as_str(), basis_index));
-                let key = ComponentKey::Scalar(Scalar::from(basis_index as i64));
-
-                (column, key)
+                column.with_name(self.output_name(state.field.name().as_str(), basis_index))
             })
-            .unzip();
+            .collect();
 
         let frame = DataFrame::new(height, columns)?;
         Ok(TransformOutput::new(
-            MaterializedColumns::new(frame, metadata),
+            MaterializedColumns::new(frame, self.components()),
             None,
         ))
     }

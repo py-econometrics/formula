@@ -376,7 +376,7 @@ impl Term {
 
         Self::from(Factor {
             kind: FactorKind::Call {
-                transform: Transform::G(GroupedTransform::new(intercept)),
+                transform: Transform::G(GroupedTransform::new(intercept, loadings.len())),
                 arguments: std::iter::once(group).chain(loadings).collect(),
             },
         })
@@ -1598,7 +1598,7 @@ mod tests {
             Column::new("time".into(), [1.0, 2.0]),
             Column::new("exposure".into(), [0.5, 1.0]),
         ];
-        let output = Transform::G(GroupedTransform::new(false))
+        let output = Transform::G(GroupedTransform::new(false, 2))
             .transform(&inputs)
             .unwrap();
 

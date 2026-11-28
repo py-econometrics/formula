@@ -355,7 +355,7 @@ mod tests {
         }
         for transform in [
             Transform::Expression(ExpressionTransform::LOG),
-            Transform::G(GroupedTransform::new(false)),
+            Transform::G(GroupedTransform::new(false, 0)),
         ] {
             assert!(
                 transform
