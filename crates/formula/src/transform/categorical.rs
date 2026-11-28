@@ -6,6 +6,7 @@ use crate::fit::Definition;
 use crate::formula::{ComponentKey, MaterializedColumns};
 use crate::transform::codes::{Codes, fitted_levels, level_columns};
 use polars::chunked_array::cast::CastOptions;
+use polars::error::PolarsResult;
 use polars::prelude::{AnyValue, DataType, PlSmallStr, Scalar, Series, SortOptions};
 use std::collections::BTreeMap;
 
@@ -432,11 +433,8 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         };
 
         let Some(selection) = &self.selection else {
-            return Ok(CategoricalState {
-                levels,
-                kept: columns.len(),
-                columns,
-            });
+            let kept = columns.len();
+            return Ok(CategoricalState::new(levels, columns, kept)?);
         };
         let (parameter, selected) = selection.parameter();
         let mut selected_columns = vec![false; columns.len()];
@@ -476,11 +474,7 @@ impl Definition<CategoricalState> for CategoricalDefinition {
         let kept_count = kept.len();
         kept.extend(omitted);
 
-        Ok(CategoricalState {
-            levels,
-            kept: kept_count,
-            columns: kept,
-        })
+        Ok(CategoricalState::new(levels, kept, kept_count)?)
     }
 
     fn transform(
@@ -494,16 +488,11 @@ impl Definition<CategoricalState> for CategoricalDefinition {
             &state.levels,
             state.columns.iter().map(EncodedColumn::levels),
         )?;
-        let fitted_levels = fitted_levels(&state.levels)?;
-        let keys = state.columns[..state.kept]
+        let names = state
+            .keys
             .iter()
-            .map(|column| column.key(&fitted_levels))
-            .collect::<Vec<_>>();
-        let names = keys.iter().map(|key| self.output_name(field.name(), key));
-        let columns = MaterializedColumns::new(
-            codes.indicators(names)?,
-            keys.into_iter().map(ComponentKey::Scalar).collect(),
-        );
+            .map(|key| self.output_name(field.name(), key));
+        let columns = MaterializedColumns::new(codes.indicators(names)?, state.components());
         Ok(TransformOutput::new(columns, Some(codes)))
     }
 }
@@ -538,8 +527,31 @@ pub(crate) struct CategoricalState {
     levels: Series,
     /// The kept columns, then the omitted ones
     columns: Vec<EncodedColumn>,
-    /// The number of kept columns
-    kept: usize,
+    /// The key of each kept column, so the first `keys.len()` columns are the kept ones
+    keys: Vec<Scalar>,
+}
+
+impl CategoricalState {
+    fn new(levels: Series, columns: Vec<EncodedColumn>, kept: usize) -> PolarsResult<Self> {
+        let fitted_levels = fitted_levels(&levels)?;
+        let keys = columns[..kept]
+            .iter()
+            .map(|column| column.key(&fitted_levels))
+            .collect();
+        Ok(Self {
+            levels,
+            columns,
+            keys,
+        })
+    }
+
+    pub(super) fn components(&self) -> Vec<ComponentKey> {
+        self.keys
+            .iter()
+            .cloned()
+            .map(ComponentKey::Scalar)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -963,7 +975,7 @@ mod tests {
         assert_eq!(actual.shape(), (height, expected.len()));
 
         let fitted_levels = fitted_levels(&transform.levels).unwrap();
-        let names = transform.columns[..transform.kept]
+        let names = transform.columns[..transform.keys.len()]
             .iter()
             .map(|column| definition.output_name(input[0].name(), &column.key(&fitted_levels)))
             .collect::<Vec<_>>();

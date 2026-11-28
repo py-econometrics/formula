@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GroupedTransform {
     intercept: bool,
+    /// The number of loading inputs that follow the group input
+    loadings: usize,
 }
 
 impl TransformDefinition for GroupedTransform {
@@ -21,7 +23,7 @@ impl TransformDefinition for GroupedTransform {
     }
 
     fn argument_count(&self) -> ArgumentCount {
-        ArgumentCount::AtLeast(1)
+        ArgumentCount::Exactly(1 + self.loadings)
     }
 
     fn parameters(&self) -> BTreeMap<&'static str, ParameterValue> {
@@ -49,8 +51,11 @@ impl GroupedTransform {
     const GROUP_KEY: &'static str = "group";
     const LOADING_KEY: &'static str = "loading";
 
-    pub(crate) fn new(intercept: bool) -> Self {
-        Self { intercept }
+    pub(crate) fn new(intercept: bool, loadings: usize) -> Self {
+        Self {
+            intercept,
+            loadings,
+        }
     }
 
     pub(crate) fn intercept(&self) -> bool {
@@ -61,9 +66,15 @@ impl GroupedTransform {
         &self,
         inputs: &'a PreparedInput,
     ) -> Result<(&'a Column, &'a [Column]), TransformError> {
-        let Some((group, loadings)) = inputs.frame.columns().split_first() else {
+        let expected = self.argument_count();
+        let Some((group, loadings)) = inputs
+            .frame
+            .columns()
+            .split_first()
+            .filter(|_| expected.accepts(inputs.fields.len()))
+        else {
             return Err(TransformError::InputCountMismatch {
-                expected: self.argument_count(),
+                expected,
                 actual: inputs.fields.len(),
             });
         };
@@ -72,6 +83,17 @@ impl GroupedTransform {
             validate_numeric_field(field)?;
         }
         Ok((group, loadings))
+    }
+
+    pub(crate) fn components(&self) -> Vec<ComponentKey> {
+        let group = ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static(Self::GROUP_KEY)));
+        let loadings = (1..=self.loadings).map(|position| {
+            ComponentKey::Tuple(vec![
+                ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static(Self::LOADING_KEY))),
+                ComponentKey::Scalar(Scalar::from(position as u64)),
+            ])
+        });
+        std::iter::once(group).chain(loadings).collect()
     }
 
     pub(crate) fn transform(
@@ -91,9 +113,6 @@ impl GroupedTransform {
             .with_name(format!("{name}[{}]", Self::GROUP_KEY).into());
         let height = group.len();
         let mut columns = vec![group];
-        let mut keys = vec![ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static(
-            Self::GROUP_KEY,
-        )))];
         for (index, loading) in loadings.iter().enumerate() {
             let input_position = index + 1;
 
@@ -102,17 +121,12 @@ impl GroupedTransform {
                     .cast(&DataType::Float64)?
                     .with_name(format!("{name}[{}:{input_position}]", Self::LOADING_KEY).into()),
             );
-
-            keys.push(ComponentKey::Tuple(vec![
-                ComponentKey::Scalar(Scalar::from(PlSmallStr::from_static(Self::LOADING_KEY))),
-                ComponentKey::Scalar(Scalar::from(input_position as u64)),
-            ]));
         }
 
         let frame = DataFrame::new(height, columns)?;
 
         Ok(TransformOutput::new(
-            MaterializedColumns::new(frame, keys),
+            MaterializedColumns::new(frame, self.components()),
             None,
         ))
     }
@@ -138,7 +152,7 @@ mod tests {
             let expected = group
                 .clone()
                 .with_name("G(firm, intercept=true)[group]".into());
-            let output = GroupedTransform::new(true).transform(&prepare(&[group]))?;
+            let output = GroupedTransform::new(true, 0).transform(&prepare(&[group]))?;
             assert!(output.frame().equals_missing(&expected.into_frame()));
         }
         Ok(())
@@ -152,7 +166,7 @@ mod tests {
             Column::new("exposure".into(), [Some(0.5_f32), None, Some(1.5)]),
         ];
         let prepared_inputs = prepare(&inputs);
-        let output = GroupedTransform::new(false).transform(&prepared_inputs)?;
+        let output = GroupedTransform::new(false, 2).transform(&prepared_inputs)?;
         let frame = output.frame();
 
         assert_eq!(
@@ -192,7 +206,7 @@ mod tests {
             Column::new("x".into(), [2_f64, 3.0]),
         ] {
             let inputs = prepare(&[Column::new("x".into(), [0_u32, 1]), loading]);
-            let output = GroupedTransform::new(false).transform(&inputs)?;
+            let output = GroupedTransform::new(false, 1).transform(&inputs)?;
             assert_eq!(
                 output.frame()[1].f64()?.iter().collect::<Vec<_>>(),
                 vec![Some(2.0), Some(3.0)],
@@ -215,7 +229,7 @@ mod tests {
             ],
         ] {
             let prepared_inputs = prepare(&inputs);
-            let output = GroupedTransform::new(false).transform(&prepared_inputs)?;
+            let output = GroupedTransform::new(false, 1).transform(&prepared_inputs)?;
             assert_eq!(output.frame().shape(), (inputs[0].len(), 2));
             assert_eq!(output.frame()[0].dtype(), &DataType::UInt32);
             assert_eq!(output.frame()[1].dtype(), &DataType::Float64);
@@ -228,20 +242,22 @@ mod tests {
     #[test]
     fn rejects_wrong_input_counts() {
         for intercept in [true, false] {
-            let transform = GroupedTransform::new(intercept);
-            let expected = transform.argument_count();
-            for count in [0, 1, 2, 3]
-                .into_iter()
-                .filter(|count| !expected.accepts(*count))
-            {
-                let inputs = prepare(&vec![Column::new("x".into(), [0_u32]); count]);
-                assert!(matches!(
-                    transform.transform(&inputs),
-                    Err(TransformError::InputCountMismatch {
-                        expected: actual_expected,
-                        actual,
-                    }) if actual == count && actual_expected == expected
-                ));
+            for loadings in [0, 1, 2] {
+                let transform = GroupedTransform::new(intercept, loadings);
+                let expected = transform.argument_count();
+                for count in [0, 1, 2, 3, 4]
+                    .into_iter()
+                    .filter(|count| !expected.accepts(*count))
+                {
+                    let inputs = prepare(&vec![Column::new("x".into(), [0_u32]); count]);
+                    assert!(matches!(
+                        transform.transform(&inputs),
+                        Err(TransformError::InputCountMismatch {
+                            expected: actual_expected,
+                            actual,
+                        }) if actual == count && actual_expected == expected
+                    ));
+                }
             }
         }
     }
@@ -258,7 +274,7 @@ mod tests {
                 loading,
             ]);
             assert!(matches!(
-                GroupedTransform::new(false).transform(&inputs),
+                GroupedTransform::new(false, 2).transform(&inputs),
                 Err(TransformError::NonNumericInput { name, .. }) if name == "time"
             ));
         }
@@ -271,7 +287,7 @@ mod tests {
             Column::new("time".into(), [1.0]),
         ];
         assert!(matches!(
-            Transform::G(GroupedTransform::new(false)).transform(&inputs),
+            Transform::G(GroupedTransform::new(false, 1)).transform(&inputs),
             Err(FitError::Transform(TransformError::Polars(
                 PolarsError::ShapeMismatch(_)
             )))
@@ -280,10 +296,10 @@ mod tests {
 
     #[test]
     fn enum_delegates_stateless_materialization() -> Result<(), TransformError> {
-        let transform = Transform::G(GroupedTransform::new(true));
+        let transform = Transform::G(GroupedTransform::new(true, 1));
         assert_eq!(transform.name(), "G");
         assert!(transform.expands());
-        assert_eq!(transform.argument_count(), ArgumentCount::AtLeast(1));
+        assert_eq!(transform.argument_count(), ArgumentCount::Exactly(2));
         assert_eq!(
             transform.parameters(),
             BTreeMap::from([("intercept", ParameterValue::Scalar(Scalar::from(true)))])
