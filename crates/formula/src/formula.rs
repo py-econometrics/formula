@@ -1131,6 +1131,25 @@ impl FittedTerm {
         &self.term
     }
 
+    fn select(&self, fitted: &Self) -> PolarsResult<Self> {
+        let (columns, metadata): (Vec<_>, Vec<_>) = fitted
+            .columns
+            .frame()
+            .columns()
+            .iter()
+            .map(|column| {
+                let (data, metadata) = lookup_column(&self.columns, column.name().as_str());
+                (data.clone(), metadata.clone())
+            })
+            .unzip();
+        let frame = DataFrame::new(self.columns.frame().height(), columns)?;
+
+        Ok(Self {
+            term: self.term.clone(),
+            columns: MaterializedColumns::new(frame, metadata),
+        })
+    }
+
     pub fn columns(&self) -> impl Iterator<Item = FormulaColumn<'_>> {
         self.columns
             .iter()
@@ -1220,8 +1239,9 @@ impl FittedExpression {
         let terms = self
             .terms
             .iter()
-            .map(|term| lookup_term(transformed, &term.term, false).clone())
-            .collect::<Vec<_>>();
+            .map(|term| lookup_term(transformed, &term.term, false).select(term))
+            .collect::<PolarsResult<Vec<_>>>()
+            .map_err(TransformError::from)?;
 
         let children = self
             .children
@@ -1492,6 +1512,18 @@ fn lookup_term<'a>(transformed: &'a [FittedTerm], term: &Term, fitting: bool) ->
         .iter()
         .find(|entry| same_term(&entry.term, term, fitting))
         .expect("every term must have an transformed entry")
+}
+
+fn lookup_column<'a>(
+    columns: &'a MaterializedColumns<ColumnMetadata>,
+    name: &str,
+) -> (&'a Column, &'a ColumnMetadata) {
+    let index = columns
+        .frame()
+        .get_column_index(name)
+        .expect("every fitted column must have a transformed column");
+
+    (&columns.frame().columns()[index], &columns.metadata[index])
 }
 
 #[derive(Clone, Debug)]
@@ -3717,6 +3749,59 @@ mod tests {
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].as_ref(), &Factor::from("y"));
         assert!(schedule_factors(&independent, true).is_empty());
+    }
+
+    #[test]
+    fn transform_preserves_fitted_column_selection_and_order() {
+        let training = polars::df!(
+            "y" => [1.0, 2.0, 3.0], "g" => ["a", "b", "c"], "x" => [1.0, 2.0, 3.0],
+        )
+        .unwrap();
+        let models = crate::parse("y ~ C(g):x - 1")
+            .unwrap()
+            .fit(&training)
+            .unwrap();
+        let model = models.iter().next().unwrap();
+        let [candidates] = model.expression(Role::Independent).unwrap().terms() else {
+            panic!("expected one interaction term");
+        };
+        // Keep the columns for levels c and b, in that order
+        let kept = [2, 1];
+        let names = kept.map(|index| candidates.columns.frame().columns()[index].name().clone());
+        let fitted = FittedTerm {
+            term: candidates.term.clone(),
+            columns: MaterializedColumns::new(
+                DataFrame::new(
+                    training.height(),
+                    kept.map(|index| candidates.columns.frame().columns()[index].clone())
+                        .to_vec(),
+                )
+                .unwrap(),
+                kept.map(|index| candidates.columns.metadata[index].clone())
+                    .to_vec(),
+            ),
+        };
+        let expression =
+            FittedExpression::new(training.height(), vec![fitted], Vec::new()).unwrap();
+
+        let input = polars::df!("g" => ["c", "b", "a"], "x" => [10.0, 20.0, 30.0]).unwrap();
+        let terms = expression
+            .terms()
+            .iter()
+            .map(FittedTerm::term)
+            .collect::<Vec<_>>();
+        let transformed = transform_terms(&terms, &input).unwrap();
+        let applied = expression.assemble(input.height(), &transformed).unwrap();
+        let frame = applied.frame();
+        assert_eq!(frame.get_column_names(), names.iter().collect::<Vec<_>>());
+        assert_eq!(
+            frame[0].f64().unwrap().iter().collect::<Vec<_>>(),
+            [Some(10.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(
+            frame[1].f64().unwrap().iter().collect::<Vec<_>>(),
+            [Some(0.0), Some(20.0), Some(0.0)]
+        );
     }
 
     #[test]
